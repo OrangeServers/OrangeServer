@@ -58,6 +58,26 @@ class RunLeaseService:
         self.session.commit()
 
     # ------------------------------------------------------------------
+    # 状态查询
+    # ------------------------------------------------------------------
+
+    def get_lease_state(self, run_id):
+        """返回 Run 的当前状态/租约快照；行不存在返回 None。
+
+        供任务层区分"执行中的重复投递"与"新认领"，只读。
+        """
+        row = self._fetch(run_id)
+        if row is None:
+            return None
+        return {
+            'run_id': run_id,
+            'status': row.status,
+            'revision': int(row.revision or 0),
+            'lease_owner': row.lease_owner,
+            'lease_expires_at': row.lease_expires_at,
+        }
+
+    # ------------------------------------------------------------------
     # 认领 / 心跳 / 释放
     # ------------------------------------------------------------------
 
@@ -67,26 +87,16 @@ class RunLeaseService:
         """原子认领 queued Run，或接管活动态中租约已过期的 Run。
 
         成功返回 {'run_id', 'revision', 'lease_expires_at'}；
-        行不存在、状态不可认领、或租约被其他 Worker 有效持有时返回 None。
-        queued 认领把状态推进到 running；接管过期租约进入 recovering，
-        由恢复切片按写意图与 checkpoint 边界重新规划。
-        同一 Worker 的重复投递再次认领只会刷新租约。
+        行不存在、状态不可认领、或租约被任何 Worker（含自身）有效
+        持有时返回 None。queued 认领把状态推进到 running；接管过期
+        租约进入 recovering，由恢复切片按写意图与 checkpoint 边界
+        重新规划。执行中的重复投递由任务层先查 get_lease_state 自行
+        跳过，不经这里。
         """
         table = self._run_table()
         now = now or _utcnow()
         expires_at = now + datetime.timedelta(seconds=int(lease_ttl_seconds))
         worker_id = str(worker_id)[:64]
-
-        row = self._fetch(run_id)
-        if row is not None and row.lease_owner == worker_id and row.status in (
-            (RunStatus.QUEUED.value,) + _LEASED_ACTIVE_STATUSES
-        ):
-            # 同一 Worker 的重复投递：幂等刷新租约。
-            refreshed = self.heartbeat(
-                run_id, worker_id, int(row.revision or 0),
-                lease_ttl_seconds, now=now,
-            )
-            return refreshed
 
         new_status = sa.case(
             (table.c.status == RunStatus.QUEUED.value,

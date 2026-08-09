@@ -121,20 +121,38 @@ def test_duplicate_delivery_never_runs_run_in_parallel(lease_env):
     assert row.status == "running"
 
 
-def test_same_worker_duplicate_delivery_is_idempotent(lease_env):
-    """同一 Worker 的重复投递再次认领，只刷新租约不产生第二个持有者。"""
+def test_reclaim_while_lease_valid_is_rejected_even_for_owner(lease_env):
+    """租约有效期间再认领一律 None（含持有者自身）；
+    执行中的重复投递由任务层查 get_lease_state 自行跳过。"""
     run = lease_env["create_queued_run"]()
     first = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
     later = datetime.datetime.utcnow() + datetime.timedelta(seconds=5)
     second = lease_env["lease"].claim_run(
         run["id"], "worker-a", TTL, now=later,
     )
-    assert first is not None and second is not None
+    assert first is not None
+    assert second is None
     row = _row(lease_env["session"], run["id"])
     assert row.lease_owner == "worker-a"
     assert row.status == "running"
-    assert second["lease_expires_at"] > first["lease_expires_at"]
-    assert second["revision"] == first["revision"] + 1
+
+
+def test_get_lease_state_snapshot(lease_env):
+    """get_lease_state 只读返回状态/租约快照，行不存在返回 None。"""
+    lease = lease_env["lease"]
+    assert lease.get_lease_state("missing") is None
+    run = lease_env["create_queued_run"]()
+    state = lease.get_lease_state(run["id"])
+    assert state["status"] == "queued"
+    assert state["lease_owner"] is None
+    claimed = lease.claim_run(run["id"], "worker-a", TTL)
+    state = lease.get_lease_state(run["id"])
+    assert state["status"] == "running"
+    assert state["lease_owner"] == "worker-a"
+    assert state["revision"] == claimed["revision"]
+    # 只读：快照不改变行状态。
+    row = _row(lease_env["session"], run["id"])
+    assert row.revision == claimed["revision"]
 
 
 def test_expired_lease_can_be_reclaimed_by_another_worker(lease_env):

@@ -250,6 +250,18 @@ AI_AUTONOMY_ENABLED = str(_env('OGS_AI_AUTONOMY_ENABLED', '')).strip().lower() i
     '1', 'true', 'yes', 'on',
 )
 
+# M1/S2: 自治专用 Redis 8 接线（与业务 Redis 7 完全隔离）。
+#   DB 0 存 LangGraph checkpoint，DB 1 作为 Celery broker；
+#   服务端要求 AOF + noeviction + 持久卷（部署层保证）。
+#   主机留空视为接线未完成，自治 Worker 不启动，等价于禁用。
+AI_AUTONOMY_REDIS_HOST = str(_env('OGS_AI_AUTONOMY_REDIS_HOST', '')).strip()
+AI_AUTONOMY_REDIS_PORT = int(_env('OGS_AI_AUTONOMY_REDIS_PORT', '6379'))
+AI_AUTONOMY_REDIS_PASSWORD = str(_env('OGS_AI_AUTONOMY_REDIS_PASSWORD', ''))
+#   Worker 租约有效期；心跳必须显著短于此（执行器切片负责心跳）。
+AI_AUTONOMY_LEASE_TTL_SECONDS = max(
+    10, int(_env('OGS_AI_AUTONOMY_LEASE_TTL_SECONDS', '120')),
+)
+
 # REVIEW-11-P1-1: SSH 危险命令黑名单
 #   拦截 rm -rf / / mkfs / dd if= / shutdown / reboot / fork 炸弹 等
 #   逗号分隔, 可通过 env 覆盖 (生产环境只追加,不删除默认项)

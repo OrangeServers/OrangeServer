@@ -51,6 +51,11 @@ python-dotenv==1.2.2              # .env 文件加载（conf.py / init.py 都用
 # --- LLM Provider (OpenAI-compatible APIs) -------------------------------
 openai==2.46.0
 
+# --- AI autonomy executor (M1/S2, feature-gated) -------------------------
+# 仅 OGS_AI_AUTONOMY_ENABLED 启用时参与运行；kombu 的 redis transport
+# 要求 redis>=4.5.2,<6.5，现有 redis==5.3.1 兼容。
+celery==5.6.3
+
 # --- Automation (Ansible) -------------------------------------------------
 # 项目自研 ansible_runner/ 走的是 ansible-core API，而非社区 ansible 发行版
 # 历史注释里的 ansible~=4.10.0 是错的（4.x 已 EOL），必须装 ansible-core
