@@ -295,7 +295,10 @@ def test_baseline_varchar_lengths_match_current_orm():
 
 
 def test_rev53_autonomy_migration_matches_baseline_and_orm():
-    """M1/S1: rev53 升级迁移、orange.sql 基线与 ORM 三方列集合一致。"""
+    """M1/S1: rev53 列集合仍是 orange.sql 基线与 ORM 的子集。
+
+    rev53 迁移文件本身不可变；后续迁移（rev54+）向同表追加列，
+    完整三方一致由最新迁移的契约测试断言。"""
     from app.core.db.database import db
 
     rev53 = (
@@ -325,7 +328,8 @@ def test_rev53_autonomy_migration_matches_baseline_and_orm():
         rev53_columns = columns(rev53, table)
         baseline_columns = columns(schema, table)
         orm_columns = set(db.metadata.tables[table].columns.keys())
-        assert rev53_columns == baseline_columns == orm_columns, table
+        assert rev53_columns <= baseline_columns, table
+        assert rev53_columns <= orm_columns, table
 
     assert (
         "ADD COLUMN `ai_environment` VARCHAR(10) NOT NULL "
@@ -339,6 +343,67 @@ def test_rev53_autonomy_migration_matches_baseline_and_orm():
         "`ai_environment` varchar(10) NOT NULL DEFAULT 'production'"
     ) in host_ddl.group(1)
     assert "ai_environment" in db.metadata.tables["t_host"].columns
+
+
+def test_rev54_autonomy_migration_matches_baseline_and_orm():
+    """M1/S2: rev54 追加列后，rev53+rev54、orange.sql 与 ORM 三方一致。"""
+    from app.core.db.database import db
+
+    rev53 = (
+        BACKEND / "mysqldir" / "rev53_ai_autonomy_baseline.sql"
+    ).read_text(encoding="utf-8")
+    rev54 = (
+        BACKEND / "mysqldir" / "rev54_ai_autonomy_lease.sql"
+    ).read_text(encoding="utf-8")
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+
+    def create_columns(source, table):
+        match = re.search(
+            r"CREATE TABLE(?: IF NOT EXISTS)? `" + table
+            + r"` \((.*?)\)\s*ENGINE=",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        assert match, f"{table} is missing from the schema source"
+        return set(
+            re.findall(r"^\s*`([^`]+)`\s+", match.group(1), re.MULTILINE)
+        )
+
+    added = set(re.findall(
+        r"ADD COLUMN `(\w+)`", rev54,
+    ))
+    assert added == {
+        "lease_owner", "lease_expires_at", "heartbeat_at", "graph_version",
+    }, added
+    # 每个 ALTER 都有幂等守卫，脚本可重复执行。
+    assert rev54.count("information_schema.COLUMNS") == 4
+    assert rev54.count("PREPARE stmt FROM @sql;") == 5
+
+    rev53_columns = create_columns(rev53, "t_ai_autonomous_run")
+    baseline_columns = create_columns(schema, "t_ai_autonomous_run")
+    orm_columns = set(
+        db.metadata.tables["t_ai_autonomous_run"].columns.keys()
+    )
+    assert rev53_columns | added == baseline_columns == orm_columns
+
+    run_ddl = re.search(
+        r"CREATE TABLE `t_ai_autonomous_run` \((.*?)\)\s*ENGINE=",
+        schema,
+        re.DOTALL,
+    )
+    assert run_ddl, "orange.sql must define t_ai_autonomous_run"
+    assert "`lease_owner` varchar(64) DEFAULT NULL" in run_ddl.group(1)
+    assert "`lease_expires_at` datetime DEFAULT NULL" in run_ddl.group(1)
+    assert "`heartbeat_at` datetime DEFAULT NULL" in run_ddl.group(1)
+    assert (
+        "`graph_version` varchar(32) NOT NULL DEFAULT 'v1'"
+    ) in run_ddl.group(1)
+    assert (
+        "KEY `idx_ai_auto_run_lease_expires` (`lease_expires_at`)"
+    ) in run_ddl.group(1)
+    assert (
+        "ADD KEY `idx_ai_auto_run_lease_expires` (`lease_expires_at`)"
+    ) in rev54
 
 
 def test_dockerfile_builds_from_committed_requirements_without_resolving_lock():
