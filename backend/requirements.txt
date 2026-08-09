@@ -53,8 +53,11 @@ openai==2.46.0
 
 # --- AI autonomy executor (M1/S2, feature-gated) -------------------------
 # 仅 OGS_AI_AUTONOMY_ENABLED 启用时参与运行；kombu 的 redis transport
-# 要求 redis>=4.5.2,<6.5，现有 redis==5.3.1 兼容。
+# 要求 redis>=4.5.2,<6.5，redisvl 要求 redis<8.0,>=5.0，现有
+# redis==5.3.1 同时满足两者。
 celery==5.6.3
+langgraph==1.2.10
+langgraph-checkpoint-redis==0.5.1
 
 # --- Automation (Ansible) -------------------------------------------------
 # 项目自研 ansible_runner/ 走的是 ansible-core API，而非社区 ansible 发行版
