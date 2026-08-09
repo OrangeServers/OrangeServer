@@ -28,6 +28,12 @@ from app.ai.autonomy.executor import AutonomyExecutor
 from app.ai.autonomy.graph import AutonomyGraphError, build_graph
 from app.ai.autonomy.lease import RunLeaseService
 from app.ai.autonomy.policy import Budget
+from app.ai.autonomy.recovery import (
+    MODE_BOUNDARY,
+    MODE_HALT,
+    MODE_PAUSE,
+    RecoveryService,
+)
 from app.ai.autonomy.repository import sanitize_text
 from app.ai.autonomy.state import (
     RunStatus,
@@ -129,6 +135,7 @@ class AutonomyDriver:
         )
         self.repo = self.executor.repo
         self.lease = RunLeaseService(session)
+        self.recovery = RecoveryService(session, self.repo)
         self.worker_id = worker_id
         self.lease_ttl = lease_ttl or config.AI_AUTONOMY_LEASE_TTL_SECONDS
         self._heartbeat_session_factory = heartbeat_session_factory
@@ -394,17 +401,9 @@ class AutonomyDriver:
         if bool(run.cancel_requested):
             return self._confirm_cancel(run)
 
-        # 接管来的 recovering Run 由恢复切片处理，本切片先 fail-closed。
-        if run.status == RunStatus.RECOVERING.value:
-            assert_run_transition(
-                run.status, RunStatus.NEEDS_ATTENTION.value,
-            )
-            run.status = RunStatus.NEEDS_ATTENTION.value
-            self.repo._bump(run)
-            self.repo.append_event(run, 'recovery_pending', {
-                'note': 'recovery slice not wired yet',
-            })
-            self.repo._commit()
+        # 写结果未知的重放守卫：needs_attention 只能人工处置，
+        # 再被投递也绝不自动重跑。
+        if run.status == RunStatus.NEEDS_ATTENTION.value:
             self._release_lease(run_id)
             return RESULT_NEEDS_ATTENTION
 
@@ -439,25 +438,54 @@ class AutonomyDriver:
         compiled = builder.compile(checkpointer=saver)
         cfg = {'configurable': {'thread_id': THREAD_ID_PREFIX + run_id}}
 
-        paused = 'approval_pause' in (compiled.get_state(cfg).next or ())
-        if paused:
-            decision = self._pending_decision(
-                run_id, compiled.get_state(cfg),
-            )
+        snapshot = compiled.get_state(cfg)
+        # checkpoint 丢失检测：空线程的快照没有 metadata；有 Step
+        # 落库却没有 checkpoint 即为丢失，只能从 MySQL 边界重建。
+        checkpoint_present = snapshot.metadata is not None
+        paused = 'approval_pause' in (snapshot.next or ())
+        if paused and checkpoint_present:
+            decision = self._pending_decision(run_id, snapshot)
             if decision is None:
                 # 决策未到：继续等人，释放租约保持暂停。
+                self._settle_paused(run)
                 self._release_lease(run_id)
                 return RESULT_PAUSED
             entry = Command(resume=decision)
         else:
-            entry = {
-                'run_id': run_id,
-                'graph_version': str(run.graph_version or ''),
-                'owner': str(run.owner or ''),
-                'goal': sanitize_text(run.goal or '')[:120],
-                'loops': 0,
-                'proposed_steps': 0,
-            }
+            outcome = self.recovery.resolve(
+                run, checkpoint_present=checkpoint_present,
+            )
+            if outcome.mode == MODE_HALT:
+                self._release_lease(run_id)
+                return outcome.result
+            if outcome.mode == MODE_PAUSE:
+                # 有待审 Step 但 checkpoint 丢失：继续等人审批。
+                self._release_lease(run_id)
+                return RESULT_PAUSED
+            if outcome.mode == MODE_BOUNDARY:
+                # 从 MySQL 已批准 Step 重建 checkpoint：把游标定位到
+                # policy 之后，再走标准审批恢复路径（approve 由
+                # _pending_decision 从 MySQL 重新推导，绝不信任重建值）。
+                compiled.update_state(
+                    cfg, outcome.entry, as_node='policy',
+                )
+                snapshot = compiled.get_state(cfg)
+                decision = self._pending_decision(run_id, snapshot)
+                if decision is None:
+                    self._settle_paused(run)
+                    self._release_lease(run_id)
+                    return RESULT_PAUSED
+                entry = Command(resume=decision)
+            else:
+                # resume/fresh 都从 plan 起点重新入场。
+                entry = {
+                    'run_id': run_id,
+                    'graph_version': str(run.graph_version or ''),
+                    'owner': str(run.owner or ''),
+                    'goal': sanitize_text(run.goal or '')[:120],
+                    'loops': 0,
+                    'proposed_steps': 0,
+                }
 
         heartbeater = self._start_heartbeat(run_id, claimed)
         final_state = None
@@ -475,6 +503,7 @@ class AutonomyDriver:
                     if decision is None:
                         # policy 已把 Run 置 waiting_approval；
                         # 释放租约等人审批。
+                        self._settle_paused(run)
                         self._release_lease(run_id)
                         return RESULT_PAUSED
                     resumes += 1
@@ -494,6 +523,19 @@ class AutonomyDriver:
         if heartbeater.lost:
             return RESULT_LEASE_LOST
         return self._finalize(run_id, dict(final_state or {}))
+
+    def _settle_paused(self, run):
+        """暂停落定：recovering 接管后重新暂停要回 waiting_approval，
+        避免留在 recovering 被恢复扫描反复认领。"""
+        self.session.expire_all()
+        row = self._run_row(run.id)
+        if row is not None and row.status == RunStatus.RECOVERING.value:
+            assert_run_transition(
+                row.status, RunStatus.WAITING_APPROVAL.value,
+            )
+            row.status = RunStatus.WAITING_APPROVAL.value
+            self.repo._bump(row)
+            self.repo._commit()
 
     def _confirm_cancel(self, run):
         assert_run_transition(run.status, RunStatus.CANCELLED.value)

@@ -17,11 +17,13 @@ import sqlalchemy as sa
 
 from app.ai.autonomy.state import RunStatus
 
-# 租约覆盖的活动态：queued 等待首次认领，running/waiting_approval
-# 的租约过期后由新的 Worker 重新认领并进入 recovering 重新规划。
+# 租约覆盖的活动态：queued 等待首次认领，running/waiting_approval/
+# recovering 的租约过期后由新的 Worker 重新认领；过期接管进入
+# recovering，由恢复层按写意图与 checkpoint 边界重建。
 _LEASED_ACTIVE_STATUSES = (
     RunStatus.RUNNING.value,
     RunStatus.WAITING_APPROVAL.value,
+    RunStatus.RECOVERING.value,
 )
 
 REASON_QUEUED = 'queued'
@@ -89,8 +91,9 @@ class RunLeaseService:
         成功返回 {'run_id', 'revision', 'lease_expires_at'}；
         行不存在、状态不可认领、或租约被任何 Worker（含自身）有效
         持有时返回 None。queued 认领把状态推进到 running；接管过期
-        租约进入 recovering，由恢复切片按写意图与 checkpoint 边界
-        重新规划。执行中的重复投递由任务层先查 get_lease_state 自行
+        租约进入 recovering，由恢复层按写意图与 checkpoint 边界
+        重建；recovering 再被接管时保持 recovering，避免恢复中无限
+        自套娃。执行中的重复投递由任务层先查 get_lease_state 自行
         跳过，不经这里。
         """
         table = self._run_table()
@@ -101,6 +104,8 @@ class RunLeaseService:
         new_status = sa.case(
             (table.c.status == RunStatus.QUEUED.value,
              RunStatus.RUNNING.value),
+            (table.c.status == RunStatus.RECOVERING.value,
+             RunStatus.RECOVERING.value),
             else_=RunStatus.RECOVERING.value,
         )
         result = self.session.execute(
