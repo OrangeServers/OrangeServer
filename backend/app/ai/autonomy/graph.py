@@ -34,13 +34,17 @@ class AutonomyGraphError(Exception):
 class GraphCursor(TypedDict, total=False):
     """紧凑流程游标：进 checkpoint 的只有这些字段。
 
-    禁止包含凭据、完整命令、原始日志、完整提示词。
+    禁止包含凭据、完整命令、原始日志、完整提示词；goal 只进
+    截断后的短摘要。
     """
 
     run_id: str
     graph_version: str
+    owner: str
+    goal: str
     phase: str
     loops: int
+    proposed_steps: int
     pending_step_id: str
     decision: str
     done: bool
@@ -75,7 +79,9 @@ def _route_after_decide(state: GraphCursor) -> str:
 
 
 def _build_v1(handlers: Dict[str, Callable]) -> StateGraph:
-    missing = [name for name in NODE_SEQUENCE if name not in handlers]
+    # approval_pause 是内置唯一中断点，不由调用方提供 handler。
+    required = [name for name in NODE_SEQUENCE if name != 'approval_pause']
+    missing = [name for name in required if name not in handlers]
     if missing:
         raise AutonomyGraphError('missing handlers: %s' % (missing,))
 

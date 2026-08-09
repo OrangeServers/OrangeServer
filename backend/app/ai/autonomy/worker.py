@@ -8,8 +8,9 @@
 - 任务只携带 run_id，按至少一次投递设计：task_acks_late +
   worker 丢失时 reject 重投，重复投递的并行安全由 lease.claim_run
   的条件 UPDATE 保证。
-- 执行器尚未接线的切片里，drive_run 认领后立即释放租约并返回
-  executor_unavailable，绝不伪造执行结果（fail-closed）。
+- 默认执行器是 drive.AutonomyDriver 驱动循环；checkpoint 未接线、
+  规划器未接线等前置缺失由驱动循环 fail-closed 落库，任务层不
+  伪造执行结果。
 - Worker 就绪时扫描 queued / 租约过期的 Run 并重新投递，覆盖
   进程重启与 Celery 丢消息两类场景。
 """
@@ -79,7 +80,49 @@ def _register_tasks(app):
     def drive_run(self, run_id):
         from app.core.db.database import db
 
-        return drive_run_once(db.session, run_id)
+        return drive_run_once(
+            db.session, run_id, executor=build_default_executor(db.session),
+        )
+
+
+def build_default_executor(session):
+    """生产默认执行器：AutonomyDriver 驱动循环。
+
+    规划器尚未接线的切片里，驱动循环会把 Run 落 failed +
+    planner_unavailable 事件（fail-closed），绝不伪造执行结果。
+    """
+    from app.ai.autonomy.drive import (
+        AutonomyDriver,
+        make_autonomy_heartbeat_session_factory,
+        make_autonomy_saver_factory,
+    )
+    from app.core.config import FLASK_SECRET_KEY
+
+    def executor(run_id, claimed):
+        driver = AutonomyDriver(
+            session, FLASK_SECRET_KEY,
+            saver_factory=make_autonomy_saver_factory(),
+            heartbeat_session_factory=(
+                make_autonomy_heartbeat_session_factory()
+            ),
+        )
+        return driver.drive(run_id, claimed)
+
+    return executor
+
+
+def dispatch_drive_run(run_id, celery_app=None):
+    """把指定 Run 投递给 drive_run；功能未启用时静默不投。
+
+    供决策/启动接口在状态推进后显式唤醒 Worker；投递失败不阻断
+    调用方，启动扫描与租约过期认领是兜底。
+    """
+    if celery_app is None:
+        celery_app = get_celery_app()
+    if celery_app is None:
+        return False
+    celery_app.send_task(DRIVE_RUN_TASK, args=[run_id])
+    return True
 
 
 def drive_run_once(session, run_id, *, executor=None, worker_id=None,

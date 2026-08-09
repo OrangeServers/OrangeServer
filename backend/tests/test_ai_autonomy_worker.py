@@ -192,7 +192,11 @@ def test_delivery_to_other_workers_run_is_skipped(worker_env):
 
 
 def test_drive_run_without_executor_fails_closed(worker_env):
-    """执行器未接线：认领后立即释放租约，绝不伪造执行结果。"""
+    """执行器未接线：认领后立即释放租约，绝不伪造执行结果。
+
+    释放后的 running + 无租约不是启动扫描候选（健康空闲不
+    churn）；接线修复后由新的投递/扫描唤醒。
+    """
     from app.core.db.database import t_ai_autonomous_run
     from app.ai.autonomy.lease import RunLeaseService
 
@@ -206,9 +210,8 @@ def test_drive_run_without_executor_fails_closed(worker_env):
     ).one()
     assert row.lease_owner is None
     assert row.lease_expires_at is None
-    # 释放后仍会被启动扫描重新发现（running + 无租约）。
     candidates = RunLeaseService(worker_env["session"]).scan_recoverable()
-    assert run["id"] in {c["run_id"] for c in candidates}
+    assert run["id"] not in {c["run_id"] for c in candidates}
 
 
 def test_drive_run_unknown_run_is_skipped(worker_env):

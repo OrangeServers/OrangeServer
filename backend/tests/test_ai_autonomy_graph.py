@@ -73,7 +73,8 @@ def test_node_sequence_matches_roadmap_flow():
 def test_cursor_state_is_compact():
     """进 checkpoint 的字段是固定白名单：无凭据/命令/日志/提示词。"""
     assert set(GraphCursor.__annotations__.keys()) == {
-        'run_id', 'graph_version', 'phase', 'loops',
+        'run_id', 'graph_version', 'owner', 'goal', 'phase', 'loops',
+        'proposed_steps',
         'pending_step_id', 'decision', 'done', 'summary',
     }
 

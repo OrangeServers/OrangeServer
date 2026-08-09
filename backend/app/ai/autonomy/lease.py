@@ -196,6 +196,9 @@ class RunLeaseService:
 
         返回按 created_at 排序的候选列表，每项含 run_id、status 与
         reason；本方法只读，不改任何状态。
+        健康暂停（waiting_approval 且租约已释放，lease_expires_at
+        为 NULL）不是候选：它由决策接口的显式投递唤醒，反复扫描
+        只会制造无意义的认领/释放 churn。
         """
         table = self._run_table()
         now = now or _utcnow()
@@ -205,10 +208,8 @@ class RunLeaseService:
                     table.c.status == RunStatus.QUEUED.value,
                     sa.and_(
                         table.c.status.in_(_LEASED_ACTIVE_STATUSES),
-                        sa.or_(
-                            table.c.lease_expires_at.is_(None),
-                            table.c.lease_expires_at < now,
-                        ),
+                        table.c.lease_expires_at.isnot(None),
+                        table.c.lease_expires_at < now,
                     ),
                 )
             ).order_by(table.c.created_at.asc())
