@@ -30,9 +30,9 @@ from app.ai.autonomy.policy import (
 
 def test_probe_registry_is_server_owned_and_read_only():
     assert list_probe_ids() == [
-        "file.read_bounded", "log.tail", "service.status",
-        "system.disk_usage", "system.load", "system.memory",
-        "verify.http_status", "verify.journal_pattern",
+        "file.read_bounded", "log.tail", "package.installed",
+        "service.status", "system.disk_usage", "system.load",
+        "system.memory", "verify.http_status", "verify.journal_pattern",
         "verify.port_open", "verify.process_running",
     ]
 

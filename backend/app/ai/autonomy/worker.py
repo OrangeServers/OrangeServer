@@ -168,13 +168,21 @@ def drive_run_once(session, run_id, *, executor=None, worker_id=None,
 
 
 def dispatch_recoverable(session, celery_app=None):
-    """启动扫描：把 queued / 租约过期的 Run 重新投递给 drive_run。"""
+    """启动扫描：先清扫超期 draft/待审批，再把 queued / 租约过期的
+    Run 重新投递给 drive_run。"""
     from app.ai.autonomy.lease import RunLeaseService
+    from app.ai.autonomy.repository import sweep_expired_runs
 
     if celery_app is None:
         celery_app = get_celery_app()
     if celery_app is None:
         return []
+    try:
+        sweep_expired_runs(
+            session, ttl_seconds=config.AI_AUTONOMY_APPROVAL_TTL_SECONDS,
+        )
+    except Exception:
+        logger.exception('autonomy expiry sweep failed')
     candidates = RunLeaseService(session).scan_recoverable()
     for candidate in candidates:
         celery_app.send_task(DRIVE_RUN_TASK, args=[candidate['run_id']])

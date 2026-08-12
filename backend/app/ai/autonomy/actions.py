@@ -123,6 +123,18 @@ _PROBES: Dict[str, Dict[str, Any]] = {
             'pattern': re.compile(r'^[A-Za-z0-9._:-]{1,128}$'),
         },
     },
+    'package.installed': {
+        'title': '包安装状态查询（只读）',
+        'selector': 'manager',
+        'command': {
+            'apt': 'dpkg -s {package}',
+            'dnf': 'rpm -q {package}',
+        },
+        'params': {
+            'manager': re.compile(r'^(apt|dnf)$'),
+            'package': re.compile(r'^[A-Za-z0-9][A-Za-z0-9+._-]{0,127}$'),
+        },
+    },
 }
 
 # 有界读取的根目录白名单；log.tail 进一步收紧到 /var/log。
@@ -498,6 +510,9 @@ def build_probe_command(probe_id: str, params: Dict[str, Any]) -> str:
     spec = probe_spec(probe_id)
     normalized = validate_probe(probe_id, params)
     template = spec['command']
+    if isinstance(template, dict):
+        # 与写模板同构的 selector 分发（如包查询按管理器选命令）。
+        template = template[normalized[spec['selector']]]
     if normalized:
         # format 会把双花括号转义还原为字面花括号。
         command = template.format(**normalized)

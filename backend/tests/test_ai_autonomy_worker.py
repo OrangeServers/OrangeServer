@@ -4,6 +4,8 @@
 与租约测试相同的注入式 SQLite 内存引擎方案；Celery 应用只做构造
 与配置断言，不连接真实 broker（投递用替身记录）。
 """
+import datetime
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -90,6 +92,7 @@ def worker_env(monkeypatch):
 
     env = {
         "session": session,
+        "repo": repo,
         "create_queued_run": create_queued_run,
     }
     yield env
@@ -233,6 +236,39 @@ def test_dispatch_recoverable_enqueues_candidates(worker_env):
     )
     assert [c["run_id"] for c in candidates] == [queued["id"]]
     assert fake_app.sent == [(worker.DRIVE_RUN_TASK, (queued["id"],))]
+
+
+def test_dispatch_recoverable_sweeps_expired_before_dispatch(worker_env):
+    """启动扫描先落掉超期 draft/待审批，再投递活动 Run。"""
+    session = worker_env["session"]
+    host = t_host(
+        alias="web-stale", host_ip="203.0.113.60",
+        host_port=22, ai_environment="lab",
+    )
+    session.add(host)
+    session.commit()
+    # 先建超期 draft 再建活动 Run：同 host 活动 Run 互斥。
+    draft = worker_env["repo"].create_run(
+        "admin", "admin", goal="stale draft",
+        host_id=int(host.id), system_user_id=19, mode="assisted",
+    )
+    row = session.get(t_ai_autonomous_run, draft["id"])
+    row.updated_at = (
+        datetime.datetime.utcnow() - datetime.timedelta(hours=25)
+    )
+    session.commit()
+    queued = worker_env["create_queued_run"]()
+
+    fake_app = FakeCeleryApp()
+    candidates = worker.dispatch_recoverable(
+        session, celery_app=fake_app,
+    )
+    # 超期 draft 被清扫为 expired，绝不进入投递候选。
+    assert [c["run_id"] for c in candidates] == [queued["id"]]
+    session.expire_all()
+    assert session.get(
+        t_ai_autonomous_run, draft["id"],
+    ).status == "expired"
 
 
 def test_dispatch_recoverable_disabled_sends_nothing(worker_env):

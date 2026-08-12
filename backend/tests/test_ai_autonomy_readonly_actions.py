@@ -119,6 +119,31 @@ def test_probe_check_hooks_run_before_digestable_output():
 
 
 # ---------------------------------------------------------------------------
+# 包查询探针：按包管理器分发，只读
+# ---------------------------------------------------------------------------
+
+def test_package_probe_dispatches_by_manager():
+    assert build_probe_command(
+        "package.installed", {"manager": "apt", "package": "nginx"},
+    ) == "dpkg -s nginx"
+    assert build_probe_command(
+        "package.installed", {"manager": "dnf", "package": "nginx"},
+    ) == "rpm -q nginx"
+
+
+@pytest.mark.parametrize("params", [
+    {"manager": "yum", "package": "nginx"},       # 管理器白名单外
+    {"manager": "apt", "package": "nginx;rm -rf /"},
+    {"manager": "apt", "package": ""},
+    {"manager": "apt"},                            # 缺参数
+    {"manager": "apt", "package": "nginx", "repo": "evil"},
+])
+def test_package_probe_parameters_outside_whitelist_are_rejected(params):
+    with pytest.raises(ActionValidationError):
+        validate_probe("package.installed", params)
+
+
+# ---------------------------------------------------------------------------
 # v1 永久拒绝清单：审批不能推翻
 # ---------------------------------------------------------------------------
 
@@ -197,6 +222,12 @@ def test_constructed_probe_commands_stay_off_the_deny_list():
         build_probe_command(
             "verify.journal_pattern",
             {"unit": "nginx", "lines": "200", "pattern": "error"},
+        ),
+        build_probe_command(
+            "package.installed", {"manager": "apt", "package": "nginx"},
+        ),
+        build_probe_command(
+            "package.installed", {"manager": "dnf", "package": "nginx"},
         ),
     ]
     for command in commands:

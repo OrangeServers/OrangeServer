@@ -101,6 +101,75 @@ def _utcnow() -> datetime.datetime:
     return datetime.datetime.utcnow()
 
 
+def _approval_ttl_seconds(ttl_seconds=None) -> int:
+    """draft/待审批有效期；默认读配置（ROADMAP 约定 24 小时）。"""
+    if ttl_seconds is not None:
+        return max(1, int(ttl_seconds))
+    from app.core import config
+    return config.AI_AUTONOMY_APPROVAL_TTL_SECONDS
+
+
+def _expire_run_row(session, run, reason: str) -> None:
+    """把活动 Run 落 expired 并追加事件（调用方负责提交）。"""
+    assert_run_transition(run.status, RunStatus.EXPIRED.value)
+    run.status = RunStatus.EXPIRED.value
+    run.completed_at = run.completed_at or _utcnow()
+    run.revision = int(run.revision or 0) + 1
+    seq = int(run.latest_event_seq or 0) + 1
+    from app.core.db.database import t_ai_autonomous_event
+    session.add(t_ai_autonomous_event(
+        run_id=run.id,
+        sequence=seq,
+        event_type='run_expired',
+        payload_json=json.dumps(
+            sanitize_payload({'reason': reason}), ensure_ascii=False,
+        ),
+    ))
+    run.latest_event_seq = seq
+
+
+def sweep_expired_runs(session, ttl_seconds=None, now=None) -> Dict[str, int]:
+    """清扫超期的 draft 与待审批 Run（Worker 启动扫描兼周期兜底）。
+
+    - draft 超期未启动 → expired；
+    - 待审批 Step 超期未决策 → Step 落 cancelled，Run 落 expired；
+    绝不自动越过审批，也不碰租约被持有的活动 Run。
+    """
+    from app.core.db.database import (
+        t_ai_autonomous_run, t_ai_autonomous_step,
+    )
+
+    now = now or _utcnow()
+    cutoff = now - datetime.timedelta(seconds=_approval_ttl_seconds(ttl_seconds))
+    expired = 0
+
+    drafts = session.query(t_ai_autonomous_run).filter(
+        t_ai_autonomous_run.status == RunStatus.DRAFT.value,
+        t_ai_autonomous_run.updated_at < cutoff,
+    ).all()
+    for run in drafts:
+        _expire_run_row(session, run, 'draft_expired')
+        expired += 1
+
+    stale_steps = session.query(t_ai_autonomous_step).filter(
+        t_ai_autonomous_step.status == StepStatus.WAITING_APPROVAL.value,
+        t_ai_autonomous_step.updated_at < cutoff,
+    ).all()
+    stale_run_ids = sorted({step.run_id for step in stale_steps})
+    for step in stale_steps:
+        assert_step_transition(step.status, StepStatus.CANCELLED.value)
+        step.status = StepStatus.CANCELLED.value
+        step.note = 'approval expired'
+    for run_id in stale_run_ids:
+        run = session.query(t_ai_autonomous_run).filter_by(id=run_id).first()
+        if run is not None and run.status == RunStatus.WAITING_APPROVAL.value:
+            _expire_run_row(session, run, 'approval_expired')
+            expired += 1
+    if expired:
+        session.commit()
+    return {'expired_runs': expired, 'cancelled_steps': len(stale_steps)}
+
+
 class AutonomyRepository:
     """owner 隔离的自治任务持久层。"""
 
@@ -176,6 +245,16 @@ class AutonomyRepository:
     def _bump(self, run_row) -> int:
         run_row.revision = int(run_row.revision or 0) + 1
         return run_row.revision
+
+    @staticmethod
+    def _is_stale(stamp) -> bool:
+        """时间戳早于有效期切点即视为过期（draft/待审批）。"""
+        if stamp is None:
+            return False
+        cutoff = _utcnow() - datetime.timedelta(
+            seconds=_approval_ttl_seconds(),
+        )
+        return stamp < cutoff
 
     def _run_to_dict(self, row) -> Dict[str, Any]:
         return {
@@ -294,6 +373,15 @@ class AutonomyRepository:
     def start_run(self, owner: str, role: str, run_id: str) -> Dict[str, Any]:
         run = self._get_run_row(owner, run_id)
         self._revalidate_boundaries(owner, role, run)
+        # 惰性过期：draft 超过有效期未启动即落 expired，绝不带着
+        # 陈旧草稿开跑。
+        if (
+            run.status == RunStatus.DRAFT.value
+            and self._is_stale(run.updated_at)
+        ):
+            _expire_run_row(self.session, run, 'draft_expired')
+            self._commit()
+            raise AutonomyConflict('draft expired; start denied')
         assert_run_transition(run.status, RunStatus.QUEUED.value)
         run.status = RunStatus.QUEUED.value
         run.started_at = run.started_at or _utcnow()
@@ -463,6 +551,20 @@ class AutonomyRepository:
         if step is None:
             # 跨 Run 的 step_id 与不存在的 step 一律冲突，不泄露存在性。
             raise AutonomyConflict('step does not belong to this run')
+
+        # 惰性过期：待审批超过有效期即落 cancelled，Run 落 expired，
+        # 绝不接受陈旧审批。
+        if (
+            step.status == StepStatus.WAITING_APPROVAL.value
+            and self._is_stale(step.updated_at)
+        ):
+            assert_step_transition(step.status, StepStatus.CANCELLED.value)
+            step.status = StepStatus.CANCELLED.value
+            step.note = 'approval expired'
+            if run.status == RunStatus.WAITING_APPROVAL.value:
+                _expire_run_row(self.session, run, 'approval_expired')
+            self._commit()
+            raise AutonomyConflict('approval window expired')
 
         allowed = self.allowed_operations(owner, run_id)
         if str(operation or '') not in allowed:

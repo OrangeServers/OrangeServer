@@ -261,6 +261,11 @@ AI_AUTONOMY_REDIS_PASSWORD = str(_env('OGS_AI_AUTONOMY_REDIS_PASSWORD', ''))
 AI_AUTONOMY_LEASE_TTL_SECONDS = max(
     10, int(_env('OGS_AI_AUTONOMY_LEASE_TTL_SECONDS', '120')),
 )
+#   M1/S2: draft 与待审批的有效期（ROADMAP 默认 24 小时）；超时后
+#   Run 落 expired，待审 Step 落 cancelled，绝不自动越过审批。
+AI_AUTONOMY_APPROVAL_TTL_SECONDS = max(
+    60, int(_env('OGS_AI_AUTONOMY_APPROVAL_TTL_SECONDS', '86400')),
+)
 
 # REVIEW-11-P1-1: SSH 危险命令黑名单
 #   拦截 rm -rf / / mkfs / dd if= / shutdown / reboot / fork 炸弹 等
