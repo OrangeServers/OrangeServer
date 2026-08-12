@@ -162,6 +162,10 @@ CREATE TABLE `t_ai_autonomous_run` (
   `budget_json` text NOT NULL,
   `latest_event_seq` int NOT NULL DEFAULT 0,
   `cancel_requested` tinyint(1) NOT NULL DEFAULT 0,
+  `lease_owner` varchar(64) DEFAULT NULL,
+  `lease_expires_at` datetime DEFAULT NULL,
+  `heartbeat_at` datetime DEFAULT NULL,
+  `graph_version` varchar(32) NOT NULL DEFAULT 'v1',
   `started_at` datetime DEFAULT NULL,
   `completed_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -171,7 +175,8 @@ CREATE TABLE `t_ai_autonomous_run` (
   KEY `idx_ai_auto_run_host` (`host_id`),
   KEY `idx_ai_auto_run_status` (`status`),
   KEY `idx_ai_auto_run_created_at` (`created_at`),
-  KEY `idx_ai_auto_run_updated_at` (`updated_at`)
+  KEY `idx_ai_auto_run_updated_at` (`updated_at`),
+  KEY `idx_ai_auto_run_lease_expires` (`lease_expires_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE `t_ai_autonomous_step` (

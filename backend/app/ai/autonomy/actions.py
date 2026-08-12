@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
-"""M1/S1: 结构化动作 schema、服务端探针与审批 digest。
+"""M1/S1+S2: 结构化动作 schema、服务端探针/写模板与审批 digest。
 
 锁定的安全契约：
 - 自动的只读工作只接受服务端自有探针 ID + 校验过的结构化参数；
   模型或调用方不能把任意 Shell 标记为只读。
+- S2 有界读取：文件/日志读取限制行数与根目录白名单，敏感路径
+  在参数层即被永久拒绝。
+- S2 结构化写动作（systemd 服务操作、包安装、文件补丁与恢复）
+  同样只接受服务端模板 + 白名单参数；永远不会自动执行，执行前
+  落写意图。文件补丁必须有备份并可恢复（v1 唯一回退承诺）。
 - 动作快照在审批前不可变地落库；凭据只以 ID 引用存在，永不进入
   快照、digest、Event 或响应。
 - digest 绑定动作版本、目标、凭据引用、工具(kind/probe)、规范化
@@ -13,6 +18,7 @@ import hashlib
 import hmac
 import json
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
@@ -27,6 +33,12 @@ _PARAM_FORBIDDEN_RE = re.compile(r"[|&;<>()`$\\\"'\n\r\t]")
 
 # 服务端自有探针：命令模板完全由服务端持有，参数白名单校验。
 # 每个探针都是只读探测；新增探针必须过安全评审。
+#
+# S2 有界读取与验证探针：
+# - file.read_bounded / log.tail 的行数上限 999，路径只允许白名单
+#   根目录，`..` 逐段拒绝，敏感路径复用 policy.is_sensitive_path；
+# - verify.* 探针的退出码即验证结论（0 = 通过），模板不含任何
+#   Shell 元字符。
 _PROBES: Dict[str, Dict[str, Any]] = {
     'system.load': {
         'title': '系统负载',
@@ -50,7 +62,348 @@ _PROBES: Dict[str, Dict[str, Any]] = {
             'unit': re.compile(r'^[A-Za-z0-9@:._-]{1,128}$'),
         },
     },
+    'file.read_bounded': {
+        'title': '有界文件读取',
+        'command': 'head -n {lines} -- {path}',
+        'params': {
+            'lines': re.compile(r'^[1-9][0-9]{0,2}$'),
+            'path': re.compile(r'^/[A-Za-z0-9._/-]{1,255}$'),
+        },
+        'check': lambda params: _check_bounded_path(
+            params, _FILE_READ_ROOTS,
+        ),
+    },
+    'log.tail': {
+        'title': '有界日志读取',
+        'command': 'tail -n {lines} -- {path}',
+        'params': {
+            'lines': re.compile(r'^[1-9][0-9]{0,2}$'),
+            'path': re.compile(r'^/[A-Za-z0-9._/-]{1,255}$'),
+        },
+        'check': lambda params: _check_bounded_path(
+            params, _LOG_TAIL_ROOTS,
+        ),
+    },
+    'verify.port_open': {
+        'title': '端口连通性验证',
+        'command': 'nc -z -w 5 {host} {port}',
+        'params': {
+            'host': re.compile(r'^[A-Za-z0-9.-]{1,253}$'),
+            'port': re.compile(r'^[1-9][0-9]{0,4}$'),
+        },
+        'check': lambda params: _check_port_range(params),
+    },
+    'verify.http_status': {
+        'title': 'HTTP 状态验证',
+        'command': (
+            'curl --silent --show-error --output /dev/null'
+            ' --write-out %{{http_code}} --max-time 10 {url}'
+        ),
+        'params': {
+            # 只允许 scheme://host[:port]/path；查询串、凭据与元字符
+            # 在白名单字符集之外，直接拒绝。
+            'url': re.compile(r'^https?://[A-Za-z0-9._:/-]{1,500}$'),
+        },
+    },
+    'verify.process_running': {
+        'title': '进程存在性验证',
+        'command': 'pgrep -c -x {process}',
+        'params': {
+            'process': re.compile(r'^[A-Za-z0-9._-]{1,64}$'),
+        },
+    },
+    'verify.journal_pattern': {
+        'title': '服务日志关键字验证',
+        'command': (
+            'journalctl -u {unit} -n {lines} --no-pager -g {pattern}'
+        ),
+        'params': {
+            'unit': re.compile(r'^[A-Za-z0-9@:._-]{1,128}$'),
+            'lines': re.compile(r'^[1-9][0-9]{0,2}$'),
+            'pattern': re.compile(r'^[A-Za-z0-9._:-]{1,128}$'),
+        },
+    },
+    'package.installed': {
+        'title': '包安装状态查询（只读）',
+        'selector': 'manager',
+        'command': {
+            'apt': 'dpkg -s {package}',
+            'dnf': 'rpm -q {package}',
+        },
+        'params': {
+            'manager': re.compile(r'^(apt|dnf)$'),
+            'package': re.compile(r'^[A-Za-z0-9][A-Za-z0-9+._-]{0,127}$'),
+        },
+    },
 }
+
+# 有界读取的根目录白名单；log.tail 进一步收紧到 /var/log。
+# 新增根目录必须过安全评审。
+_FILE_READ_ROOTS = ('/var/log', '/etc', '/opt')
+_LOG_TAIL_ROOTS = ('/var/log',)
+
+# 文件补丁只开放配置目录（/etc、/opt）；补丁前自动备份到目标
+# 文件同目录的受管备份目录，恢复只接受白名单后缀的备份名。
+_PATCH_ROOTS = ('/etc', '/opt')
+PATCH_BACKUP_DIR = '.ogs-autonomy-backup'
+_PATCH_BACKUP_SUFFIX_RE = re.compile(
+    r'\.ogs-bak-[0-9a-f]{12}$'
+)
+
+# 结构化文件补丁的内容上限（字节）：审批单元保持可审，大文件
+# 变更不在 v1 承诺范围。远端备份是原文件的完整副本，不受此限。
+PATCH_CONTENT_MAX_BYTES = 8192
+
+
+def _check_bounded_path(params: Dict[str, str], roots) -> None:
+    """有界读取路径复核：逐段拒绝 `..`，限定根目录，敏感路径拒绝。
+
+    符号链接逃逸不在 v1 承诺范围内；白名单根目录已经把攻击面收到
+    最小，剩余风险由审批与审计兜底。
+    """
+    # 延迟导入：policy 依赖本模块的 StructuredAction。
+    from app.ai.autonomy.policy import is_sensitive_path
+
+    path = str(params.get('path') or '')
+    parts = [part for part in path.split('/') if part]
+    if '..' in parts or '.' in parts:
+        raise ActionValidationError('path traversal is not allowed')
+    if not any(
+        path == root or path.startswith(root + '/') for root in roots
+    ):
+        raise ActionValidationError(
+            'path is outside the bounded read roots'
+        )
+    if is_sensitive_path(path):
+        raise ActionValidationError(
+            'sensitive path is denied by server policy'
+        )
+
+
+def _check_port_range(params: Dict[str, str]) -> None:
+    port = int(params['port'])
+    if port < 1 or port > 65535:
+        raise ActionValidationError('port must be within 1..65535')
+
+
+# ---------------------------------------------------------------------------
+# 结构化写动作：服务端模板 + 白名单参数，永不自动
+# ---------------------------------------------------------------------------
+
+# 与探针同构的写模板注册表：命令模板完全由服务端持有。新增写
+# 模板必须过安全评审。约束：
+# - systemd 只开放 start/stop/restart；status 走只读探针
+#   service.status，enable/disable/mask 属高影响变更，v1 不开放；
+# - 包安装只能从已配置源安装（模板不携带任何新增源的能力）；
+#   新增源属“永远精确审批”类，v1 不做。
+_WRITE_TEMPLATES: Dict[str, Dict[str, Any]] = {
+    'systemd': {
+        'title': 'systemd 服务操作',
+        'command': 'systemctl {operation} {unit}',
+        'params': {
+            'operation': re.compile(r'^(start|stop|restart)$'),
+            'unit': re.compile(r'^[A-Za-z0-9@:._-]{1,128}$'),
+        },
+    },
+    'package_install': {
+        'title': '包安装（仅限已配置源）',
+        'selector': 'manager',
+        'command': {
+            'apt': (
+                'apt-get install --assume-yes'
+                ' --no-install-recommends {package}'
+            ),
+            'dnf': 'dnf install --assumeyes {package}',
+        },
+        'params': {
+            'manager': re.compile(r'^(apt|dnf)$'),
+            'package': re.compile(r'^[A-Za-z0-9][A-Za-z0-9+._-]{0,127}$'),
+        },
+    },
+}
+
+
+def list_write_kinds():
+    """结构化写动作 kind 列表（供测试与后续提案入口）。"""
+    return sorted(_WRITE_TEMPLATES)
+
+
+def _write_spec(kind: str) -> Dict[str, Any]:
+    spec = _WRITE_TEMPLATES.get(str(kind or ''))
+    if spec is None:
+        raise ActionValidationError(
+            'unknown write action kind: %r' % (kind,)
+        )
+    return spec
+
+
+def validate_write_action(kind: str, params: Dict[str, Any]) -> Dict[str, str]:
+    """校验结构化写动作参数，返回规范化参数（与探针同构）。"""
+    spec = _write_spec(kind)
+    declared = spec['params']
+    params = params or {}
+    unknown = set(params) - set(declared)
+    if unknown:
+        raise ActionValidationError(
+            'unexpected parameters: %s' % ', '.join(sorted(unknown))
+        )
+    missing = set(declared) - set(params)
+    if missing:
+        raise ActionValidationError(
+            'missing parameters: %s' % ', '.join(sorted(missing))
+        )
+    normalized = {}
+    for key, pattern in declared.items():
+        value = str(params[key])
+        if _PARAM_FORBIDDEN_RE.search(value):
+            raise ActionValidationError(
+                'parameter %r contains shell metacharacters' % (key,)
+            )
+        if not pattern.match(value):
+            raise ActionValidationError(
+                'parameter %r does not match the whitelist' % (key,)
+            )
+        normalized[key] = value
+    return normalized
+
+
+def build_write_command(kind: str, params: Dict[str, Any]) -> str:
+    """由服务端写模板构造最终命令。
+
+    除探针同构的白名单/元字符自检外，构造结果再过一次永久拒绝
+    清单（如 stop auditd 这种绕过审计的服务操作）。
+    """
+    # 延迟导入：policy 依赖本模块。
+    from app.ai.autonomy.policy import permanent_deny_reason
+
+    spec = _write_spec(kind)
+    normalized = validate_write_action(kind, params)
+    template = spec['command']
+    if isinstance(template, dict):
+        template = template[normalized[spec['selector']]]
+    command = template.format(**normalized)
+    if _PARAM_FORBIDDEN_RE.search(command):
+        raise ActionValidationError('constructed command failed safety guard')
+    deny_reason = permanent_deny_reason(command)
+    if deny_reason is not None:
+        raise ActionValidationError(
+            'constructed command is permanently denied: %s' % (deny_reason,)
+        )
+    return command
+
+
+# ---------------------------------------------------------------------------
+# 结构化文件补丁：备份 + 写入 + 恢复（v1 唯一回退承诺）
+# ---------------------------------------------------------------------------
+
+# 补丁内容的控制字符清洗：保留换行/回车/制表符（文本补丁必需），
+# 其余控制字符全部剔除，防止 ANSI/终端注入。
+_PATCH_CONTROL_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def _shell_single_quote(text: str) -> str:
+    """POSIX 单引号安全转义：'→'\\''。"""
+    return "'" + str(text).replace("'", "'\\''") + "'"
+
+
+def patch_backup_path(path: str, run_id: str, step_id: str) -> str:
+    """确定性备份路径：同目录受管备份目录 + 原名 + 派生 token。
+
+    token 由 path/run/step 确定性派生，不含时钟：提案时即可写入
+    digest，执行期复算一致，恢复动作无需依赖执行期产物。
+    """
+    token = uuid.uuid5(
+        uuid.NAMESPACE_OID, '%s|%s|%s' % (path, run_id, step_id),
+    ).hex[:12]
+    name = path.rsplit('/', 1)[-1]
+    return '%s/%s/%s.ogs-bak-%s' % (
+        path.rsplit('/', 1)[0], PATCH_BACKUP_DIR, name, token,
+    )
+
+
+def build_file_patch_command(
+    path: str, content: str, backup_path: str,
+) -> str:
+    """构造补丁命令：建备份目录 + 整文件备份 + 写入新内容。
+
+    三段以 && 串联：备份失败绝不写入。本构造器不走通用模板白名单
+    （内容天然含元字符），安全性由路径白名单 + 单引号转义 + 永久
+    拒绝清单承担。
+    """
+    from app.ai.autonomy.policy import permanent_deny_reason
+
+    _check_patch_path(path)
+    text = _PATCH_CONTROL_RE.sub('', str(content or ''))
+    if len(text.encode('utf-8')) > PATCH_CONTENT_MAX_BYTES:
+        raise ActionValidationError(
+            'patch content exceeds %d bytes' % PATCH_CONTENT_MAX_BYTES
+        )
+    if not text:
+        raise ActionValidationError('patch content is empty')
+    backup_dir = backup_path.rsplit('/', 1)[0]
+    command = 'mkdir -p -- %s && cp -p -- %s %s && printf %%s %s > %s' % (
+        _shell_single_quote(backup_dir),
+        _shell_single_quote(path),
+        _shell_single_quote(backup_path),
+        _shell_single_quote(text),
+        _shell_single_quote(path),
+    )
+    deny_reason = permanent_deny_reason(command)
+    if deny_reason is not None:
+        raise ActionValidationError(
+            'constructed command is permanently denied: %s' % (deny_reason,)
+        )
+    return command
+
+
+def build_file_restore_command(path: str, backup_path: str) -> str:
+    """构造恢复命令：把受管备份复制回目标路径（保留权限）。"""
+    from app.ai.autonomy.policy import permanent_deny_reason
+
+    _check_patch_path(path)
+    expected_dir = '%s/%s' % (path.rsplit('/', 1)[0], PATCH_BACKUP_DIR)
+    if not backup_path.startswith(expected_dir + '/'):
+        raise ActionValidationError(
+            'backup must live in the managed backup directory'
+        )
+    name = backup_path.rsplit('/', 1)[-1]
+    if '/' in name or not _PATCH_BACKUP_SUFFIX_RE.search(name):
+        raise ActionValidationError(
+            'backup name does not match the managed suffix whitelist'
+        )
+    command = 'cp -p -- %s %s' % (
+        _shell_single_quote(backup_path),
+        _shell_single_quote(path),
+    )
+    deny_reason = permanent_deny_reason(command)
+    if deny_reason is not None:
+        raise ActionValidationError(
+            'constructed command is permanently denied: %s' % (deny_reason,)
+        )
+    return command
+
+
+def _check_patch_path(path: str) -> None:
+    """补丁路径复核：白名单根 + 逐段拒绝 `..` + 敏感路径拒绝。"""
+    from app.ai.autonomy.policy import is_sensitive_path
+
+    normalized = str(path or '')
+    if not re.match(r'^/[A-Za-z0-9._/-]{1,255}$', normalized):
+        raise ActionValidationError('patch path is malformed')
+    parts = [part for part in normalized.split('/') if part]
+    if '..' in parts or '.' in parts:
+        raise ActionValidationError('path traversal is not allowed')
+    if not any(
+        normalized == root or normalized.startswith(root + '/')
+        for root in _PATCH_ROOTS
+    ):
+        raise ActionValidationError(
+            'patch path is outside the allowed roots'
+        )
+    if is_sensitive_path(normalized):
+        raise ActionValidationError(
+            'sensitive path is denied by server policy'
+        )
 
 
 class ActionValidationError(Exception):
@@ -112,7 +465,9 @@ def validate_probe(probe_id: str, params: Dict[str, Any]) -> Dict[str, str]:
     - 未知探针直接拒绝；
     - 参数集合必须与探针声明完全一致（不允许多余参数，防止注入
       伪装成合法探针的额外字段）；
-    - 每个参数值必须匹配探针的白名单正则，且不含任何 Shell 元字符。
+    - 每个参数值必须匹配探针的白名单正则，且不含任何 Shell 元字符；
+    - 探针可选声明 check 钩子，做正则表达不了的语义复核（路径根
+      白名单、端口范围等）。
     """
     spec = probe_spec(probe_id)
     declared = spec['params']
@@ -139,6 +494,9 @@ def validate_probe(probe_id: str, params: Dict[str, Any]) -> Dict[str, str]:
                 'parameter %r does not match the probe whitelist' % (key,)
             )
         normalized[key] = value
+    check = spec.get('check')
+    if check is not None:
+        check(normalized)
     return normalized
 
 
@@ -146,11 +504,20 @@ def build_probe_command(probe_id: str, params: Dict[str, Any]) -> str:
     """由服务端模板构造最终命令。
 
     模板与参数都来自服务端白名单；构造结果再做一次元字符自检，
-    双重防御模板维护失误。
+    双重防御模板维护失误。模板中的字面花括号（如 curl 的
+    %{http_code}）必须写成双花括号转义，避免被 format 误解析。
     """
     spec = probe_spec(probe_id)
     normalized = validate_probe(probe_id, params)
-    command = spec['command'].format(**normalized) if normalized else spec['command']
+    template = spec['command']
+    if isinstance(template, dict):
+        # 与写模板同构的 selector 分发（如包查询按管理器选命令）。
+        template = template[normalized[spec['selector']]]
+    if normalized:
+        # format 会把双花括号转义还原为字面花括号。
+        command = template.format(**normalized)
+    else:
+        command = template.replace('{{', '{').replace('}}', '}')
     if _PARAM_FORBIDDEN_RE.search(command):
         raise ActionValidationError('constructed command failed safety guard')
     return command

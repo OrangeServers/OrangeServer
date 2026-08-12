@@ -1,18 +1,24 @@
 # -*- coding: utf-8 -*-
-"""M1/S1: 服务端动作策略、预算与敏感路径规则。
+"""M1/S1+S2: 服务端动作策略、预算、敏感路径与永久拒绝清单。
 
 策略完全由服务端持有：
 - probe（服务端自有探针）是唯一可自动执行的只读动作；
 - file_read 永不自动：敏感路径直接拒绝，其余等待精确审批；
+- systemd/package_install 结构化写动作永不自动：read_only 拒绝，
+  其余等待精确审批；参数在 actions.validate_write_action 白名单
+  校验，构造结果再过永久拒绝清单；
 - shell 永不自动：read_only 模式直接拒绝，其余等待精确审批；
   含管道/重定向/解释器/下载执行等特征时按高危处理。
+- 永久拒绝清单（磁盘分区格式化、根目录宽删、主动读秘密、横向
+  SSH、绕过审计）即使命中人工精确审批也不执行；黑名单只提供
+  风险信号，永久拒绝清单才是硬规则。
 - lab_autonomous 仅由管理员维护的 t_host.ai_environment='lab'
   授予；名为 lab 的普通资产组不带来任何自治能力。
 """
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from app.ai.autonomy.actions import StructuredAction
 from app.ai.autonomy.state import AiEnvironment, RunMode
@@ -119,6 +125,58 @@ def is_sensitive_path(path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 永久拒绝清单（ROADMAP「模式和动作」）：即使有精确人工审批也拒绝
+# ---------------------------------------------------------------------------
+
+_PERMANENT_DENY_PATTERNS = (
+    (re.compile(r'\bmkfs(\.[a-z0-9]+)?\b'),
+     'disk formatting is permanently denied'),
+    (re.compile(r'\b(fdisk|parted|sgdisk|wipefs)\b'),
+     'disk partitioning is permanently denied'),
+    (re.compile(r'\bdd\b[^|;&]*\bof=/dev/'),
+     'raw writes to block devices are permanently denied'),
+    (re.compile(r'\brm\b[^\n]*--no-preserve-root'),
+     'root filesystem deletion is permanently denied'),
+    # rm 带任意旗标且目标是 / 或 /*：根目录宽范围删除。
+    (re.compile(r'\brm\s+(-[a-zA-Z]+\s+)+/\*?(\s|$)'),
+     'root filesystem deletion is permanently denied'),
+    (re.compile(r'\bssh\s'), 'lateral SSH is permanently denied'),
+    (re.compile(r'\b(scp|sftp)\s'),
+     'lateral SSH transfer is permanently denied'),
+    (re.compile(r'\bsetenforce\s+0\b'),
+     'disabling SELinux is permanently denied'),
+    (re.compile(r'\bauditctl\s+(-D|-e\s+0)'),
+     'disabling audit is permanently denied'),
+    (re.compile(r'\bsystemctl\s+(stop|disable|mask)\s+auditd\b'),
+     'disabling the audit service is permanently denied'),
+)
+
+# 命令文本中出现秘密载体即视为主动读取密钥（v1 永久拒绝）。
+# 宁严勿漏：合法维护走精确审批的结构化动作，不走任意 Shell。
+_SECRET_TARGET_RE = re.compile(
+    r'/etc/shadow\b|/etc/gshadow\b|/etc/sudoers\b|/etc/ssl/private/'
+    r'|\.ssh/|id_(rsa|dsa|ecdsa|ed25519)\b|\.pem\b|(^|\s)/[^ ]*\.env(\.|\b)'
+)
+
+
+def permanent_deny_reason(command: str) -> Optional[str]:
+    """永久拒绝清单复核：命中返回拒绝原因，否则返回 None。
+
+    在执行器构造命令时与提案分类时都会调用；清单是服务端硬
+    规则，审批不能推翻。
+    """
+    text = str(command or '')
+    if not text.strip():
+        return None
+    for pattern, reason in _PERMANENT_DENY_PATTERNS:
+        if pattern.search(text):
+            return reason
+    if _SECRET_TARGET_RE.search(text):
+        return 'reading secrets is permanently denied'
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Shell 命令风险特征：黑名单只提供风险信号，命中即不可自动
 # ---------------------------------------------------------------------------
 
@@ -137,12 +195,16 @@ _SHELL_RISK_PATTERNS = (
 def classify_shell_command(command: str) -> Tuple[ApprovalDecision, str]:
     """对任意 Shell 文本做风险分级。
 
-    shell 动作永远不可能自动执行；这里进一步把伪装写入、管道、
-    重定向、解释器和下载命令标记为永久拒绝，其余要求精确审批。
+    shell 动作永远不可能自动执行；永久拒绝清单命中直接拒绝，
+    再把伪装写入、管道、重定向、解释器和下载命令标记为拒绝，
+    其余要求精确审批。
     """
     text = str(command or '')
     if not text.strip():
         return ApprovalDecision.DENIED, 'empty command'
+    deny_reason = permanent_deny_reason(text)
+    if deny_reason is not None:
+        return ApprovalDecision.DENIED, deny_reason
     for pattern, reason in _SHELL_RISK_PATTERNS:
         if pattern.search(text):
             return ApprovalDecision.DENIED, reason
@@ -173,7 +235,11 @@ def classify_action(
     - probe 是服务端自有只读探针，任何模式下都可自动（参数在
       actions.validate_probe 已白名单校验）；
     - file_read 敏感路径拒绝，其余任何模式都要求审批；
-    - shell 在 read_only 拒绝，其余要求审批，永不自动。
+    - shell 在 read_only 拒绝，其余要求审批，永不自动；
+    - systemd/package_install 结构化写动作在 read_only 拒绝，其余
+      要求精确审批，永不自动；
+    - file_patch/file_restore 带备份承诺的文件写动作同样永不自动：
+      read_only 拒绝，敏感路径拒绝，其余要求精确审批。
     """
     RunMode(mode)
     AiEnvironment(environment)
@@ -186,7 +252,34 @@ def classify_action(
             return ApprovalDecision.DENIED, 'sensitive path is denied by server policy'
         return ApprovalDecision.APPROVAL_REQUIRED, 'general file reads are never automatic'
     if kind == 'shell':
+        command = str(action.parameters.get('command') or '')
+        decision, reason = classify_shell_command(command)
+        if decision == ApprovalDecision.DENIED:
+            return ApprovalDecision.DENIED, reason
         if mode == RunMode.READ_ONLY.value:
             return ApprovalDecision.DENIED, 'shell actions are denied in read_only mode'
-        return ApprovalDecision.APPROVAL_REQUIRED, 'arbitrary shell requires exact approval'
+        return ApprovalDecision.APPROVAL_REQUIRED, reason
+    if kind in ('systemd', 'package_install'):
+        # 结构化写动作：模板与参数白名单在 actions 层校验；这里
+        # 只决定审批策略——永不自动。
+        if mode == RunMode.READ_ONLY.value:
+            return ApprovalDecision.DENIED, (
+                '%s actions are denied in read_only mode' % kind
+            )
+        return ApprovalDecision.APPROVAL_REQUIRED, (
+            'structured write requires exact approval'
+        )
+    if kind in ('file_patch', 'file_restore'):
+        # 文件写动作：路径白名单与敏感路径复核在 actions 层；
+        # 敏感路径在策略层先拒绝，其余永不自动。
+        path = str(action.parameters.get('path') or '')
+        if is_sensitive_path(path):
+            return ApprovalDecision.DENIED, 'sensitive path is denied by server policy'
+        if mode == RunMode.READ_ONLY.value:
+            return ApprovalDecision.DENIED, (
+                '%s actions are denied in read_only mode' % kind
+            )
+        return ApprovalDecision.APPROVAL_REQUIRED, (
+            'file write requires exact approval'
+        )
     return ApprovalDecision.DENIED, 'unknown action kind'

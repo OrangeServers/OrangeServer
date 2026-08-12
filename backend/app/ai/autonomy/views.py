@@ -86,6 +86,17 @@ def _guarded(role):
     return None
 
 
+def _dispatch_drive(run_id):
+    """状态推进后显式唤醒 Worker；投递失败不阻断接口，
+    启动扫描与租约过期认领是兜底。"""
+    try:
+        from app.ai.autonomy import worker
+
+        worker.dispatch_drive_run(run_id)
+    except Exception:
+        logger.exception('autonomy drive dispatch failed')
+
+
 def create_run():
     _holder, owner, role = _identity()
     blocked = _guarded(role)
@@ -114,6 +125,7 @@ def start_run(run_id):
         return blocked
     try:
         run = _repo().start_run(owner, role, run_id)
+        _dispatch_drive(run_id)
         return api_response(data=run, run=run)
     except Exception as exc:
         db.session.rollback()
@@ -178,6 +190,7 @@ def decide_step(run_id, step_id):
             operation=str(payload.get('operation') or ''),
             expected_revision=payload.get('expected_revision'),
         )
+        _dispatch_drive(run_id)
         return api_response(data=step, step=step)
     except Exception as exc:
         db.session.rollback()

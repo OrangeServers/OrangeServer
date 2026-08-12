@@ -7,7 +7,7 @@ SQLite 内存引擎 + 注入式 session，绕开全局 patch 验证真实落库�
 import json
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from app.ai.autonomy.actions import (
@@ -141,6 +141,61 @@ def test_create_run_defaults_and_event_trail(repo_env):
     assert payload["system_user_id"] == 19
     assert "password" not in payload
     assert "credential" not in json.dumps(payload)
+
+
+def test_create_run_inserts_run_before_first_event_under_fk():
+    """强制外键下 create_run 必须先落 run 再落首个事件。
+
+    完成门（真实 MySQL）发现：ORM 无 relationship 时 flush 不保证
+    父子插入顺序，SQLite 默认不强制外键所以历史测试全绿，真实
+    MySQL 会拒绝先插入的事件行。这里用 PRAGMA 强制外键复现。
+    """
+    engine = create_engine("sqlite:///:memory:")
+
+    @event.listens_for(engine, "connect")
+    def _enforce_fk(dbapi_conn, _record):
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+    db.metadata.create_all(
+        engine,
+        tables=[
+            t_group.__table__,
+            t_host.__table__,
+            t_ai_autonomous_run.__table__,
+            t_ai_autonomous_step.__table__,
+            t_ai_autonomous_event.__table__,
+        ],
+    )
+    session = sessionmaker(bind=engine)()
+    try:
+        platform_state = {"asset_ok": True, "credential_ok": True,
+                          "calls": []}
+        repo = AutonomyRepository(
+            session, SECRET_KEY,
+            platform_factory=lambda o, r: FakePlatform(o, r, platform_state),
+        )
+        host = t_host(
+            alias="web-fk", host_ip="203.0.113.99", host_port=22,
+            ai_environment="lab",
+        )
+        session.add(host)
+        session.commit()
+
+        run = repo.create_run(
+            "admin", "admin",
+            goal="fk ordering regression",
+            host_id=int(host.id),
+            system_user_id=19,
+            mode="assisted",
+        )
+        assert run["status"] == "draft"
+        rows = session.query(t_ai_autonomous_event).filter_by(
+            run_id=run["id"],
+        ).all()
+        assert [row.event_type for row in rows] == ["run_created"]
+    finally:
+        session.close()
+        engine.dispose()
 
 
 @pytest.mark.parametrize("overrides", [

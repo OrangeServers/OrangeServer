@@ -118,6 +118,9 @@ STEP_TRANSITIONS = {
     StepStatus.RUNNING: {
         StepStatus.SUCCEEDED, StepStatus.FAILED,
         StepStatus.OUTCOME_UNKNOWN, StepStatus.CANCELLED,
+        # 只读动作执行中被强杀：恢复层把它回退到 approved 自动重试
+        # （人工审批仍然有效）；是否允许由恢复层按写意图判定。
+        StepStatus.APPROVED,
     },
     # 写动作结果未知：绝不自动重放，只能由人工决策落到终态。
     StepStatus.OUTCOME_UNKNOWN: {StepStatus.SUCCEEDED, StepStatus.FAILED},
