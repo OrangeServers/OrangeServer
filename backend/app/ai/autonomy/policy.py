@@ -237,7 +237,9 @@ def classify_action(
     - file_read 敏感路径拒绝，其余任何模式都要求审批；
     - shell 在 read_only 拒绝，其余要求审批，永不自动；
     - systemd/package_install 结构化写动作在 read_only 拒绝，其余
-      要求精确审批，永不自动。
+      要求精确审批，永不自动；
+    - file_patch/file_restore 带备份承诺的文件写动作同样永不自动：
+      read_only 拒绝，敏感路径拒绝，其余要求精确审批。
     """
     RunMode(mode)
     AiEnvironment(environment)
@@ -266,5 +268,18 @@ def classify_action(
             )
         return ApprovalDecision.APPROVAL_REQUIRED, (
             'structured write requires exact approval'
+        )
+    if kind in ('file_patch', 'file_restore'):
+        # 文件写动作：路径白名单与敏感路径复核在 actions 层；
+        # 敏感路径在策略层先拒绝，其余永不自动。
+        path = str(action.parameters.get('path') or '')
+        if is_sensitive_path(path):
+            return ApprovalDecision.DENIED, 'sensitive path is denied by server policy'
+        if mode == RunMode.READ_ONLY.value:
+            return ApprovalDecision.DENIED, (
+                '%s actions are denied in read_only mode' % kind
+            )
+        return ApprovalDecision.APPROVAL_REQUIRED, (
+            'file write requires exact approval'
         )
     return ApprovalDecision.DENIED, 'unknown action kind'

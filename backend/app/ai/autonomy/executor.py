@@ -16,14 +16,18 @@
 - 取消是请求：cancel_requested 后执行器拒绝开跑新 Step。
 """
 import json
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
 from app.ai.autonomy.actions import (
     ActionValidationError,
     action_from_dict,
+    build_file_patch_command,
+    build_file_restore_command,
     build_probe_command,
     build_write_command,
+    patch_backup_path,
     verify_action_digest,
 )
 from app.ai.autonomy.policy import Budget, permanent_deny_reason
@@ -44,8 +48,10 @@ from app.ai.autonomy.state import (
 
 # 需要“写意图先落库”的动作类别。shell 是通用写入口（永远精确
 # 审批）；systemd/package_install 是服务端模板的结构化写动作；
-# 后续 file_patch 类别在此追加。
-WRITE_KINDS = frozenset({'shell', 'systemd', 'package_install'})
+# file_patch/file_restore 是带备份与恢复承诺的文件写动作。
+WRITE_KINDS = frozenset({
+    'shell', 'systemd', 'package_install', 'file_patch', 'file_restore',
+})
 
 # 已计入动作预算的 Step 状态。
 _EXECUTED_STEP_STATUSES = (
@@ -139,7 +145,7 @@ class AutonomyExecutor:
             raise AutonomyConflict('action digest mismatch')
         return action
 
-    def _build_command(self, action) -> str:
+    def _build_command(self, action, run_id: str) -> str:
         kind = str(action.kind)
         if kind == 'probe':
             probe_id = str(action.parameters.get('probe_id') or '')
@@ -164,6 +170,21 @@ class AutonomyExecutor:
             # 服务端模板构造；白名单与永久拒绝复核在 actions 层。
             try:
                 return build_write_command(kind, action.parameters)
+            except ActionValidationError as exc:
+                raise AutonomyValidationError(str(exc)) from exc
+        if kind == 'file_patch':
+            path = str(action.parameters.get('path') or '')
+            content = str(action.parameters.get('content') or '')
+            backup = patch_backup_path(path, run_id, action.step_id)
+            try:
+                return build_file_patch_command(path, content, backup)
+            except ActionValidationError as exc:
+                raise AutonomyValidationError(str(exc)) from exc
+        if kind == 'file_restore':
+            path = str(action.parameters.get('path') or '')
+            backup = str(action.parameters.get('backup_path') or '')
+            try:
+                return build_file_restore_command(path, backup)
             except ActionValidationError as exc:
                 raise AutonomyValidationError(str(exc)) from exc
         raise AutonomyValidationError(
@@ -211,7 +232,7 @@ class AutonomyExecutor:
         if executed >= budget.max_actions:
             raise AutonomyConflict('action budget exhausted')
 
-        command = self._build_command(action)
+        command = self._build_command(action, run_id)
         timeout = max(
             1, min(budget.command_timeout_seconds, action.timeout_seconds),
         )
@@ -243,6 +264,26 @@ class AutonomyExecutor:
         )
 
         self._apply_result(run, step, action, result, is_write)
+        # 文件补丁成功后把受管备份引用落 artifact（v1 回退承诺的
+        # 可追溯凭据）；备份路径由 path/run/step 确定性派生，执行
+        # 期复算一致，无需解析远端输出。
+        if (
+            str(action.kind) == 'file_patch'
+            and step.status == StepStatus.SUCCEEDED.value
+        ):
+            backup = patch_backup_path(
+                str(action.parameters.get('path') or ''),
+                run_id,
+                str(action.step_id),
+            )
+            self.repo.create_artifact(
+                owner, run_id,
+                kind='backup_ref',
+                title='file_patch backup for %s'
+                % str(action.parameters.get('path') or '')[:96],
+                content=backup,
+                step_id=step_id,
+            )
         return {
             'step_id': step_id,
             'step_status': step.status,

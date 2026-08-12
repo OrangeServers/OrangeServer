@@ -6,8 +6,9 @@
   模型或调用方不能把任意 Shell 标记为只读。
 - S2 有界读取：文件/日志读取限制行数与根目录白名单，敏感路径
   在参数层即被永久拒绝。
-- S2 结构化写动作（systemd 服务操作、包安装）同样只接受服务端
-  模板 + 白名单参数；永远不会自动执行，执行前落写意图。
+- S2 结构化写动作（systemd 服务操作、包安装、文件补丁与恢复）
+  同样只接受服务端模板 + 白名单参数；永远不会自动执行，执行前
+  落写意图。文件补丁必须有备份并可恢复（v1 唯一回退承诺）。
 - 动作快照在审批前不可变地落库；凭据只以 ID 引用存在，永不进入
   快照、digest、Event 或响应。
 - digest 绑定动作版本、目标、凭据引用、工具(kind/probe)、规范化
@@ -17,6 +18,7 @@ import hashlib
 import hmac
 import json
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
@@ -127,6 +129,18 @@ _PROBES: Dict[str, Dict[str, Any]] = {
 # 新增根目录必须过安全评审。
 _FILE_READ_ROOTS = ('/var/log', '/etc', '/opt')
 _LOG_TAIL_ROOTS = ('/var/log',)
+
+# 文件补丁只开放配置目录（/etc、/opt）；补丁前自动备份到目标
+# 文件同目录的受管备份目录，恢复只接受白名单后缀的备份名。
+_PATCH_ROOTS = ('/etc', '/opt')
+PATCH_BACKUP_DIR = '.ogs-autonomy-backup'
+_PATCH_BACKUP_SUFFIX_RE = re.compile(
+    r'\.ogs-bak-[0-9a-f]{12}$'
+)
+
+# 结构化文件补丁的内容上限（字节）：审批单元保持可审，大文件
+# 变更不在 v1 承诺范围。远端备份是原文件的完整副本，不受此限。
+PATCH_CONTENT_MAX_BYTES = 8192
 
 
 def _check_bounded_path(params: Dict[str, str], roots) -> None:
@@ -264,6 +278,120 @@ def build_write_command(kind: str, params: Dict[str, Any]) -> str:
             'constructed command is permanently denied: %s' % (deny_reason,)
         )
     return command
+
+
+# ---------------------------------------------------------------------------
+# 结构化文件补丁：备份 + 写入 + 恢复（v1 唯一回退承诺）
+# ---------------------------------------------------------------------------
+
+# 补丁内容的控制字符清洗：保留换行/回车/制表符（文本补丁必需），
+# 其余控制字符全部剔除，防止 ANSI/终端注入。
+_PATCH_CONTROL_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def _shell_single_quote(text: str) -> str:
+    """POSIX 单引号安全转义：'→'\\''。"""
+    return "'" + str(text).replace("'", "'\\''") + "'"
+
+
+def patch_backup_path(path: str, run_id: str, step_id: str) -> str:
+    """确定性备份路径：同目录受管备份目录 + 原名 + 派生 token。
+
+    token 由 path/run/step 确定性派生，不含时钟：提案时即可写入
+    digest，执行期复算一致，恢复动作无需依赖执行期产物。
+    """
+    token = uuid.uuid5(
+        uuid.NAMESPACE_OID, '%s|%s|%s' % (path, run_id, step_id),
+    ).hex[:12]
+    name = path.rsplit('/', 1)[-1]
+    return '%s/%s/%s.ogs-bak-%s' % (
+        path.rsplit('/', 1)[0], PATCH_BACKUP_DIR, name, token,
+    )
+
+
+def build_file_patch_command(
+    path: str, content: str, backup_path: str,
+) -> str:
+    """构造补丁命令：建备份目录 + 整文件备份 + 写入新内容。
+
+    三段以 && 串联：备份失败绝不写入。本构造器不走通用模板白名单
+    （内容天然含元字符），安全性由路径白名单 + 单引号转义 + 永久
+    拒绝清单承担。
+    """
+    from app.ai.autonomy.policy import permanent_deny_reason
+
+    _check_patch_path(path)
+    text = _PATCH_CONTROL_RE.sub('', str(content or ''))
+    if len(text.encode('utf-8')) > PATCH_CONTENT_MAX_BYTES:
+        raise ActionValidationError(
+            'patch content exceeds %d bytes' % PATCH_CONTENT_MAX_BYTES
+        )
+    if not text:
+        raise ActionValidationError('patch content is empty')
+    backup_dir = backup_path.rsplit('/', 1)[0]
+    command = 'mkdir -p -- %s && cp -p -- %s %s && printf %%s %s > %s' % (
+        _shell_single_quote(backup_dir),
+        _shell_single_quote(path),
+        _shell_single_quote(backup_path),
+        _shell_single_quote(text),
+        _shell_single_quote(path),
+    )
+    deny_reason = permanent_deny_reason(command)
+    if deny_reason is not None:
+        raise ActionValidationError(
+            'constructed command is permanently denied: %s' % (deny_reason,)
+        )
+    return command
+
+
+def build_file_restore_command(path: str, backup_path: str) -> str:
+    """构造恢复命令：把受管备份复制回目标路径（保留权限）。"""
+    from app.ai.autonomy.policy import permanent_deny_reason
+
+    _check_patch_path(path)
+    expected_dir = '%s/%s' % (path.rsplit('/', 1)[0], PATCH_BACKUP_DIR)
+    if not backup_path.startswith(expected_dir + '/'):
+        raise ActionValidationError(
+            'backup must live in the managed backup directory'
+        )
+    name = backup_path.rsplit('/', 1)[-1]
+    if '/' in name or not _PATCH_BACKUP_SUFFIX_RE.search(name):
+        raise ActionValidationError(
+            'backup name does not match the managed suffix whitelist'
+        )
+    command = 'cp -p -- %s %s' % (
+        _shell_single_quote(backup_path),
+        _shell_single_quote(path),
+    )
+    deny_reason = permanent_deny_reason(command)
+    if deny_reason is not None:
+        raise ActionValidationError(
+            'constructed command is permanently denied: %s' % (deny_reason,)
+        )
+    return command
+
+
+def _check_patch_path(path: str) -> None:
+    """补丁路径复核：白名单根 + 逐段拒绝 `..` + 敏感路径拒绝。"""
+    from app.ai.autonomy.policy import is_sensitive_path
+
+    normalized = str(path or '')
+    if not re.match(r'^/[A-Za-z0-9._/-]{1,255}$', normalized):
+        raise ActionValidationError('patch path is malformed')
+    parts = [part for part in normalized.split('/') if part]
+    if '..' in parts or '.' in parts:
+        raise ActionValidationError('path traversal is not allowed')
+    if not any(
+        normalized == root or normalized.startswith(root + '/')
+        for root in _PATCH_ROOTS
+    ):
+        raise ActionValidationError(
+            'patch path is outside the allowed roots'
+        )
+    if is_sensitive_path(normalized):
+        raise ActionValidationError(
+            'sensitive path is denied by server policy'
+        )
 
 
 class ActionValidationError(Exception):

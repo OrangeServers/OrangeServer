@@ -7,6 +7,7 @@ fail-closed（outcome_unknown + needs_attention，绝不重放）、只读
 runner 用替身注入，不触网。
 """
 import json
+import re
 import uuid
 
 import pytest
@@ -16,6 +17,7 @@ from sqlalchemy.orm import sessionmaker
 from app.ai.autonomy.actions import (
     StructuredAction,
     build_action_digest,
+    patch_backup_path,
 )
 from app.ai.autonomy.executor import (
     AutonomyExecutor,
@@ -29,6 +31,7 @@ from app.ai.autonomy.repository import (
 )
 from app.core.db.database import (
     db,
+    t_ai_autonomous_artifact,
     t_ai_autonomous_event,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
@@ -75,7 +78,8 @@ def env():
         tables=[t_group.__table__, t_host.__table__,
                 t_ai_autonomous_run.__table__,
                 t_ai_autonomous_step.__table__,
-                t_ai_autonomous_event.__table__],
+                t_ai_autonomous_event.__table__,
+                t_ai_autonomous_artifact.__table__],
     )
     session = sessionmaker(bind=engine)()
     platform_state = {"asset_ok": True, "credential_ok": True}
@@ -139,9 +143,13 @@ def env():
             timeout_seconds=30,
             step_id=step_id,
         )
+        # (run_id, seq) 唯一：直插 Step 时取下一个空闲 seq。
+        max_seq = session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id,
+        ).count()
         step = t_ai_autonomous_step(
             id=step_id, run_id=run_id, kind="action", status="approved",
-            seq=90, summary="%s step" % kind,
+            seq=90 + max_seq, summary="%s step" % kind,
             action_json=json.dumps(
                 action.to_canonical_dict(), sort_keys=True,
             ),
@@ -465,3 +473,111 @@ def test_step_note_capped_by_budget(env):
     )
     env["executor"].execute_step("admin", "admin", run["id"], step_id)
     assert len(_step_row(env, step_id).note) <= 255
+
+
+# ---------------------------------------------------------------------------
+# 文件补丁与恢复（v1 唯一回退承诺）
+# ---------------------------------------------------------------------------
+
+def _stub_basesec(monkeypatch):
+    import app.tools.basesec as basesec
+
+    monkeypatch.setattr(
+        basesec, "encrypt_secret", lambda text: "enc:%s" % text,
+    )
+
+
+def test_file_patch_success_writes_intent_and_backup_artifact(
+    env, monkeypatch,
+):
+    _stub_basesec(monkeypatch)
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_action_step"](run["id"], "file_patch", {
+        "path": "/etc/app.conf",
+        "content": "workers=4\n",
+    })
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+    assert result["step_status"] == "succeeded"
+    assert result["uncertain"] is False
+
+    # 命令结构：先建备份目录，再整文件备份，最后才写入；
+    # 备份失败（&& 断链）绝不写入新内容。
+    command = env["runner"].calls[0]["command"]
+    assert command.index("mkdir -p") < command.index("cp -p")
+    assert command.index("cp -p") < command.index("printf")
+    assert "'/etc/app.conf'" in command
+
+    # 写意图在副作用之前落库。
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert types.index("write_intent") < types.index("step_executed")
+
+    # 备份引用落 artifact：确定性路径，执行期复算一致。
+    artifacts = env["session"].query(t_ai_autonomous_artifact).filter_by(
+        run_id=run["id"],
+    ).all()
+    assert len(artifacts) == 1
+    artifact = artifacts[0]
+    assert artifact.kind == "backup_ref"
+    assert artifact.step_id == step_id
+    expected = patch_backup_path("/etc/app.conf", run["id"], step_id)
+    assert artifact.content_ciphertext == "enc:%s" % expected
+    assert re.search(r"\.ogs-bak-[0-9a-f]{12}$", expected)
+    assert "/etc/.ogs-autonomy-backup/app.conf.ogs-bak-" in expected
+
+
+def test_file_patch_uncertain_outcome_creates_no_artifact(
+    env, monkeypatch,
+):
+    _stub_basesec(monkeypatch)
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_action_step"](run["id"], "file_patch", {
+        "path": "/etc/app.conf",
+        "content": "workers=4\n",
+    })
+    env["runner"].result = RunnerResult(
+        exit_code=None, output="", transport_error="timeout",
+    )
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+    # 写结果未知：fail-closed，绝不报成功，也不得伪造备份凭据。
+    assert result["uncertain"] is True
+    assert _step_row(env, step_id).status == "outcome_unknown"
+    assert _run_row(env, run["id"]).status == "needs_attention"
+    artifacts = env["session"].query(t_ai_autonomous_artifact).filter_by(
+        run_id=run["id"],
+    ).count()
+    assert artifacts == 0
+
+
+def test_file_restore_executes_managed_backup_only(env):
+    run = env["create_queued_run"]()
+    backup = patch_backup_path("/etc/app.conf", run["id"], "a" * 32)
+    step_id = env["add_approved_action_step"](run["id"], "file_restore", {
+        "path": "/etc/app.conf",
+        "backup_path": backup,
+    })
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+    assert result["step_status"] == "succeeded"
+    command = env["runner"].calls[0]["command"]
+    assert command.startswith("cp -p -- ")
+    assert backup in command
+
+    # 受管目录之外的“备份”在构造层拒绝，不产生任何远程副作用。
+    rogue_id = env["add_approved_action_step"](run["id"], "file_restore", {
+        "path": "/etc/app.conf",
+        "backup_path": "/tmp/evil.ogs-bak-aaaaaaaaaaaa",
+    })
+    with pytest.raises(AutonomyValidationError):
+        env["executor"].execute_step(
+            "admin", "admin", run["id"], rogue_id,
+        )
+    assert len(env["runner"].calls) == 1
+    assert _step_row(env, rogue_id).status == "approved"
