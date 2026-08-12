@@ -7,6 +7,8 @@
 - 写意图先落库再执行：写动作的意图在副作用之前持久化；结果不
   确定（写可能已生效但未落库结果）时 Step 落 outcome_unknown、
   Run 落 needs_attention，绝不自动重放。
+- 永久拒绝清单在构造命令时硬拦截：即使旧审批残留，命中清单
+  的命令也不产生任何远程副作用。
 - 只读动作传输失败可重试（Step failed，note 标记 retryable）；
   确认未执行的失败按普通 failed 处理。
 - 预算硬约束：动作数耗尽拒绝执行；命令超时取动作超时与预算
@@ -23,7 +25,7 @@ from app.ai.autonomy.actions import (
     build_probe_command,
     verify_action_digest,
 )
-from app.ai.autonomy.policy import Budget
+from app.ai.autonomy.policy import Budget, permanent_deny_reason
 from app.ai.autonomy.repository import (
     AutonomyConflict,
     AutonomyPermissionError,
@@ -148,6 +150,13 @@ class AutonomyExecutor:
             command = str(action.parameters.get('command') or '')
             if not command.strip():
                 raise AutonomyValidationError('shell action has no command')
+            # 永久拒绝清单是服务端硬规则：旧审批不能推翻。
+            deny_reason = permanent_deny_reason(command)
+            if deny_reason is not None:
+                raise AutonomyValidationError(
+                    'shell command is permanently denied: %s'
+                    % (deny_reason,)
+                )
             return command
         raise AutonomyValidationError(
             'executor does not support action kind %r yet' % (kind,)

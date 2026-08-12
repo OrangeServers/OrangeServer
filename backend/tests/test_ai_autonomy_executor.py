@@ -25,6 +25,7 @@ from app.ai.autonomy.repository import (
     AutonomyConflict,
     AutonomyPermissionError,
     AutonomyRepository,
+    AutonomyValidationError,
 )
 from app.core.db.database import (
     db,
@@ -113,8 +114,8 @@ def env():
         run = repo.create_run("admin", "admin", **payload)
         return repo.start_run("admin", "admin", run["id"])
 
-    def approve_probe_step(run_id, probe_id="system.load"):
-        step = repo.propose_probe("admin", "admin", run_id, probe_id)
+    def approve_probe_step(run_id, probe_id="system.load", params=None):
+        step = repo.propose_probe("admin", "admin", run_id, probe_id, params)
         row = session.query(t_ai_autonomous_step).filter_by(
             id=step["id"],
         ).one()
@@ -204,6 +205,40 @@ def test_execute_approved_probe_success(env):
     assert call["kwargs"]["timeout_seconds"] <= 600
     types = [e.event_type for e in _events(env, run["id"])]
     assert "step_executed" in types
+
+
+def test_bounded_file_read_probe_runs_server_template(env):
+    """S2 有界读取探针：命令完全来自服务端模板，只读不写意图。"""
+    run = env["create_queued_run"]()
+    step_id = env["approve_probe_step"](
+        run["id"], "file.read_bounded",
+        params={"lines": "200", "path": "/var/log/app.log"},
+    )
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+    assert result["step_status"] == "succeeded"
+    call = env["runner"].calls[0]
+    assert call["command"] == "head -n 200 -- /var/log/app.log"
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "write_intent" not in types
+
+
+def test_approved_shell_on_permanent_deny_list_never_reaches_runner(env):
+    """永久拒绝清单在构造命令时硬拦截：旧审批不能推翻。"""
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_shell_step"](
+        run["id"], command="cat /etc/shadow",
+    )
+    with pytest.raises(AutonomyValidationError):
+        env["executor"].execute_step(
+            "admin", "admin", run["id"], step_id,
+        )
+    assert env["runner"].calls == []
+    # Step 未被推进，也没有写意图落库。
+    assert _step_row(env, step_id).status == "approved"
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "write_intent" not in types
 
 
 def test_execute_rejects_unapproved_or_cancelled(env):

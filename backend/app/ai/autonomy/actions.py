@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""M1/S1: 结构化动作 schema、服务端探针与审批 digest。
+"""M1/S1+S2: 结构化动作 schema、服务端探针与审批 digest。
 
 锁定的安全契约：
 - 自动的只读工作只接受服务端自有探针 ID + 校验过的结构化参数；
   模型或调用方不能把任意 Shell 标记为只读。
+- S2 有界读取：文件/日志读取限制行数与根目录白名单，敏感路径
+  在参数层即被永久拒绝。
 - 动作快照在审批前不可变地落库；凭据只以 ID 引用存在，永不进入
   快照、digest、Event 或响应。
 - digest 绑定动作版本、目标、凭据引用、工具(kind/probe)、规范化
@@ -27,6 +29,12 @@ _PARAM_FORBIDDEN_RE = re.compile(r"[|&;<>()`$\\\"'\n\r\t]")
 
 # 服务端自有探针：命令模板完全由服务端持有，参数白名单校验。
 # 每个探针都是只读探测；新增探针必须过安全评审。
+#
+# S2 有界读取与验证探针：
+# - file.read_bounded / log.tail 的行数上限 999，路径只允许白名单
+#   根目录，`..` 逐段拒绝，敏感路径复用 policy.is_sensitive_path；
+# - verify.* 探针的退出码即验证结论（0 = 通过），模板不含任何
+#   Shell 元字符。
 _PROBES: Dict[str, Dict[str, Any]] = {
     'system.load': {
         'title': '系统负载',
@@ -50,7 +58,104 @@ _PROBES: Dict[str, Dict[str, Any]] = {
             'unit': re.compile(r'^[A-Za-z0-9@:._-]{1,128}$'),
         },
     },
+    'file.read_bounded': {
+        'title': '有界文件读取',
+        'command': 'head -n {lines} -- {path}',
+        'params': {
+            'lines': re.compile(r'^[1-9][0-9]{0,2}$'),
+            'path': re.compile(r'^/[A-Za-z0-9._/-]{1,255}$'),
+        },
+        'check': lambda params: _check_bounded_path(
+            params, _FILE_READ_ROOTS,
+        ),
+    },
+    'log.tail': {
+        'title': '有界日志读取',
+        'command': 'tail -n {lines} -- {path}',
+        'params': {
+            'lines': re.compile(r'^[1-9][0-9]{0,2}$'),
+            'path': re.compile(r'^/[A-Za-z0-9._/-]{1,255}$'),
+        },
+        'check': lambda params: _check_bounded_path(
+            params, _LOG_TAIL_ROOTS,
+        ),
+    },
+    'verify.port_open': {
+        'title': '端口连通性验证',
+        'command': 'nc -z -w 5 {host} {port}',
+        'params': {
+            'host': re.compile(r'^[A-Za-z0-9.-]{1,253}$'),
+            'port': re.compile(r'^[1-9][0-9]{0,4}$'),
+        },
+        'check': lambda params: _check_port_range(params),
+    },
+    'verify.http_status': {
+        'title': 'HTTP 状态验证',
+        'command': (
+            'curl --silent --show-error --output /dev/null'
+            ' --write-out %{{http_code}} --max-time 10 {url}'
+        ),
+        'params': {
+            # 只允许 scheme://host[:port]/path；查询串、凭据与元字符
+            # 在白名单字符集之外，直接拒绝。
+            'url': re.compile(r'^https?://[A-Za-z0-9._:/-]{1,500}$'),
+        },
+    },
+    'verify.process_running': {
+        'title': '进程存在性验证',
+        'command': 'pgrep -c -x {process}',
+        'params': {
+            'process': re.compile(r'^[A-Za-z0-9._-]{1,64}$'),
+        },
+    },
+    'verify.journal_pattern': {
+        'title': '服务日志关键字验证',
+        'command': (
+            'journalctl -u {unit} -n {lines} --no-pager -g {pattern}'
+        ),
+        'params': {
+            'unit': re.compile(r'^[A-Za-z0-9@:._-]{1,128}$'),
+            'lines': re.compile(r'^[1-9][0-9]{0,2}$'),
+            'pattern': re.compile(r'^[A-Za-z0-9._:-]{1,128}$'),
+        },
+    },
 }
+
+# 有界读取的根目录白名单；log.tail 进一步收紧到 /var/log。
+# 新增根目录必须过安全评审。
+_FILE_READ_ROOTS = ('/var/log', '/etc', '/opt')
+_LOG_TAIL_ROOTS = ('/var/log',)
+
+
+def _check_bounded_path(params: Dict[str, str], roots) -> None:
+    """有界读取路径复核：逐段拒绝 `..`，限定根目录，敏感路径拒绝。
+
+    符号链接逃逸不在 v1 承诺范围内；白名单根目录已经把攻击面收到
+    最小，剩余风险由审批与审计兜底。
+    """
+    # 延迟导入：policy 依赖本模块的 StructuredAction。
+    from app.ai.autonomy.policy import is_sensitive_path
+
+    path = str(params.get('path') or '')
+    parts = [part for part in path.split('/') if part]
+    if '..' in parts or '.' in parts:
+        raise ActionValidationError('path traversal is not allowed')
+    if not any(
+        path == root or path.startswith(root + '/') for root in roots
+    ):
+        raise ActionValidationError(
+            'path is outside the bounded read roots'
+        )
+    if is_sensitive_path(path):
+        raise ActionValidationError(
+            'sensitive path is denied by server policy'
+        )
+
+
+def _check_port_range(params: Dict[str, str]) -> None:
+    port = int(params['port'])
+    if port < 1 or port > 65535:
+        raise ActionValidationError('port must be within 1..65535')
 
 
 class ActionValidationError(Exception):
@@ -112,7 +217,9 @@ def validate_probe(probe_id: str, params: Dict[str, Any]) -> Dict[str, str]:
     - 未知探针直接拒绝；
     - 参数集合必须与探针声明完全一致（不允许多余参数，防止注入
       伪装成合法探针的额外字段）；
-    - 每个参数值必须匹配探针的白名单正则，且不含任何 Shell 元字符。
+    - 每个参数值必须匹配探针的白名单正则，且不含任何 Shell 元字符；
+    - 探针可选声明 check 钩子，做正则表达不了的语义复核（路径根
+      白名单、端口范围等）。
     """
     spec = probe_spec(probe_id)
     declared = spec['params']
@@ -139,6 +246,9 @@ def validate_probe(probe_id: str, params: Dict[str, Any]) -> Dict[str, str]:
                 'parameter %r does not match the probe whitelist' % (key,)
             )
         normalized[key] = value
+    check = spec.get('check')
+    if check is not None:
+        check(normalized)
     return normalized
 
 
@@ -146,11 +256,17 @@ def build_probe_command(probe_id: str, params: Dict[str, Any]) -> str:
     """由服务端模板构造最终命令。
 
     模板与参数都来自服务端白名单；构造结果再做一次元字符自检，
-    双重防御模板维护失误。
+    双重防御模板维护失误。模板中的字面花括号（如 curl 的
+    %{http_code}）必须写成双花括号转义，避免被 format 误解析。
     """
     spec = probe_spec(probe_id)
     normalized = validate_probe(probe_id, params)
-    command = spec['command'].format(**normalized) if normalized else spec['command']
+    template = spec['command']
+    if normalized:
+        # format 会把双花括号转义还原为字面花括号。
+        command = template.format(**normalized)
+    else:
+        command = template.replace('{{', '{').replace('}}', '}')
     if _PARAM_FORBIDDEN_RE.search(command):
         raise ActionValidationError('constructed command failed safety guard')
     return command
