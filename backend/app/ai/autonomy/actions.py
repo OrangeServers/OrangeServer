@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-"""M1/S1+S2: 结构化动作 schema、服务端探针与审批 digest。
+"""M1/S1+S2: 结构化动作 schema、服务端探针/写模板与审批 digest。
 
 锁定的安全契约：
 - 自动的只读工作只接受服务端自有探针 ID + 校验过的结构化参数；
   模型或调用方不能把任意 Shell 标记为只读。
 - S2 有界读取：文件/日志读取限制行数与根目录白名单，敏感路径
   在参数层即被永久拒绝。
+- S2 结构化写动作（systemd 服务操作、包安装）同样只接受服务端
+  模板 + 白名单参数；永远不会自动执行，执行前落写意图。
 - 动作快照在审批前不可变地落库；凭据只以 ID 引用存在，永不进入
   快照、digest、Event 或响应。
 - digest 绑定动作版本、目标、凭据引用、工具(kind/probe)、规范化
@@ -156,6 +158,112 @@ def _check_port_range(params: Dict[str, str]) -> None:
     port = int(params['port'])
     if port < 1 or port > 65535:
         raise ActionValidationError('port must be within 1..65535')
+
+
+# ---------------------------------------------------------------------------
+# 结构化写动作：服务端模板 + 白名单参数，永不自动
+# ---------------------------------------------------------------------------
+
+# 与探针同构的写模板注册表：命令模板完全由服务端持有。新增写
+# 模板必须过安全评审。约束：
+# - systemd 只开放 start/stop/restart；status 走只读探针
+#   service.status，enable/disable/mask 属高影响变更，v1 不开放；
+# - 包安装只能从已配置源安装（模板不携带任何新增源的能力）；
+#   新增源属“永远精确审批”类，v1 不做。
+_WRITE_TEMPLATES: Dict[str, Dict[str, Any]] = {
+    'systemd': {
+        'title': 'systemd 服务操作',
+        'command': 'systemctl {operation} {unit}',
+        'params': {
+            'operation': re.compile(r'^(start|stop|restart)$'),
+            'unit': re.compile(r'^[A-Za-z0-9@:._-]{1,128}$'),
+        },
+    },
+    'package_install': {
+        'title': '包安装（仅限已配置源）',
+        'selector': 'manager',
+        'command': {
+            'apt': (
+                'apt-get install --assume-yes'
+                ' --no-install-recommends {package}'
+            ),
+            'dnf': 'dnf install --assumeyes {package}',
+        },
+        'params': {
+            'manager': re.compile(r'^(apt|dnf)$'),
+            'package': re.compile(r'^[A-Za-z0-9][A-Za-z0-9+._-]{0,127}$'),
+        },
+    },
+}
+
+
+def list_write_kinds():
+    """结构化写动作 kind 列表（供测试与后续提案入口）。"""
+    return sorted(_WRITE_TEMPLATES)
+
+
+def _write_spec(kind: str) -> Dict[str, Any]:
+    spec = _WRITE_TEMPLATES.get(str(kind or ''))
+    if spec is None:
+        raise ActionValidationError(
+            'unknown write action kind: %r' % (kind,)
+        )
+    return spec
+
+
+def validate_write_action(kind: str, params: Dict[str, Any]) -> Dict[str, str]:
+    """校验结构化写动作参数，返回规范化参数（与探针同构）。"""
+    spec = _write_spec(kind)
+    declared = spec['params']
+    params = params or {}
+    unknown = set(params) - set(declared)
+    if unknown:
+        raise ActionValidationError(
+            'unexpected parameters: %s' % ', '.join(sorted(unknown))
+        )
+    missing = set(declared) - set(params)
+    if missing:
+        raise ActionValidationError(
+            'missing parameters: %s' % ', '.join(sorted(missing))
+        )
+    normalized = {}
+    for key, pattern in declared.items():
+        value = str(params[key])
+        if _PARAM_FORBIDDEN_RE.search(value):
+            raise ActionValidationError(
+                'parameter %r contains shell metacharacters' % (key,)
+            )
+        if not pattern.match(value):
+            raise ActionValidationError(
+                'parameter %r does not match the whitelist' % (key,)
+            )
+        normalized[key] = value
+    return normalized
+
+
+def build_write_command(kind: str, params: Dict[str, Any]) -> str:
+    """由服务端写模板构造最终命令。
+
+    除探针同构的白名单/元字符自检外，构造结果再过一次永久拒绝
+    清单（如 stop auditd 这种绕过审计的服务操作）。
+    """
+    # 延迟导入：policy 依赖本模块。
+    from app.ai.autonomy.policy import permanent_deny_reason
+
+    spec = _write_spec(kind)
+    normalized = validate_write_action(kind, params)
+    template = spec['command']
+    if isinstance(template, dict):
+        template = template[normalized[spec['selector']]]
+    command = template.format(**normalized)
+    if _PARAM_FORBIDDEN_RE.search(command):
+        raise ActionValidationError('constructed command failed safety guard')
+    deny_reason = permanent_deny_reason(command)
+    if deny_reason is not None:
+        raise ActionValidationError(
+            'constructed command is permanently denied: %s' % (deny_reason,)
+        )
+    return command
 
 
 class ActionValidationError(Exception):

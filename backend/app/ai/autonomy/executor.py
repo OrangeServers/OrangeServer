@@ -23,6 +23,7 @@ from app.ai.autonomy.actions import (
     ActionValidationError,
     action_from_dict,
     build_probe_command,
+    build_write_command,
     verify_action_digest,
 )
 from app.ai.autonomy.policy import Budget, permanent_deny_reason
@@ -41,9 +42,10 @@ from app.ai.autonomy.state import (
     assert_step_transition,
 )
 
-# 需要"写意图先落库"的动作类别。v1 探针全部只读；shell 是通用
-# 写入口（永远精确审批）。后续 file_patch/systemd 类别在此追加。
-WRITE_KINDS = frozenset({'shell'})
+# 需要“写意图先落库”的动作类别。shell 是通用写入口（永远精确
+# 审批）；systemd/package_install 是服务端模板的结构化写动作；
+# 后续 file_patch 类别在此追加。
+WRITE_KINDS = frozenset({'shell', 'systemd', 'package_install'})
 
 # 已计入动作预算的 Step 状态。
 _EXECUTED_STEP_STATUSES = (
@@ -158,6 +160,12 @@ class AutonomyExecutor:
                     % (deny_reason,)
                 )
             return command
+        if kind in ('systemd', 'package_install'):
+            # 服务端模板构造；白名单与永久拒绝复核在 actions 层。
+            try:
+                return build_write_command(kind, action.parameters)
+            except ActionValidationError as exc:
+                raise AutonomyValidationError(str(exc)) from exc
         raise AutonomyValidationError(
             'executor does not support action kind %r yet' % (kind,)
         )

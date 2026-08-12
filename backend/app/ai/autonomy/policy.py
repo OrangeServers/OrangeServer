@@ -4,6 +4,9 @@
 策略完全由服务端持有：
 - probe（服务端自有探针）是唯一可自动执行的只读动作；
 - file_read 永不自动：敏感路径直接拒绝，其余等待精确审批；
+- systemd/package_install 结构化写动作永不自动：read_only 拒绝，
+  其余等待精确审批；参数在 actions.validate_write_action 白名单
+  校验，构造结果再过永久拒绝清单；
 - shell 永不自动：read_only 模式直接拒绝，其余等待精确审批；
   含管道/重定向/解释器/下载执行等特征时按高危处理。
 - 永久拒绝清单（磁盘分区格式化、根目录宽删、主动读秘密、横向
@@ -232,7 +235,9 @@ def classify_action(
     - probe 是服务端自有只读探针，任何模式下都可自动（参数在
       actions.validate_probe 已白名单校验）；
     - file_read 敏感路径拒绝，其余任何模式都要求审批；
-    - shell 在 read_only 拒绝，其余要求审批，永不自动。
+    - shell 在 read_only 拒绝，其余要求审批，永不自动；
+    - systemd/package_install 结构化写动作在 read_only 拒绝，其余
+      要求精确审批，永不自动。
     """
     RunMode(mode)
     AiEnvironment(environment)
@@ -252,4 +257,14 @@ def classify_action(
         if mode == RunMode.READ_ONLY.value:
             return ApprovalDecision.DENIED, 'shell actions are denied in read_only mode'
         return ApprovalDecision.APPROVAL_REQUIRED, reason
+    if kind in ('systemd', 'package_install'):
+        # 结构化写动作：模板与参数白名单在 actions 层校验；这里
+        # 只决定审批策略——永不自动。
+        if mode == RunMode.READ_ONLY.value:
+            return ApprovalDecision.DENIED, (
+                '%s actions are denied in read_only mode' % kind
+            )
+        return ApprovalDecision.APPROVAL_REQUIRED, (
+            'structured write requires exact approval'
+        )
     return ApprovalDecision.DENIED, 'unknown action kind'

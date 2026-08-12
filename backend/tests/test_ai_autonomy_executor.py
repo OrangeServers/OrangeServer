@@ -124,19 +124,24 @@ def env():
         return step["id"]
 
     def add_approved_shell_step(run_id, command="systemctl restart nginx"):
+        return add_approved_action_step(
+            run_id, "shell", {"command": command},
+        )
+
+    def add_approved_action_step(run_id, kind, parameters):
         run = session.query(t_ai_autonomous_run).filter_by(id=run_id).one()
         step_id = uuid.uuid4().hex
         action = StructuredAction(
-            kind="shell",
+            kind=kind,
             target_id=int(run.host_id),
             system_user_id=int(run.system_user_id),
-            parameters={"command": command},
+            parameters=parameters,
             timeout_seconds=30,
             step_id=step_id,
         )
         step = t_ai_autonomous_step(
             id=step_id, run_id=run_id, kind="action", status="approved",
-            seq=90, summary="shell restart",
+            seq=90, summary="%s step" % kind,
             action_json=json.dumps(
                 action.to_canonical_dict(), sort_keys=True,
             ),
@@ -156,6 +161,7 @@ def env():
         "create_queued_run": create_queued_run,
         "approve_probe_step": approve_probe_step,
         "add_approved_shell_step": add_approved_shell_step,
+        "add_approved_action_step": add_approved_action_step,
     }
     yield env
     session.close()
@@ -239,6 +245,59 @@ def test_approved_shell_on_permanent_deny_list_never_reaches_runner(env):
     assert _step_row(env, step_id).status == "approved"
     types = [e.event_type for e in _events(env, run["id"])]
     assert "write_intent" not in types
+
+
+def test_systemd_write_persists_intent_before_side_effect(env):
+    """结构化写动作：写意图在远程副作用之前落库。"""
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_action_step"](
+        run["id"], "systemd",
+        {"operation": "restart", "unit": "nginx"},
+    )
+    # runner 被调用的那一刻快照事件类型，证明意图先于副作用。
+    env["runner"].on_call = lambda: [
+        e.event_type for e in _events(env, run["id"])
+    ]
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+    assert result["step_status"] == "succeeded"
+    call = env["runner"].calls[0]
+    assert call["command"] == "systemctl restart nginx"
+    assert "write_intent" in call["at_call"]
+
+
+def test_package_install_uses_server_template(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_action_step"](
+        run["id"], "package_install",
+        {"manager": "apt", "package": "nginx"},
+    )
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+    assert result["step_status"] == "succeeded"
+    call = env["runner"].calls[0]
+    assert call["command"] == (
+        "apt-get install --assume-yes --no-install-recommends nginx"
+    )
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "write_intent" in types
+
+
+def test_systemd_stop_auditd_rejected_at_construction(env):
+    """绕过审计的服务操作即使命中审批也被永久拒绝清单拦截。"""
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_action_step"](
+        run["id"], "systemd",
+        {"operation": "stop", "unit": "auditd"},
+    )
+    with pytest.raises(AutonomyValidationError):
+        env["executor"].execute_step(
+            "admin", "admin", run["id"], step_id,
+        )
+    assert env["runner"].calls == []
+    assert _step_row(env, step_id).status == "approved"
 
 
 def test_execute_rejects_unapproved_or_cancelled(env):
