@@ -363,6 +363,10 @@ class AutonomyRepository:
             latest_event_seq=0,
         )
         self.session.add(run)
+        # run 与首个事件同事务落库：ORM 无 relationship 时 flush 不保证
+        # 父子插入顺序，真实 MySQL 的外键会拒绝先插的事件行，必须先
+        # flush 出 run 主键。
+        self.session.flush()
         self.append_event(run, 'run_created', {
             'mode': mode, 'host_id': host_id,
             'system_user_id': system_user_id,

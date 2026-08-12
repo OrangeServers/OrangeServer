@@ -224,6 +224,99 @@ def test_drive_run_unknown_run_is_skipped(worker_env):
     assert result == worker.RESULT_SKIPPED
 
 
+def test_drive_run_task_runs_inside_flask_app_context(
+    worker_env, monkeypatch,
+):
+    """Celery 任务内核：先推应用上下文再用 db.session（Flask-
+    SQLAlchemy 3.x 下无上下文直接拿 session 会 RuntimeError）。"""
+    import app.app_factory as app_factory
+    import app.core.db.database as database_mod
+
+    entered = {"count": 0}
+
+    class _Ctx:
+        def __enter__(self):
+            entered["count"] += 1
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    class _FakeFlaskApp:
+        def app_context(self):
+            return _Ctx()
+
+    sentinel_session = object()
+
+    class _FakeDb:
+        session = sentinel_session
+
+    monkeypatch.setattr(app_factory, "app", _FakeFlaskApp())
+    monkeypatch.setattr(database_mod, "db", _FakeDb())
+
+    captured = {}
+
+    def fake_once(session, run_id, *, executor=None, worker_id=None,
+                  lease_ttl=None):
+        captured["session"] = session
+        captured["inside_context"] = entered["count"] == 1
+        return worker.RESULT_SKIPPED
+
+    monkeypatch.setattr(worker, "drive_run_once", fake_once)
+    monkeypatch.setattr(
+        worker, "build_default_executor", lambda session: None,
+    )
+
+    celery_app = worker.get_celery_app()
+    result = celery_app.tasks[worker.DRIVE_RUN_TASK].apply(args=["run-x"])
+    assert result.result == worker.RESULT_SKIPPED
+    assert captured["session"] is sentinel_session
+    assert captured["inside_context"] is True
+
+
+def test_worker_ready_scan_runs_inside_flask_app_context(
+    worker_env, monkeypatch,
+):
+    """启动扫描信号同样必须先推应用上下文再用 db.session。"""
+    import app.app_factory as app_factory
+    import app.core.db.database as database_mod
+
+    entered = {"count": 0}
+
+    class _Ctx:
+        def __enter__(self):
+            entered["count"] += 1
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    class _FakeFlaskApp:
+        def app_context(self):
+            return _Ctx()
+
+    sentinel_session = object()
+
+    class _FakeDb:
+        session = sentinel_session
+
+    monkeypatch.setattr(app_factory, "app", _FakeFlaskApp())
+    monkeypatch.setattr(database_mod, "db", _FakeDb())
+
+    captured = {}
+
+    def fake_dispatch(session, celery_app=None):
+        captured["session"] = session
+        captured["inside_context"] = entered["count"] == 1
+        return []
+
+    monkeypatch.setattr(worker, "dispatch_recoverable", fake_dispatch)
+
+    worker._on_worker_ready()
+    assert captured["session"] is sentinel_session
+    assert captured["inside_context"] is True
+
+
 # ---------------------------------------------------------------------------
 # 启动扫描投递
 # ---------------------------------------------------------------------------

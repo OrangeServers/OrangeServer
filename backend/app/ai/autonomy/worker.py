@@ -78,11 +78,16 @@ def reset_celery_app():
 def _register_tasks(app):
     @app.task(name=DRIVE_RUN_TASK, bind=True)
     def drive_run(self, run_id):
+        # Celery 任务不在 Flask 请求上下文里：db.session 必须先推
+        # 应用上下文（与 cron/后台线程的既有模式一致）。
+        from app.app_factory import app as flask_app
         from app.core.db.database import db
 
-        return drive_run_once(
-            db.session, run_id, executor=build_default_executor(db.session),
-        )
+        with flask_app.app_context():
+            return drive_run_once(
+                db.session, run_id,
+                executor=build_default_executor(db.session),
+            )
 
 
 def build_default_executor(session):
@@ -194,9 +199,11 @@ def _on_worker_ready(**kwargs):
     """Celery worker 就绪后补投漏掉/中断的 Run（仅功能启用时）。"""
     if get_celery_app() is None:
         return
+    from app.app_factory import app as flask_app
     from app.core.db.database import db
 
     try:
-        dispatch_recoverable(db.session)
+        with flask_app.app_context():
+            dispatch_recoverable(db.session)
     except Exception:
         logger.exception('autonomy startup scan failed')
