@@ -79,7 +79,7 @@ SET @col_exists := (
       AND COLUMN_NAME = 'active_host_id'
 );
 SET @sql := IF(@col_exists = 0,
-    'ALTER TABLE `t_ai_autonomous_run` ADD COLUMN `active_host_id` INT GENERATED ALWAYS AS (CASE WHEN `status` IN (''completed'', ''failed'', ''cancelled'', ''expired'') THEN NULL ELSE `host_id` END) STORED',
+    'ALTER TABLE `t_ai_autonomous_run` ADD COLUMN `active_host_id` INT GENERATED ALWAYS AS (CASE WHEN `status` IN (_utf8mb4''completed'', _utf8mb4''failed'', _utf8mb4''cancelled'', _utf8mb4''expired'') THEN NULL ELSE `host_id` END) STORED',
     'SELECT "active_host_id exists" AS info');
 PREPARE stmt FROM @sql;
 EXECUTE stmt;

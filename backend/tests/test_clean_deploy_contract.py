@@ -413,6 +413,14 @@ def test_rev54_autonomy_migration_matches_baseline_and_orm():
     assert "ADD UNIQUE KEY `uq_ai_auto_run_active_host`" in rev54
     assert "HAVING COUNT(*) > 1" in rev54
 
+    # Generated-expression string literals must not inherit the caller's
+    # connection charset. The old dump begins with SET NAMES utf8 (utf8mb3),
+    # while migrations use utf8mb4; explicit introducers keep fresh and
+    # upgraded information_schema expressions identical.
+    for status in ("completed", "failed", "cancelled", "expired"):
+        assert f"_utf8mb4'{status}'" in run_ddl.group(1)
+        assert f"_utf8mb4''{status}''" in rev54
+
 
 def test_dockerfile_builds_from_committed_requirements_without_resolving_lock():
     dockerfile = (BACKEND / "Dockerfile").read_text(encoding="utf-8")

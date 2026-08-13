@@ -168,7 +168,10 @@ CREATE TABLE `t_ai_autonomous_run` (
   `heartbeat_at` datetime DEFAULT NULL,
   `graph_version` varchar(32) NOT NULL DEFAULT 'v1',
   `active_host_id` int GENERATED ALWAYS AS (
-    CASE WHEN `status` IN ('completed','failed','cancelled','expired')
+    CASE WHEN `status` IN (
+      _utf8mb4'completed',_utf8mb4'failed',
+      _utf8mb4'cancelled',_utf8mb4'expired'
+    )
       THEN NULL ELSE `host_id` END
   ) STORED,
   `started_at` datetime DEFAULT NULL,
