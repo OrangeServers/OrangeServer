@@ -273,6 +273,7 @@ try {
     ) | ConvertFrom-Json
     if (
         [string]::IsNullOrWhiteSpace([string]$LeaseEvidence.lease_owner) -or
+        [int]$LeaseEvidence.revision -lt 1 -or
         [string]::IsNullOrWhiteSpace([string]$LeaseEvidence.lease_expires_at)
     ) {
         throw 'Worker lease evidence omitted its owner or expiry'
@@ -283,12 +284,15 @@ try {
     # Restart immediately, while the persisted old lease is still live.  The
     # duplicate broker delivery must retry itself across expiry; startup scan
     # cannot claim credit because the next probe requires the old lease alive.
-    Invoke-Native docker @Compose up -d --wait --wait-timeout $WaitTimeoutSeconds autonomy-worker
+    Invoke-Native docker @Compose up -d autonomy-worker
     Invoke-Native docker @Compose run --rm `
         --env "OGS_S2_EXPECTED_LEASE_OWNER=$($LeaseEvidence.lease_owner)" `
+        --env "OGS_S2_EXPECTED_LEASE_REVISION=$($LeaseEvidence.revision)" `
         --env "OGS_S2_EXPECTED_LEASE_EXPIRES_AT=$($LeaseEvidence.lease_expires_at)" `
         smoke-runner verify-restart-before-expiry
-    Invoke-Native docker @Compose run --rm smoke-runner verify-worker-kill-recovery
+    Invoke-Native docker @Compose run --rm `
+        --env "OGS_S2_EXPECTED_LEASE_EXPIRES_AT=$($LeaseEvidence.lease_expires_at)" `
+        smoke-runner verify-worker-kill-recovery
 
     # Crash before the Executor can commit execution_started/write_intent.
     # The locked approved Step proves that no remote side effect can begin;

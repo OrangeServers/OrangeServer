@@ -37,7 +37,7 @@ def test_s2_smoke_compose_is_isolated_and_builds_current_backend():
         '?smoke autonomy Redis password required}'
     ) in autonomy_redis
     assert '--concurrency=1' in compose
-    assert 'OGS_AI_AUTONOMY_LEASE_TTL_SECONDS: 30' in compose
+    assert 'OGS_AI_AUTONOMY_LEASE_TTL_SECONDS: 60' in compose
     assert 'OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis' in compose
     assert 'OGS_S2_SMOKE_UPGRADE_MYSQL_HOST: mysql-upgrade' in compose
     assert 'OGS_DATA_DIR: /app/data' in compose
@@ -94,6 +94,7 @@ def test_s2_smoke_wrapper_pins_upgrade_source_and_cleans_by_default():
     assert 'S2_WORKER_LEASE_EVIDENCE=' in wrapper
     assert 'ConvertFrom-Json' in wrapper
     assert 'OGS_S2_EXPECTED_LEASE_OWNER=' in wrapper
+    assert 'OGS_S2_EXPECTED_LEASE_REVISION=' in wrapper
     assert 'OGS_S2_EXPECTED_LEASE_EXPIRES_AT=' in wrapper
     assert 'kill --signal SIGKILL autonomy-worker' in wrapper
     assert 'docker rm -f $BlockerName' in wrapper
@@ -126,7 +127,7 @@ def test_s2_smoke_wrapper_pins_upgrade_source_and_cleans_by_default():
 
     killed = wrapper.index('kill --signal SIGKILL autonomy-worker')
     restarted = wrapper.index(
-        'up -d --wait --wait-timeout $WaitTimeoutSeconds autonomy-worker',
+        'up -d autonomy-worker',
         killed,
     )
     old_lease_checked = wrapper.index(
@@ -193,8 +194,24 @@ def test_s2_smoke_probe_covers_migration_persistence_and_delivery():
     assert "'lease_token':" not in wait_lease
     assert "def verify_restart_before_expiry():" in probe
     assert "os.environ['OGS_S2_EXPECTED_LEASE_OWNER']" in probe
+    assert "os.environ['OGS_S2_EXPECTED_LEASE_REVISION']" in probe
     assert "os.environ['OGS_S2_EXPECTED_LEASE_EXPIRES_AT']" in probe
-    assert "replacement Worker was not ready before old lease expiry" in probe
+    restart_probe = probe.split(
+        'def verify_restart_before_expiry():', 1,
+    )[1].split('def verify_worker_kill_recovery():', 1)[0]
+    assert 'worker_readiness(timeout=1)' in restart_probe
+    assert 'UTC_TIMESTAMP(6) AS observed_at' in restart_probe
+    assert "row['observed_at'] >= expected_expiry" in restart_probe
+    assert 'worker_readiness(timeout=1)' in restart_probe
+    assert "ready_row['observed_at'] >= expected_expiry" in restart_probe
+    assert 'harness missed the live-lease observation window' in restart_probe
+
+    recovery_probe = probe.split(
+        'def verify_worker_kill_recovery():', 1,
+    )[1].split('\ndef ', 1)[0]
+    assert "os.environ['OGS_S2_EXPECTED_LEASE_EXPIRES_AT']" in recovery_probe
+    assert "SELECT UTC_TIMESTAMP(6) AS observed_at" in recovery_probe
+    assert 'timeout=max(45, int(math.ceil(remaining)) + 45)' in recovery_probe
     assert "def verify_worker_kill_recovery():" in probe
     assert "Worker crash recovery replayed an uncertain write" in probe
     assert "Worker crash safety event was not exactly-once" in probe

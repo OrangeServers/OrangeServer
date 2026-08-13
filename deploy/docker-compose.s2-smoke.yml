@@ -23,7 +23,7 @@ x-smoke-environment: &smoke-environment
   OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis
   OGS_AI_AUTONOMY_REDIS_PORT: 6379
   OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_S2_SMOKE_AUTONOMY_REDIS_PASSWORD:?smoke autonomy Redis password required}
-  OGS_AI_AUTONOMY_LEASE_TTL_SECONDS: 30
+  OGS_AI_AUTONOMY_LEASE_TTL_SECONDS: 60
   # The target is private to this disposable internal network. Host keys are
   # generated in its exact smoke image and never trusted outside this stack.
   OGS_SSH_HOST_KEY_POLICY: auto

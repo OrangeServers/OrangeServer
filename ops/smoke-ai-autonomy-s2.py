@@ -4,6 +4,7 @@
 import concurrent.futures
 import datetime
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -2428,6 +2429,7 @@ def wait_worker_lease():
         # to the post-restart phase without exposing the opaque lease token.
         print('S2_WORKER_LEASE_EVIDENCE=' + json.dumps({
             'lease_owner': row['lease_owner'],
+            'revision': int(row['revision']),
             'lease_expires_at': row['lease_expires_at'].isoformat(),
         }, separators=(',', ':')))
     finally:
@@ -2436,44 +2438,100 @@ def wait_worker_lease():
 
 def verify_restart_before_expiry():
     """Prove the replacement Worker was ready while the old lease lived."""
+    from app.ai.autonomy.readiness import worker_readiness
+
+    expected_owner = os.environ['OGS_S2_EXPECTED_LEASE_OWNER']
+    expected_revision = int(os.environ['OGS_S2_EXPECTED_LEASE_REVISION'])
+    expected_expiry_text = os.environ[
+        'OGS_S2_EXPECTED_LEASE_EXPIRES_AT'
+    ]
+    expected_expiry = datetime.datetime.fromisoformat(expected_expiry_text)
     connection = mysql_connection(os.environ['OGS_MYSQL_HOST'])
     try:
-        row = fetch_one(
-            connection,
-            """
-            SELECT status, revision, lease_owner,
-                   lease_token IS NOT NULL AS lease_present,
-                   lease_expires_at
-              FROM t_ai_autonomous_run WHERE id = %s
-            """,
-            (WORKER_KILL_RUN_ID,),
-        )
-        require(row['status'] == 'running',
-                'replacement Worker crossed the live lease too early')
-        require(row['lease_owner'] is not None,
-                'SIGKILL residue lost the old lease owner')
-        require(bool(row['lease_present']),
-                'SIGKILL residue lost the fenced lease token')
+        replacement_ready = False
+        while True:
+            row = fetch_one(
+                connection,
+                """
+                SELECT status, revision, lease_owner,
+                       lease_token IS NOT NULL AS lease_present,
+                       lease_expires_at,
+                       UTC_TIMESTAMP(6) AS observed_at
+                  FROM t_ai_autonomous_run WHERE id = %s
+                """,
+                (WORKER_KILL_RUN_ID,),
+            )
+            if row['observed_at'] >= expected_expiry:
+                break
+            require(row['status'] == 'running',
+                    'replacement Worker crossed the live lease too early')
+            require(row['lease_owner'] == expected_owner,
+                    'old lease owner changed before expiry takeover')
+            require(int(row['revision']) == expected_revision,
+                    'Run revision changed before expiry takeover')
+            require(bool(row['lease_present']),
+                    'SIGKILL residue lost the fenced lease token')
+            require(
+                row['lease_expires_at'] is not None
+                and row['lease_expires_at'].isoformat()
+                == expected_expiry_text,
+                'old lease expiry evidence changed before takeover',
+            )
+            if worker_readiness(timeout=1):
+                # Inspect readiness is not the evidence boundary: re-read the
+                # Run and DB clock after the Worker reply, so a slow inspect
+                # cannot accidentally classify a legal expiry as early use.
+                ready_row = fetch_one(
+                    connection,
+                    """
+                    SELECT status, revision, lease_owner,
+                           lease_token IS NOT NULL AS lease_present,
+                           lease_expires_at,
+                           UTC_TIMESTAMP(6) AS observed_at
+                      FROM t_ai_autonomous_run WHERE id = %s
+                    """,
+                    (WORKER_KILL_RUN_ID,),
+                )
+                if ready_row['observed_at'] >= expected_expiry:
+                    break
+                require(ready_row['status'] == 'running',
+                        'ready Worker crossed the live lease too early')
+                require(ready_row['lease_owner'] == expected_owner,
+                        'old lease owner changed after Worker readiness')
+                require(int(ready_row['revision']) == expected_revision,
+                        'Run revision changed after Worker readiness')
+                require(bool(ready_row['lease_present']),
+                        'ready Worker replaced the fenced lease token')
+                require(
+                    ready_row['lease_expires_at'] is not None
+                    and ready_row['lease_expires_at'].isoformat()
+                    == expected_expiry_text,
+                    'old lease expiry changed after Worker readiness',
+                )
+                replacement_ready = True
+                break
+            time.sleep(0.1)
         require(
-            row['lease_expires_at'] is not None
-            and row['lease_expires_at'] > datetime.datetime.utcnow(),
-            'replacement Worker was not ready before old lease expiry',
-        )
-        expected_owner = os.environ['OGS_S2_EXPECTED_LEASE_OWNER']
-        expected_expiry = os.environ['OGS_S2_EXPECTED_LEASE_EXPIRES_AT']
-        require(expected_owner == row['lease_owner'],
-                'old lease owner changed before expiry takeover')
-        require(
-            expected_expiry == row['lease_expires_at'].isoformat(),
-            'old lease expiry evidence changed before takeover',
+            replacement_ready,
+            'harness missed the live-lease observation window',
         )
     finally:
         connection.close()
 
 
 def verify_worker_kill_recovery():
+    expected_expiry = datetime.datetime.fromisoformat(
+        os.environ['OGS_S2_EXPECTED_LEASE_EXPIRES_AT'],
+    )
     connection = mysql_connection(os.environ['OGS_MYSQL_HOST'])
     try:
+        observed = fetch_one(
+            connection, 'SELECT UTC_TIMESTAMP(6) AS observed_at',
+        )
+        remaining = max(
+            0.0,
+            (expected_expiry - observed['observed_at']).total_seconds(),
+        )
         row = wait_for_run(
             connection, WORKER_KILL_RUN_ID,
             lambda current: (
@@ -2483,7 +2541,7 @@ def verify_worker_kill_recovery():
                 and current['lease_expires_at'] is None
             ),
             'restarted Worker did not recover expired SIGKILL lease',
-            timeout=45,
+            timeout=max(45, int(math.ceil(remaining)) + 45),
         )
         require(int(row['revision']) >= 3,
                 'recovery did not include original claim and expiry takeover')
