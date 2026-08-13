@@ -437,6 +437,32 @@ def test_evidence_list_passes_through_owner_scoped_reader(api, monkeypatch):
     assert body["trusted"] is False
 
 
+def test_rest_timestamps_serialize_as_iso_not_rfc1123(api, monkeypatch):
+    """手测发现：Flask 默认把 datetime 序列化成 RFC 1123（http_date），
+    前端 parseLogTime 解析失败导致详情页「创建于」显示为 —。
+    REST 输出必须与 SSE 一致采用 ISO 字符串。"""
+    from datetime import datetime as dt
+
+    created = dt(2026, 8, 13, 13, 51, 14)
+    client, state = api
+    _enable(monkeypatch, True)
+    state["repo"] = FakeRepo(result={
+        "id": "run-1",
+        "status": "draft",
+        "created_at": created,
+        "started_at": None,
+        "steps": [{"id": "s1", "created_at": created}],
+    })
+    response = client.get("/ai/autonomous-runs/run-1")
+    assert response.status_code == 200
+    body = response.get_json()["data"]
+    assert body["created_at"] == created.isoformat()
+    assert body["started_at"] is None
+    assert body["steps"][0]["created_at"] == created.isoformat()
+    # RFC 1123 特征（如 " GMT"）不得出现在任何时间戳字段。
+    assert "GMT" not in response.get_data(as_text=True)
+
+
 def test_stream_unknown_run_fails_closed_before_streaming(api, monkeypatch):
     client, state = api
     _enable(monkeypatch, True)

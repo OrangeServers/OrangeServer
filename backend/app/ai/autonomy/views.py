@@ -7,6 +7,7 @@
 import json
 import logging
 import time
+from datetime import datetime
 
 from flask import Response, request, stream_with_context
 
@@ -32,6 +33,22 @@ logger = logging.getLogger(__name__)
 # Last-Event-ID 重连续传。测试可调为 0/极小值。
 STREAM_POLL_SECONDS = 1.0
 STREAM_MAX_SECONDS = 300.0
+
+
+def _jsonable(value):
+    """REST 输出统一把 datetime 转 ISO 字符串。
+
+    Flask 默认 JSON 序列化把 datetime 输出为 RFC 1123（http_date），
+    前端 parseLogTime 无法解析；SSE 路径已用 default=str 输出 ISO，
+    这里把 REST 路径对齐为同一格式。
+    """
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 def _identity():
@@ -121,6 +138,7 @@ def create_run():
             budget_payload=payload.get('budget'),
             profile_payload=payload.get('profile'),
         )
+        run = _jsonable(run)
         return api_response(data=run, run=run)
     except Exception as exc:
         db.session.rollback()
@@ -135,6 +153,7 @@ def start_run(run_id):
     try:
         run = _repo().start_run(owner, role, run_id)
         _dispatch_drive(run_id)
+        run = _jsonable(run)
         return api_response(data=run, run=run)
     except Exception as exc:
         db.session.rollback()
@@ -153,6 +172,7 @@ def cancel_run(run_id):
             status.value for status in TERMINAL_RUN_STATUSES
         }:
             _dispatch_drive(run_id)
+        run = _jsonable(run)
         return api_response(data=run, run=run)
     except Exception as exc:
         db.session.rollback()
@@ -165,7 +185,7 @@ def list_runs():
     if blocked:
         return blocked
     try:
-        runs = _repo().list_runs(owner)
+        runs = _jsonable(_repo().list_runs(owner))
         return api_response(data={'runs': runs}, runs=runs)
     except Exception as exc:
         db.session.rollback()
@@ -178,7 +198,7 @@ def run_detail(run_id):
     if blocked:
         return blocked
     try:
-        run = _repo().snapshot(owner, run_id)
+        run = _jsonable(_repo().snapshot(owner, run_id))
         return api_response(data=run, run=run)
     except Exception as exc:
         db.session.rollback()
@@ -198,6 +218,7 @@ def propose_step(run_id):
             probe_id=str(payload.get('probe_id') or ''),
             params=payload.get('params') or {},
         )
+        step = _jsonable(step)
         return api_response(data=step, step=step)
     except Exception as exc:
         db.session.rollback()
@@ -218,6 +239,7 @@ def decide_step(run_id, step_id):
             expected_revision=payload.get('expected_revision'),
         )
         _dispatch_drive(run_id)
+        step = _jsonable(step)
         return api_response(data=step, step=step)
     except Exception as exc:
         db.session.rollback()
@@ -252,7 +274,7 @@ def list_artifacts(run_id):
     if blocked:
         return blocked
     try:
-        artifacts = _repo().list_artifacts(owner, run_id)
+        artifacts = _jsonable(_repo().list_artifacts(owner, run_id))
         return api_response(data={'artifacts': artifacts}, artifacts=artifacts)
     except Exception as exc:
         db.session.rollback()
@@ -266,7 +288,7 @@ def artifact_content(run_id, artifact_id):
     if blocked:
         return blocked
     try:
-        artifact = _repo().get_artifact(owner, run_id, artifact_id)
+        artifact = _jsonable(_repo().get_artifact(owner, run_id, artifact_id))
         return api_response(data=artifact, artifact=artifact)
     except Exception as exc:
         db.session.rollback()
@@ -280,7 +302,7 @@ def list_evidence(run_id):
     if blocked:
         return blocked
     try:
-        evidence = _repo().list_evidence(owner, run_id)
+        evidence = _jsonable(_repo().list_evidence(owner, run_id))
         return api_response(data={'evidence': evidence}, evidence=evidence)
     except Exception as exc:
         db.session.rollback()
