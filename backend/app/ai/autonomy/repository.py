@@ -15,6 +15,7 @@
 import datetime
 import json
 import re
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +41,17 @@ from app.ai.autonomy.policy import (
     validate_mode_for_environment,
 )
 from app.ai.autonomy.graph import DEFAULT_GRAPH_VERSION
+from app.ai.autonomy.plans import (
+    PLAN_MAX_ACTIONS,
+    PLAN_SUMMARY_CHARS,
+    PlanAuthorizationError,
+    build_plan_digest,
+    build_plan_snapshot,
+    canonical_plan_json,
+    parse_plan_snapshot,
+    validate_plan_action,
+    verify_plan_authorization,
+)
 from app.ai.autonomy.state import (
     ACTIVE_RUN_STATUSES,
     CANONICAL_RUN_MODES,
@@ -49,6 +61,7 @@ from app.ai.autonomy.state import (
     StepKind,
     StepStatus,
     TERMINAL_RUN_STATUSES,
+    TERMINAL_STEP_STATUSES,
     assert_run_transition,
     assert_step_transition,
 )
@@ -672,6 +685,181 @@ class AutonomyRepository:
         return self._step_to_dict(step)
 
     # ------------------------------------------------------------------
+    # 计划提案：一次授权一个稳定计划（S3 切片 2）
+    # ------------------------------------------------------------------
+
+    def _plan_binding(self, run) -> Dict[str, Any]:
+        """执行/决策边界从权威 Run/Host 行现取的当前绑定。
+
+        与计划快照比较：目标、凭据引用、模式、预算、图版本或
+        资产环境任一漂移，计划授权即失效回 ask。
+        """
+        host = self._get_host_row(run.host_id)
+        return {
+            'target_id': int(run.host_id),
+            'credential_ref': 'system_user:%d' % int(run.system_user_id),
+            'mode': str(run.mode or ''),
+            'budget': json.loads(run.budget_json or '{}'),
+            'graph_version': str(run.graph_version or ''),
+            'environment': str(host.ai_environment),
+        }
+
+    def propose_plan(
+        self,
+        owner: str,
+        role: str,
+        run_id: str,
+        summary: str,
+        actions: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """把模型提议的有序动作列表固化成不可变 plan Step。
+
+        目标绑定、预算、图版本与凭据引用全部取自权威 Run 行；
+        每个动作预先分配 step_id 并进 digest，展开执行时绝不重新
+        生成。任一动作被服务端策略拒绝则整体拒绝，绝不落半张计划。
+        """
+        from app.core.db.database import t_ai_autonomous_step
+
+        run = self._get_run_row(owner, run_id)
+        if run.status not in {
+            RunStatus.QUEUED.value, RunStatus.RUNNING.value,
+            RunStatus.WAITING_APPROVAL.value,
+        }:
+            raise AutonomyConflict(
+                'steps can only be proposed while the run is active'
+            )
+        items = list(actions or [])
+        if not items:
+            raise AutonomyValidationError('plan requires at least one action')
+        if len(items) > PLAN_MAX_ACTIONS:
+            raise AutonomyValidationError(
+                'plan exceeds %d actions' % PLAN_MAX_ACTIONS
+            )
+        # 同一 Run 同时只允许一个未决计划：旧计划必须先被决策或
+        # 执行完毕，避免两张计划争抢同一份授权。
+        active_plan = (
+            self.session.query(t_ai_autonomous_step)
+            .filter_by(run_id=run_id, kind=StepKind.PLAN.value)
+            .filter(
+                t_ai_autonomous_step.status.notin_(
+                    [s.value for s in TERMINAL_STEP_STATUSES],
+                ),
+            )
+            .first()
+        )
+        if active_plan is not None:
+            raise AutonomyConflict(
+                'a plan already requires a decision or execution'
+            )
+
+        self._revalidate_boundaries(owner, role, run)
+        budget = Budget(**json.loads(run.budget_json or '{}'))
+        action_count = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id, kind=StepKind.ACTION.value,
+        ).count()
+        if action_count + len(items) > int(budget.max_actions):
+            raise AutonomyConflict('action budget exhausted')
+
+        host = self._get_host_row(run.host_id)
+        constructed = []
+        needs_ask = False
+        for item in items:
+            if not isinstance(item, dict):
+                raise AutonomyValidationError(
+                    'plan actions must be objects'
+                )
+            kind = str(item.get('kind') or '')
+            params = item.get('params')
+            if params is None:
+                params = item.get('parameters') or {}
+            step_id = uuid.uuid4().hex
+            try:
+                normalized = validate_plan_action(
+                    kind, params,
+                    run_id=run_id, step_id=step_id,
+                    target_host=str(host.host_ip),
+                )
+            except ActionValidationError as exc:
+                raise AutonomyValidationError(str(exc)) from exc
+            action = StructuredAction(
+                kind=kind,
+                target_id=int(run.host_id),
+                system_user_id=int(run.system_user_id),
+                parameters=normalized,
+                timeout_seconds=min(budget.command_timeout_seconds, 600),
+                step_id=step_id,
+            )
+            decision, reason = classify_action(
+                run.mode, action, host.ai_environment,
+            )
+            if decision == PolicyDecision.DENY:
+                raise AutonomyValidationError(
+                    'plan action denied by server policy: %s' % reason
+                )
+            if decision == PolicyDecision.ASK:
+                needs_ask = True
+            constructed.append(action)
+
+        ordered_digests = [
+            build_action_digest(action, self.secret_key)
+            for action in constructed
+        ]
+        expires_at = int(time.time()) + _approval_ttl_seconds()
+        snapshot = build_plan_snapshot(
+            graph_version=str(run.graph_version or ''),
+            mode=str(run.mode or ''),
+            target_id=int(run.host_id),
+            system_user_id=int(run.system_user_id),
+            budget=budget.to_dict(),
+            expires_at=expires_at,
+            summary=sanitize_text(summary)[:PLAN_SUMMARY_CHARS],
+            actions_canonical=[
+                action.to_canonical_dict() for action in constructed
+            ],
+            ordered_action_digests=ordered_digests,
+        )
+
+        plan_step_id = uuid.uuid4().hex
+        initial_status = (
+            StepStatus.WAITING_APPROVAL.value
+            if needs_ask else StepStatus.APPROVED.value
+        )
+        seq = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id,
+        ).count() + 1
+        step = t_ai_autonomous_step(
+            id=plan_step_id,
+            run_id=run_id,
+            kind=StepKind.PLAN.value,
+            status=initial_status,
+            seq=seq,
+            summary=sanitize_text(summary)[:255] or 'plan',
+            action_json=canonical_plan_json(snapshot),
+            action_digest=build_plan_digest(snapshot, self.secret_key),
+            note='',
+        )
+        self.session.add(step)
+        self._bump(run)
+        self.append_event(run, 'plan_proposed', {
+            'step_id': plan_step_id,
+            'seq': seq,
+            'action_count': len(constructed),
+            'decision': 'ask' if needs_ask else 'allow',
+        })
+        if needs_ask:
+            if run.status != RunStatus.WAITING_APPROVAL.value:
+                assert_run_transition(
+                    run.status, RunStatus.WAITING_APPROVAL.value,
+                )
+                run.status = RunStatus.WAITING_APPROVAL.value
+                self._bump(run)
+            self.append_event(run, 'steps_waiting_approval', {
+                'step_ids': [plan_step_id],
+            })
+        self._commit()
+        return self._step_to_dict(step)
+
+    # ------------------------------------------------------------------
     # 原子审批决策
     # ------------------------------------------------------------------
 
@@ -724,15 +912,29 @@ class AutonomyRepository:
         if step.status != StepStatus.WAITING_APPROVAL.value:
             raise AutonomyConflict('step is not awaiting approval')
 
-        # digest 复核：快照被篡改则审批无效。
-        try:
-            action = action_from_dict(json.loads(step.action_json or '{}'))
-        except (ActionValidationError, ValueError):
-            raise AutonomyConflict('action snapshot is corrupted') from None
-        if not verify_action_digest(
-            action, step.action_digest, self.secret_key,
-        ):
-            raise AutonomyConflict('action digest mismatch')
+        # digest 复核：快照被篡改则审批无效。plan Step 走计划级
+        # 授权复核（digest + 过期 + 当前绑定），动作 Step 走单动作
+        # digest 复核。
+        if step.kind == StepKind.PLAN.value:
+            try:
+                snapshot = parse_plan_snapshot(step.action_json or '')
+                verify_plan_authorization(
+                    snapshot, step.action_digest,
+                    self._plan_binding(run), self.secret_key,
+                )
+            except PlanAuthorizationError as exc:
+                raise AutonomyConflict(
+                    'plan authorization invalid: %s' % exc.reason,
+                ) from None
+        else:
+            try:
+                action = action_from_dict(json.loads(step.action_json or '{}'))
+            except (ActionValidationError, ValueError):
+                raise AutonomyConflict('action snapshot is corrupted') from None
+            if not verify_action_digest(
+                action, step.action_digest, self.secret_key,
+            ):
+                raise AutonomyConflict('action digest mismatch')
 
         # 决策边界重新校验当前权限、凭据授权与资产环境。
         self._revalidate_boundaries(owner, role, run)

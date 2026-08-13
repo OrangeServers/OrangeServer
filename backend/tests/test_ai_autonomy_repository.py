@@ -1107,3 +1107,192 @@ def test_event_payload_is_sanitized_of_credentials(repo_env):
     assert cleaned["nested"] == {"ok": "y"}
     assert cleaned["list"] == [{}, {"safe": 1}]
     assert cleaned["step_id"] == "s1"
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 2：计划提案与计划级授权
+# ---------------------------------------------------------------------------
+
+def _systemd_actions():
+    return [
+        {"kind": "systemd", "params": {"operation": "restart", "unit": "nginx"}},
+    ]
+
+
+def test_propose_plan_persists_immutable_snapshot_and_pauses_run(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+
+    step = repo.propose_plan(
+        "admin", "admin", run["id"], "restart nginx", _systemd_actions(),
+    )
+
+    assert step["kind"] == "plan"
+    assert step["status"] == "waiting_approval"
+    row = repo_env["session"].get(t_ai_autonomous_step, step["id"])
+    snapshot = json.loads(row.action_json)
+    assert snapshot["target_id"] == repo_env["host_id"]
+    assert snapshot["credential_ref"] == "system_user:19"
+    assert snapshot["policy_version"]
+    assert snapshot["mode"] == "ask"
+    assert snapshot["graph_version"] == "v2"
+    assert snapshot["budget"]["max_actions"] == 30
+    assert snapshot["expires_at"] > 0
+    assert len(snapshot["actions"]) == 1
+    assert len(snapshot["ordered_action_digests"]) == 1
+    # 目标绑定来自权威 Run 行：模型参数里的主机/用户无处可进。
+    action = snapshot["actions"][0]
+    assert action["target_id"] == repo_env["host_id"]
+    assert action["system_user_id"] == 19
+    run_row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    assert run_row.status == "waiting_approval"
+
+
+def test_probe_only_plan_is_approved_without_pausing(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+
+    step = repo.propose_plan(
+        "admin", "admin", run["id"], "recheck load",
+        [{"kind": "probe", "params": {"probe_id": "system.load"}}],
+    )
+
+    assert step["status"] == "approved"
+    run_row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    # 探针-only 计划直接放行，不为审批暂停。
+    assert run_row.status != "waiting_approval"
+
+
+def test_propose_plan_rejects_unsupported_kinds(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    for kind in ("shell", "file_read"):
+        with pytest.raises(AutonomyValidationError):
+            repo.propose_plan(
+                "admin", "admin", run["id"], "bad plan",
+                [{"kind": kind, "params": {"command": "true"}}],
+            )
+    assert repo_env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"],
+    ).count() == 0
+
+
+def test_propose_plan_rejects_denied_actions_whole(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+
+    with pytest.raises(AutonomyValidationError):
+        repo.propose_plan(
+            "admin", "admin", run["id"], "bad plan",
+            [{"kind": "file_patch", "params": {
+                "path": "/etc/shadow", "content": "x",
+            }}],
+        )
+    # 半张计划绝不落库。
+    assert repo_env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"],
+    ).count() == 0
+
+
+def test_only_one_pending_plan_at_a_time(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    repo.propose_plan(
+        "admin", "admin", run["id"], "first", _systemd_actions(),
+    )
+
+    with pytest.raises(AutonomyConflict, match="plan already"):
+        repo.propose_plan(
+            "admin", "admin", run["id"], "second", _systemd_actions(),
+        )
+
+
+def test_propose_plan_enforces_action_budget(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"](budget_payload={"max_actions": 1})
+
+    with pytest.raises(AutonomyConflict, match="budget"):
+        repo.propose_plan(
+            "admin", "admin", run["id"], "too big",
+            _systemd_actions() + [
+                {"kind": "systemd", "params": {
+                    "operation": "start", "unit": "nginx",
+                }},
+            ],
+        )
+
+
+def test_decide_approves_or_rejects_a_plan_step(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    step = repo.propose_plan(
+        "admin", "admin", run["id"], "restart nginx", _systemd_actions(),
+    )
+    run_row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+
+    approved = repo.decide(
+        "admin", "admin", run["id"], step["id"],
+        operation="approve", expected_revision=int(run_row.revision),
+    )
+    assert approved["status"] == "approved"
+    run_row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    assert run_row.status == "queued"
+
+    # 模拟计划已执行完毕（终态）后，新计划才可再次提案。
+    plan_row = repo_env["session"].get(t_ai_autonomous_step, step["id"])
+    plan_row.status = "succeeded"
+    repo_env["session"].commit()
+
+    second = repo.propose_plan(
+        "admin", "admin", run["id"], "again", _systemd_actions(),
+    )
+    run_row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    rejected = repo.decide(
+        "admin", "admin", run["id"], second["id"],
+        operation="reject", expected_revision=int(run_row.revision),
+    )
+    assert rejected["status"] == "failed"
+
+
+def test_tampered_plan_snapshot_invalidates_approval(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    step = repo.propose_plan(
+        "admin", "admin", run["id"], "restart nginx", _systemd_actions(),
+    )
+    row = repo_env["session"].get(t_ai_autonomous_step, step["id"])
+    snapshot = json.loads(row.action_json)
+    snapshot["actions"][0]["parameters"]["unit"] = "attacker"
+    row.action_json = json.dumps(snapshot)
+    repo_env["session"].commit()
+    run_row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+
+    with pytest.raises(AutonomyConflict, match="plan authorization invalid"):
+        repo.decide(
+            "admin", "admin", run["id"], step["id"],
+            operation="approve", expected_revision=int(run_row.revision),
+        )
+
+
+def test_expired_plan_authorization_invalidates_approval(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    step = repo.propose_plan(
+        "admin", "admin", run["id"], "restart nginx", _systemd_actions(),
+    )
+    row = repo_env["session"].get(t_ai_autonomous_step, step["id"])
+    snapshot = json.loads(row.action_json)
+    snapshot["expires_at"] = 1
+    from app.ai.autonomy.plans import build_plan_digest, canonical_plan_json
+
+    # 即使重签，过期复核仍不放行。
+    row.action_json = canonical_plan_json(snapshot)
+    row.action_digest = build_plan_digest(snapshot, repo.secret_key)
+    repo_env["session"].commit()
+    run_row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+
+    with pytest.raises(AutonomyConflict, match="expired"):
+        repo.decide(
+            "admin", "admin", run["id"], step["id"],
+            operation="approve", expected_revision=int(run_row.revision),
+        )

@@ -1112,3 +1112,183 @@ def test_scan_excludes_healthy_paused_runs(env):
     )
     candidates = env["lease"].scan_recoverable()
     assert [c["run_id"] for c in candidates] == [run["id"]]
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 2：计划级授权——一次批准连续执行，篡改即失效
+# ---------------------------------------------------------------------------
+
+def _plan_planner(actions, summary="restart nginx"):
+    """首轮提议一张计划，之后不再提议（驱动循环应收敛）。"""
+    calls = {"n": 0}
+
+    def planner(context):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            return []
+        step = context["repo"].propose_plan(
+            context["owner"], context["role"], context["run_id"],
+            summary, actions,
+        )
+        return [step["id"]]
+
+    return planner
+
+
+def _plan_step(env, run_id):
+    return env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run_id, kind="plan",
+    ).one()
+
+
+def _approve_plan(env, run_id):
+    run = _run_row(env, run_id)
+    plan = _plan_step(env, run_id)
+    env["repo"].decide(
+        "admin", "admin", run_id, plan.id,
+        operation="approve", expected_revision=int(run.revision),
+    )
+
+
+def test_approved_plan_executes_continuously_without_asking_again(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_PAUSED
+    assert env["runner"].calls == []
+    assert _run_row(env, run["id"]).status == "waiting_approval"
+    assert _plan_step(env, run["id"]).status == "waiting_approval"
+
+    _approve_plan(env, run["id"])
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    # 未变更的动作按快照连续执行，绝不逐条再问。
+    assert len(env["runner"].calls) == 1
+    assert "systemctl restart nginx" in env["runner"].calls[0]["command"]
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "succeeded"
+    action_steps = env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).all()
+    assert len(action_steps) == 1
+    assert action_steps[0].status == "succeeded"
+    snapshot = json.loads(plan.action_json)
+    # 展开的 Step 就是提案时预分配、被 digest 覆盖的那一个。
+    assert action_steps[0].id == snapshot["actions"][0]["step_id"]
+    assert action_steps[0].action_digest == (
+        snapshot["ordered_action_digests"][0]
+    )
+    events = _events(env, run["id"])
+    waiting = [
+        e for e in events if e.event_type == "steps_waiting_approval"
+    ]
+    assert len(waiting) == 1  # 只为计划审批暂停过一次
+    decided = [
+        e for e in events
+        if e.event_type == "step_policy_decided"
+        and json.loads(e.payload_json).get("step_id")
+        == action_steps[0].id
+    ]
+    assert len(decided) == 1
+    assert json.loads(decided[0].payload_json)["decision"] == "allow"
+    completed = [e for e in events if e.event_type == "plan_completed"]
+    assert len(completed) == 1
+    assert json.loads(completed[0].payload_json)["action_count"] == 1
+
+
+def test_probe_only_plan_executes_without_any_pause(env):
+    planner = _plan_planner(
+        [{"kind": "probe", "params": {"probe_id": "system.load"}}],
+        summary="recheck load",
+    )
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    assert _plan_step(env, run["id"]).status == "succeeded"
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "steps_waiting_approval" not in types
+    assert "plan_completed" in types
+
+
+def test_tampered_plan_is_invalidated_before_any_side_effect(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+
+    _approve_plan(env, run["id"])
+    # 批准之后篡改快照：合法审批也必须立即失效。
+    plan = _plan_step(env, run["id"])
+    snapshot = json.loads(plan.action_json)
+    snapshot["actions"][0]["parameters"]["unit"] = "attacker"
+    plan.action_json = json.dumps(snapshot)
+    env["session"].commit()
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert env["runner"].calls == []
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "failed"
+    assert "digest_mismatch" in (plan.note or "")
+    invalidated = [
+        e for e in _events(env, run["id"])
+        if e.event_type == "plan_authorization_invalidated"
+    ]
+    assert len(invalidated) == 1
+    assert json.loads(invalidated[0].payload_json)["reason"] == (
+        "digest_mismatch"
+    )
+    # 半张计划绝不下场：零动作 Step、零远程副作用。
+    assert env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).count() == 0
+
+
+def test_binding_drift_invalidates_an_approved_plan(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+
+    _approve_plan(env, run["id"])
+    # 批准后服务端预算被收紧：展开前的权威复核必须拦下。
+    row = _run_row(env, run["id"])
+    budget = json.loads(row.budget_json)
+    budget["max_actions"] = 0
+    row.budget_json = json.dumps(budget)
+    env["session"].commit()
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert env["runner"].calls == []
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "failed"
+    assert "budget_changed" in (plan.note or "")
+    invalidated = [
+        e for e in _events(env, run["id"])
+        if e.event_type == "plan_authorization_invalidated"
+    ]
+    assert len(invalidated) == 1
+    assert json.loads(invalidated[0].payload_json)["reason"] == (
+        "budget_changed"
+    )

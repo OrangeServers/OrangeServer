@@ -11,12 +11,14 @@ from sqlalchemy.orm import sessionmaker
 from app.ai.autonomy import planner as planner_mod
 from app.ai.autonomy.planner import (
     FINISH_TOOL_NAME,
+    PLAN_TOOL_NAME,
     PROPOSAL_TOOL_NAME,
     PlannerProposalError,
     ToolCallingPlanner,
     proposal_tool_schemas,
     summarize_step_history,
 )
+from app.ai.autonomy.plans import PLAN_ACTION_KINDS
 from app.ai.autonomy.repository import (
     AutonomyConflict,
     AutonomyValidationError,
@@ -70,6 +72,15 @@ class FakeRepo:
             raise self.error
         return {"id": "step-%d" % len(self.calls)}
 
+    def propose_plan(self, owner, role, run_id, summary, actions):
+        self.calls.append(
+            {"owner": owner, "role": role, "run_id": run_id,
+             "summary": summary, "actions": actions},
+        )
+        if self.error is not None:
+            raise self.error
+        return {"id": "step-%d" % len(self.calls)}
+
 
 def make_context(repo, **budget_overrides):
     budget = {"remaining_loops": 5, "remaining_actions": 5}
@@ -113,7 +124,18 @@ def test_single_probe_proposal_goes_through_the_fenced_repo():
     tool_names = {
         tool["function"]["name"] for tool in request["tools"]
     }
-    assert tool_names == {PROPOSAL_TOOL_NAME, FINISH_TOOL_NAME}
+    assert tool_names == {
+        PROPOSAL_TOOL_NAME, PLAN_TOOL_NAME, FINISH_TOOL_NAME,
+    }
+    plan_tool = next(
+        tool for tool in request["tools"]
+        if tool["function"]["name"] == PLAN_TOOL_NAME
+    )
+    kind_enum = plan_tool["function"]["parameters"]["properties"][
+        "actions"
+    ]["items"]["properties"]["kind"]["enum"]
+    assert tuple(kind_enum) == PLAN_ACTION_KINDS
+    assert "shell" not in kind_enum
 
 
 def test_finish_tool_ends_the_loop_without_a_proposal():
@@ -323,3 +345,88 @@ def test_history_entries_are_capped_per_line(step_session):
 
     assert len(history) == 1
     assert len(history[0]) == planner_mod.HISTORY_ENTRY_CHARS
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 2：propose_plan 工具分发——计划也只是不可信提议
+# ---------------------------------------------------------------------------
+
+def plan_call(summary="restart service", actions=None):
+    return FakeToolCall(PLAN_TOOL_NAME, {
+        "summary": summary,
+        "actions": actions or [
+            {"kind": "systemd", "params": {
+                "operation": "restart", "unit": "nginx",
+            }},
+        ],
+    })
+
+
+def test_plan_proposal_goes_through_the_fenced_repo():
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[FakeChatResult([plan_call()])])
+
+    proposed = make_planner(adapter)(make_context(repo))
+
+    assert proposed == ["step-1"]
+    assert repo.calls == [{
+        "owner": "admin", "role": "admin", "run_id": "run-1",
+        "summary": "restart service",
+        "actions": [{"kind": "systemd", "params": {
+            "operation": "restart", "unit": "nginx",
+        }}],
+    }]
+
+
+@pytest.mark.parametrize("arguments", [
+    {"summary": "", "actions": [{"kind": "systemd", "params": {}}]},
+    {"summary": "fix", "actions": []},
+    {"summary": "fix", "actions": "not-a-list"},
+    {"summary": "fix", "actions": ["not-an-object"]},
+    {"summary": "fix", "actions": [{"kind": "systemd", "params": "x"}]},
+])
+def test_malformed_plan_shapes_fail_closed_without_repo_calls(arguments):
+    repo = FakeRepo()
+    adapter = FakeAdapter(
+        results=[FakeChatResult([FakeToolCall(PLAN_TOOL_NAME, arguments)])],
+    )
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+
+    assert excinfo.value.reason == "malformed_proposal"
+    assert repo.calls == []
+
+
+def test_plan_validation_error_maps_to_unsupported_proposal():
+    repo = FakeRepo(error=AutonomyValidationError("denied by policy"))
+    adapter = FakeAdapter(results=[FakeChatResult([plan_call()])])
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+
+    assert excinfo.value.reason == "unsupported_proposal"
+
+
+def test_active_plan_conflict_maps_to_plan_conflict():
+    repo = FakeRepo(error=AutonomyConflict(
+        "a plan already requires a decision or execution",
+    ))
+    adapter = FakeAdapter(results=[FakeChatResult([plan_call()])])
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+
+    assert excinfo.value.reason == "plan_conflict"
+
+
+def test_inactive_run_conflict_still_maps_to_run_not_active():
+    repo = FakeRepo(error=AutonomyConflict(
+        "steps can only be proposed while the run is active",
+    ))
+    adapter = FakeAdapter(results=[FakeChatResult([plan_call()])])
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+
+    assert excinfo.value.reason == "run_not_active"

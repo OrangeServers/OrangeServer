@@ -22,6 +22,7 @@ import datetime
 import json
 import logging
 import threading
+import time
 from contextlib import contextmanager
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -39,6 +40,12 @@ from app.ai.autonomy.planner import (
     PlannerProposalError,
     summarize_step_history,
 )
+from app.ai.autonomy.plans import (
+    PlanAuthorizationError,
+    canonical_plan_json,
+    parse_plan_snapshot,
+    verify_plan_authorization,
+)
 from app.ai.autonomy.policy import Budget, PolicyDecision, classify_action
 from app.ai.autonomy.recovery import (
     MODE_BOUNDARY,
@@ -48,7 +55,7 @@ from app.ai.autonomy.recovery import (
     MODE_RESUME,
     RecoveryService,
 )
-from app.ai.autonomy.repository import sanitize_text
+from app.ai.autonomy.repository import redacted_summary, sanitize_text
 from app.ai.autonomy.state import (
     RunStatus,
     StepKind,
@@ -101,6 +108,16 @@ class _ClaimFencedPlannerRepository:
             self._lock_claim(run_id)
             return self._repo.propose_probe(
                 owner, role, run_id, probe_id, params,
+            )
+        except Exception:
+            self._repo.session.rollback()
+            raise
+
+    def propose_plan(self, owner, role, run_id, summary, actions):
+        try:
+            self._lock_claim(run_id)
+            return self._repo.propose_plan(
+                owner, role, run_id, summary, actions,
             )
         except Exception:
             self._repo.session.rollback()
@@ -438,20 +455,13 @@ class AutonomyDriver:
 
             steps = proposed_steps()
             if not steps:
-                return {
-                    'pending_step_id': '',
-                    'policy_decision': PolicyDecision.ALLOW.value,
-                    'decision': '',
-                }
+                return self._policy_plan_pending(run_id)
             run = self._lock_current_claim(run_id)
             steps = proposed_steps()
             if not steps:
+                pending = self._policy_plan_pending(run_id)
                 self.repo._commit()
-                return {
-                    'pending_step_id': '',
-                    'policy_decision': PolicyDecision.ALLOW.value,
-                    'decision': '',
-                }
+                return pending
             if str(run.graph_version or '') != 'v2':
                 for step in steps:
                     assert_step_transition(
@@ -539,6 +549,16 @@ class AutonomyDriver:
             step = self._step_row(run_id, step_id)
             if step is None:
                 return {'summary': 'step vanished'}
+            if step.kind == StepKind.PLAN.value:
+                # 已授权计划：展开前权威复核，未变更动作连续执行，
+                # 不再逐个询问；崩溃后 running 计划可重新进入。
+                if step.status not in {
+                    StepStatus.APPROVED.value, StepStatus.RUNNING.value,
+                }:
+                    return {
+                        'summary': 'step skipped: %s' % (step.status,),
+                    }
+                return self._execute_approved_plan(run_id, step)
             if step.status != StepStatus.APPROVED.value:
                 # 被拒绝（或已被其他路径处理）：绝不执行。
                 return {
@@ -597,6 +617,208 @@ class AutonomyDriver:
             'verify': verify,
             'decide': decide,
         }
+
+    # ------------------------------------------------------------------
+    # 计划级授权：一次授权一个稳定计划（S3 切片 2）
+    # ------------------------------------------------------------------
+
+    def _policy_plan_pending(self, run_id):
+        """无待批动作时查未决计划：waiting→ask 暂停，approved→直接执行。"""
+        from app.core.db.database import t_ai_autonomous_step
+
+        plan_step = (
+            self.session.query(t_ai_autonomous_step)
+            .filter_by(run_id=run_id, kind=StepKind.PLAN.value)
+            .filter(
+                t_ai_autonomous_step.status.in_([
+                    StepStatus.WAITING_APPROVAL.value,
+                    StepStatus.APPROVED.value,
+                ]),
+            )
+            .order_by(t_ai_autonomous_step.seq.desc())
+            .first()
+        )
+        if plan_step is None:
+            return {
+                'pending_step_id': '',
+                'policy_decision': PolicyDecision.ALLOW.value,
+                'decision': '',
+            }
+        decision = (
+            PolicyDecision.ASK.value
+            if plan_step.status == StepStatus.WAITING_APPROVAL.value
+            else PolicyDecision.ALLOW.value
+        )
+        return {
+            'pending_step_id': plan_step.id,
+            'policy_decision': decision,
+            'decision': '',
+        }
+
+    def _execute_approved_plan(self, run_id, plan_step):
+        """展开已授权计划：复核→按序执行→落终态。
+
+        任何前置失效（digest/过期/目标/凭据/策略/预算/图版本漂移）
+        都把计划落 failed 并回 ask（下一轮重新提议与决策），绝不
+        放行部分动作；单个动作失败即停止展开，剩余动作不执行。
+        """
+        from app.core.db.database import t_ai_autonomous_step
+
+        try:
+            snapshot = parse_plan_snapshot(plan_step.action_json or '')
+            actions = verify_plan_authorization(
+                snapshot, plan_step.action_digest,
+                self.repo._plan_binding(self._run_row(run_id)),
+                self.repo.secret_key, int(time.time()),
+            )
+        except PlanAuthorizationError as exc:
+            self._invalidate_plan(run_id, plan_step, exc.reason)
+            return {'summary': 'plan invalidated: %s' % exc.reason}
+
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step.id)
+        budget = Budget(**json.loads(run.budget_json or '{}'))
+        action_count = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id, kind=StepKind.ACTION.value,
+        ).count()
+        if action_count + len(actions) > int(budget.max_actions):
+            self.repo._commit()
+            self._invalidate_plan(run_id, plan_step, 'budget_changed')
+            return {'summary': 'plan invalidated: budget_changed'}
+        if plan_step.status == StepStatus.APPROVED.value:
+            assert_step_transition(plan_step.status, StepStatus.RUNNING.value)
+            plan_step.status = StepStatus.RUNNING.value
+            self.repo._bump(run)
+            self.repo._commit()
+
+        canonical_actions = list(snapshot['actions'])
+        executed = 0
+        for index, action in enumerate(actions):
+            current = self._run_row(run_id)
+            if bool(current.cancel_requested):
+                self._fail_plan(
+                    run_id, plan_step, 'plan halted: cancel requested',
+                )
+                return {'summary': 'plan halted: cancel requested'}
+            canonical = canonical_actions[index]
+            step_row = self._ensure_plan_action_step(
+                run_id, plan_step, canonical, action, index,
+                action_digest=str(snapshot['ordered_action_digests'][index]),
+            )
+            if step_row.status in {
+                StepStatus.SUCCEEDED.value, StepStatus.SKIPPED.value,
+            }:
+                if step_row.status == StepStatus.SUCCEEDED.value:
+                    executed += 1
+                continue
+            if step_row.status in {
+                StepStatus.FAILED.value,
+                StepStatus.OUTCOME_UNKNOWN.value,
+                StepStatus.CANCELLED.value,
+            }:
+                self._fail_plan(
+                    run_id, plan_step,
+                    'plan halted: action %s' % step_row.status,
+                )
+                return {'summary': 'plan halted: action %s' % step_row.status}
+            result = self.executor.execute_step(
+                str(current.owner), self.role, run_id, step_row.id,
+                timeout_seconds=self._remaining_duration_seconds(),
+                control_probe=self._execution_control_probe,
+                control_session_factory=self._heartbeat_session_factory,
+                lease_owner=self._identity(),
+                lease_token=self._active_lease_token,
+            )
+            self._revision_state['revision'] = int(result['revision'])
+            if result.get('termination') == 'lease_lost':
+                raise DriveAbort('lease lost during plan execution')
+            if str(result['step_status']) != StepStatus.SUCCEEDED.value:
+                self._fail_plan(
+                    run_id, plan_step,
+                    'plan halted: action %s' % result['step_status'],
+                )
+                return {
+                    'summary': 'plan halted: action %s'
+                    % result['step_status'],
+                }
+            executed += 1
+
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step.id)
+        assert_step_transition(plan_step.status, StepStatus.SUCCEEDED.value)
+        plan_step.status = StepStatus.SUCCEEDED.value
+        plan_step.note = '%d action(s) succeeded' % executed
+        self.repo._bump(run)
+        self.repo.append_event(run, 'plan_completed', {
+            'step_id': plan_step.id, 'action_count': executed,
+        })
+        self.repo._commit()
+        return {'summary': 'plan succeeded: %d action(s)' % executed}
+
+    def _invalidate_plan(self, run_id, plan_step, reason):
+        """授权失效：计划落 failed + 事件，回 ask 重新提议与决策。"""
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step.id)
+        assert_step_transition(plan_step.status, StepStatus.FAILED.value)
+        plan_step.status = StepStatus.FAILED.value
+        plan_step.note = ('plan authorization invalidated: %s' % reason)[:255]
+        self.repo._bump(run)
+        self.repo.append_event(run, 'plan_authorization_invalidated', {
+            'step_id': plan_step.id, 'reason': str(reason)[:64],
+        })
+        self.repo._commit()
+
+    def _fail_plan(self, run_id, plan_step, note):
+        """执行期失败：计划落 failed，剩余动作绝不继续。"""
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step.id)
+        if plan_step.status not in {
+            StepStatus.FAILED.value, StepStatus.SUCCEEDED.value,
+        }:
+            assert_step_transition(plan_step.status, StepStatus.FAILED.value)
+            plan_step.status = StepStatus.FAILED.value
+            plan_step.note = str(note)[:255]
+            self.repo._bump(run)
+            self.repo._commit()
+
+    def _ensure_plan_action_step(
+        self, run_id, plan_step, canonical, action, index, *, action_digest,
+    ):
+        """按计划快照展开一个动作 Step（幂等：崩溃重入不重复建）。
+
+        digest 直接取计划快照的有序动作 digest：展开的动作与授权
+        时签名的动作逐字节一致，执行器还会独立复核一次。
+        """
+        from app.core.db.database import t_ai_autonomous_step
+
+        step_id = str(canonical.get('step_id') or '')
+        existing = self._step_row(run_id, step_id)
+        if existing is not None:
+            return existing
+        run = self._lock_current_claim(run_id)
+        seq = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id,
+        ).count() + 1
+        step = t_ai_autonomous_step(
+            id=step_id,
+            run_id=run_id,
+            kind=StepKind.ACTION.value,
+            status=StepStatus.APPROVED.value,
+            seq=seq,
+            summary=redacted_summary(action),
+            action_json=canonical_plan_json(canonical),
+            action_digest=action_digest,
+            note=('authorized by plan %s' % plan_step.id)[:255],
+        )
+        self.session.add(step)
+        self.repo._bump(run)
+        self.repo.append_event(run, 'step_policy_decided', {
+            'step_id': step_id,
+            'decision': PolicyDecision.ALLOW.value,
+            'reason': 'authorized by approved plan',
+        })
+        self.repo._commit()
+        return step
 
     # ------------------------------------------------------------------
     # 心跳
