@@ -135,7 +135,8 @@ Verification 表。
 
 实现必须满足：
 
-- 活动 Run 使用数据库租约和唯一约束防止并行执行；
+- 活动 Run 使用数据库唯一约束和 `owner + 一次性 token + 到期时间` 租约 fencing
+  防止并行执行及旧 Worker 回写；
 - Run 持久化 `revision`、`graph_version`、预算、心跳、取消请求和最新 Event 序号；
 - Event 在 Run 内单调递增，GET 快照始终比 SSE 增量权威；
 - Artifact 清控制字符、脱敏、限长后使用现有 Fernet 体系加密；
@@ -192,8 +193,9 @@ digest、目标、凭据引用、策略版本、预算和有效期；计划内�
 
 ### 恢复、取消和回退
 
-Celery 任务只携带 `run_id`，按至少一次投递设计。Worker 通过数据库 revision 和租约
-幂等认领 Run，并在启动时扫描 queued、请求恢复和租约过期的 Run：
+Celery 任务只携带 `run_id`，按至少一次投递设计。Worker 通过数据库 revision 和带
+一次性 token 的租约幂等认领 Run，并在启动时及运行期间周期扫描 queued、请求恢复和
+租约过期的 Run：
 
 - 只读动作可以自动重试；
 - 已确认尚未执行的结构化动作可以继续；

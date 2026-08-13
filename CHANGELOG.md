@@ -26,6 +26,17 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and `deny` can never be elevated by a model. Persisted v1 runs retain their
   original graph and legacy mode semantics for recovery.
 
+- The unreleased M1/S2 worker path now fences every claim, checkpoint write,
+  and final write with a one-time lease token, continuously rescans
+  recoverable runs, and fails closed when its Redis checkpoint store or a
+  safe MySQL recovery cursor is unavailable. The feature remains disabled by
+  default and is not part of a release deployment.
+
+- Structured file patches now retain a complete managed backup reference and
+  a redacted, encrypted unified diff in the same transaction as the successful
+  step outcome. Missing rollback evidence fails closed instead of reporting a
+  safely recoverable change.
+
 ## [1.0.4] - 2026-07-30
 
 ### Fixed

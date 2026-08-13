@@ -118,7 +118,8 @@ RUN_TRANSITIONS = {
         RunStatus.CANCELLED, RunStatus.FAILED, RunStatus.EXPIRED,
     },
     RunStatus.RECOVERING: {
-        RunStatus.RUNNING, RunStatus.NEEDS_ATTENTION,
+        RunStatus.RUNNING, RunStatus.WAITING_APPROVAL,
+        RunStatus.NEEDS_ATTENTION,
         RunStatus.FAILED, RunStatus.CANCELLED,
     },
     RunStatus.NEEDS_ATTENTION: {

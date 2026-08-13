@@ -141,7 +141,8 @@ mysql -h <mysql-host> -u <mysql-user> -p <database> \
 Run、事件、加密证据和报告表，rev51 为 `t_settings` 增加界面语言字段（默认
 zh-CN，存量行为不变），rev52 增加由管理界面维护的 SMTP 配置字段，授权码仅
 保存 Fernet 密文，rev53 为 AI 自治（M1/S1）增加资产环境列与 Run/Step/事件/
-产物四张表；rev54 为自治 Run 表追加 Worker 租约、心跳与图版本列（M1/S2，
+产物四张表；rev54 为自治 Run 表追加 Worker 租约、一次性 fencing token、心跳与
+图版本列（M1/S2，
 尚未发布，集成分支预置）；自治功能默认关闭
 （`OGS_AI_AUTONOMY_ENABLED` 不设置即无行为变化）。
 各脚本针对其自身变更设计了重复执行保护，但重复运行前仍应

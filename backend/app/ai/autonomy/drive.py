@@ -22,7 +22,9 @@ import datetime
 import json
 import logging
 import threading
+from contextlib import contextmanager
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
 from app.ai.autonomy.actions import (
@@ -36,8 +38,10 @@ from app.ai.autonomy.lease import RunLeaseService
 from app.ai.autonomy.policy import Budget, PolicyDecision, classify_action
 from app.ai.autonomy.recovery import (
     MODE_BOUNDARY,
+    MODE_FRESH,
     MODE_HALT,
     MODE_PAUSE,
+    MODE_RESUME,
     RecoveryService,
 )
 from app.ai.autonomy.repository import sanitize_text
@@ -77,6 +81,62 @@ class DriveAbort(Exception):
 
 class DurationBudgetExhausted(Exception):
     """Run 的持久化墙钟预算已耗尽，不得再开始新的副作用。"""
+
+
+class _ClaimFencedPlannerRepository:
+    """Expose planner proposals only through the current locked claim."""
+
+    def __init__(self, repo, lock_claim):
+        self._repo = repo
+        self._lock_claim = lock_claim
+
+    def propose_probe(
+        self, owner, role, run_id, probe_id, params=None,
+    ):
+        try:
+            self._lock_claim(run_id)
+            return self._repo.propose_probe(
+                owner, role, run_id, probe_id, params,
+            )
+        except Exception:
+            self._repo.session.rollback()
+            raise
+
+
+class _ClaimFencedCheckpointSaver(BaseCheckpointSaver):
+    """Fence each checkpoint write with the exact authoritative Run claim."""
+
+    def __init__(self, saver, write_fence):
+        super().__init__(serde=saver.serde)
+        self._saver = saver
+        self._write_fence = write_fence
+
+    def __getattr__(self, name):
+        return getattr(self._saver, name)
+
+    @property
+    def config_specs(self):
+        return self._saver.config_specs
+
+    def get_tuple(self, *args, **kwargs):
+        return self._saver.get_tuple(*args, **kwargs)
+
+    def list(self, *args, **kwargs):
+        return self._saver.list(*args, **kwargs)
+
+    def get_next_version(self, *args, **kwargs):
+        return self._saver.get_next_version(*args, **kwargs)
+
+    def get_delta_channel_history(self, *args, **kwargs):
+        return self._saver.get_delta_channel_history(*args, **kwargs)
+
+    def put(self, *args, **kwargs):
+        with self._write_fence():
+            return self._saver.put(*args, **kwargs)
+
+    def put_writes(self, *args, **kwargs):
+        with self._write_fence():
+            return self._saver.put_writes(*args, **kwargs)
 
 
 class LeaseHeartbeat:
@@ -153,6 +213,7 @@ class AutonomyDriver:
         self._heartbeater = None
         self._revision_state = {'revision': 0}
         self._duration_deadline = None
+        self._active_lease_token = ''
 
     # ------------------------------------------------------------------
     # 内部工具
@@ -215,7 +276,64 @@ class AutonomyDriver:
             self._revision_state['revision'] = int(row.revision or 0)
 
     def _release_lease(self, run_id):
-        self.lease.release_lease(run_id, self._identity())
+        self.lease.release_lease(
+            run_id, self._identity(), self._active_lease_token,
+        )
+
+    def _lock_claim_in_session(self, session, run_id):
+        """Lock the Run and prove this exact claim still owns persistence."""
+        from app.core.db.database import t_ai_autonomous_run
+
+        session.rollback()
+        session.expire_all()
+        current = session.query(t_ai_autonomous_run).filter_by(
+            id=run_id,
+        ).with_for_update().first()
+        now = _utcnow()
+        if (
+            current is None
+            or str(current.lease_owner or '') != self._identity()
+            or not self._active_lease_token
+            or str(current.lease_token or '') != self._active_lease_token
+            or current.lease_expires_at is None
+            or current.lease_expires_at < now
+        ):
+            session.rollback()
+            raise DriveAbort('lease claim fence lost')
+        return current
+
+    def _lock_current_claim(self, run_id):
+        return self._lock_claim_in_session(self.session, run_id)
+
+    @contextmanager
+    def _checkpoint_write_fence(self, run_id):
+        """Hold the Run row lock across one Redis checkpoint write."""
+        session = self.session
+        owns_session = False
+        if self._heartbeat_session_factory is not None:
+            session = self._heartbeat_session_factory()
+            owns_session = True
+        try:
+            self._lock_claim_in_session(session, run_id)
+            yield
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            if owns_session:
+                session.close()
+
+    def _fence_checkpoint_saver(self, run_id, saver):
+        return _ClaimFencedCheckpointSaver(
+            saver, lambda: self._checkpoint_write_fence(run_id),
+        )
+
+    @staticmethod
+    def _clear_claim(run):
+        run.lease_owner = None
+        run.lease_token = None
+        run.lease_expires_at = None
 
     def _identity(self):
         from app.ai.autonomy.worker import worker_identity
@@ -224,19 +342,40 @@ class AutonomyDriver:
 
     def _fail_run(self, run, event_type, note):
         """前置条件失败：Run 落终态 failed + 事件，释放租约。"""
+        run = self._lock_current_claim(run.id)
         assert_run_transition(run.status, RunStatus.FAILED.value)
         run.status = RunStatus.FAILED.value
         run.completed_at = run.completed_at or _utcnow()
         self.repo._bump(run)
         self.repo.append_event(run, event_type, {'note': note[:128]})
+        self._clear_claim(run)
         self.repo._commit()
-        self._release_lease(run.id)
+
+    def _checkpoint_unavailable(self, run, note):
+        """Persist a stable fail-closed checkpoint failure and release claim."""
+        current = self._lock_current_claim(run.id)
+        if current.status != RunStatus.NEEDS_ATTENTION.value:
+            assert_run_transition(
+                current.status, RunStatus.NEEDS_ATTENTION.value,
+            )
+            current.status = RunStatus.NEEDS_ATTENTION.value
+        self.repo._bump(current)
+        self.repo.append_event(current, 'checkpoint_unavailable', {
+            'reason': sanitize_text(note)[:64],
+        })
+        self._clear_claim(current)
+        self.repo._commit()
+        return RESULT_CHECKPOINT_UNAVAILABLE
 
     # ------------------------------------------------------------------
     # 节点 handlers
     # ------------------------------------------------------------------
 
     def _build_handlers(self, run_id):
+        planner_repo = _ClaimFencedPlannerRepository(
+            self.repo, self._lock_current_claim,
+        )
+
         def plan(state):
             self._guard()
             if self.planner is None:
@@ -251,7 +390,7 @@ class AutonomyDriver:
                 'role': self.role,
                 'goal': str(current_run.goal or ''),
                 'loops': int(state.get('loops', 0)),
-                'repo': self.repo,
+                'repo': planner_repo,
             }
             proposed = list(self.planner(context) or [])
             return {
@@ -263,22 +402,33 @@ class AutonomyDriver:
             self._guard()
             from app.core.db.database import t_ai_autonomous_step
 
-            steps = (
-                self.session.query(t_ai_autonomous_step)
-                .filter_by(
-                    run_id=run_id, kind=StepKind.ACTION.value,
-                    status=StepStatus.PROPOSED.value,
+            def proposed_steps():
+                return (
+                    self.session.query(t_ai_autonomous_step)
+                    .filter_by(
+                        run_id=run_id, kind=StepKind.ACTION.value,
+                        status=StepStatus.PROPOSED.value,
+                    )
+                    .order_by(t_ai_autonomous_step.seq.asc())
+                    .all()
                 )
-                .order_by(t_ai_autonomous_step.seq.asc())
-                .all()
-            )
+
+            steps = proposed_steps()
             if not steps:
                 return {
                     'pending_step_id': '',
                     'policy_decision': PolicyDecision.ALLOW.value,
                     'decision': '',
                 }
-            run = self._run_row(run_id)
+            run = self._lock_current_claim(run_id)
+            steps = proposed_steps()
+            if not steps:
+                self.repo._commit()
+                return {
+                    'pending_step_id': '',
+                    'policy_decision': PolicyDecision.ALLOW.value,
+                    'decision': '',
+                }
             if str(run.graph_version or '') != 'v2':
                 for step in steps:
                     assert_step_transition(
@@ -377,6 +527,7 @@ class AutonomyDriver:
                 control_probe=self._execution_control_probe,
                 control_session_factory=self._heartbeat_session_factory,
                 lease_owner=self._identity(),
+                lease_token=self._active_lease_token,
             )
             self._revision_state['revision'] = int(result['revision'])
             if result.get('termination') == 'lease_lost':
@@ -440,7 +591,8 @@ class AutonomyDriver:
                 own_session = True
             try:
                 result = RunLeaseService(session).heartbeat(
-                    run_id, self._identity(), self.lease_ttl,
+                    run_id, self._identity(), self._active_lease_token,
+                    self.lease_ttl,
                 )
                 if result is None:
                     return None
@@ -490,8 +642,11 @@ class AutonomyDriver:
         落库为明确的 Run 状态。
         """
         self._active_run_id = run_id
+        self._active_lease_token = str(claimed.get('lease_token') or '')
         try:
             return self._drive_inner(run_id, claimed)
+        except DriveAbort:
+            return RESULT_LEASE_LOST
         except Exception:
             logger.exception('drive_run unexpected error for %s', run_id)
             # 未知异常：保留现场（不释放租约），让租约过期后由
@@ -528,21 +683,31 @@ class AutonomyDriver:
             return RESULT_FAILED
 
         if self.saver_factory is None:
-            assert_run_transition(
-                run.status, RunStatus.NEEDS_ATTENTION.value,
-            )
-            run.status = RunStatus.NEEDS_ATTENTION.value
-            self.repo._bump(run)
-            self.repo.append_event(run, 'checkpoint_unavailable', {})
-            self.repo._commit()
-            self._release_lease(run_id)
-            return RESULT_CHECKPOINT_UNAVAILABLE
+            return self._checkpoint_unavailable(run, 'saver_not_configured')
 
-        saver, close_saver = self.saver_factory()
         try:
-            return self._drive_graph(run, claimed, saver)
+            saver, close_saver = self.saver_factory()
+        except Exception:
+            logger.exception('checkpoint saver creation failed for %s', run_id)
+            return self._checkpoint_unavailable(run, 'saver_creation_failed')
+        saver = self._fence_checkpoint_saver(run_id, saver)
+        try:
+            try:
+                return self._drive_graph(run, claimed, saver)
+            except Exception as exc:
+                if _is_checkpoint_error(exc):
+                    logger.exception(
+                        'checkpoint saver access failed for %s', run_id,
+                    )
+                    return self._checkpoint_unavailable(
+                        run, 'saver_access_failed',
+                    )
+                raise
         finally:
-            close_saver()
+            try:
+                close_saver()
+            except Exception:
+                logger.exception('checkpoint saver close failed for %s', run_id)
 
     def _drive_graph(self, run, claimed, saver):
         run_id = run.id
@@ -563,15 +728,19 @@ class AutonomyDriver:
         # 落库却没有 checkpoint 即为丢失，只能从 MySQL 边界重建。
         checkpoint_present = snapshot.metadata is not None
         paused = 'approval_pause' in (snapshot.next or ())
-        if paused and checkpoint_present:
+        if (
+            paused
+            and checkpoint_present
+            and run.status != RunStatus.RECOVERING.value
+        ):
             decision = self._pending_decision(run_id, snapshot)
             if decision is None:
                 # 决策未到：继续等人，释放租约保持暂停。
                 self._settle_paused(run)
-                self._release_lease(run_id)
                 return RESULT_PAUSED
             entry = Command(resume=decision)
         else:
+            run = self._lock_current_claim(run_id)
             outcome = self.recovery.resolve(
                 run, checkpoint_present=checkpoint_present,
             )
@@ -580,24 +749,40 @@ class AutonomyDriver:
                 return outcome.result
             if outcome.mode == MODE_PAUSE:
                 # 有待审 Step 但 checkpoint 丢失：继续等人审批。
-                self._release_lease(run_id)
+                self._settle_paused(run)
                 return RESULT_PAUSED
             if outcome.mode == MODE_BOUNDARY:
-                # 从 MySQL 已批准 Step 重建 checkpoint：把游标定位到
-                # policy 之后，再走标准审批恢复路径（approve 由
-                # _pending_decision 从 MySQL 重新推导，绝不信任重建值）。
-                compiled.update_state(
-                    cfg, outcome.entry, as_node='policy',
-                )
+                # 从 MySQL 权威边界重建 checkpoint。Saver wrapper 会用
+                # 独立 session 在 Redis 写期间持有 exact-claim Run 行
+                # 锁；这里不能先用主 session 持同一锁，否则真实
+                # MySQL 会与 wrapper 自锁。
+                try:
+                    compiled.update_state(
+                        cfg, outcome.entry, as_node=outcome.as_node,
+                    )
+                except Exception:
+                    self.session.rollback()
+                    raise
+                # Redis 写后再次同步 fencing；若接管恰好发生在两者
+                # 之间，旧 Worker 立即退出，不解释或执行该游标。
+                self._lock_current_claim(run_id)
+                self.repo._commit()
                 snapshot = compiled.get_state(cfg)
-                decision = self._pending_decision(run_id, snapshot)
-                if decision is None:
-                    self._settle_paused(run)
-                    self._release_lease(run_id)
-                    return RESULT_PAUSED
-                entry = Command(resume=decision)
-            else:
-                # resume/fresh 都从 plan 起点重新入场。
+                if outcome.as_node == 'policy':
+                    decision = self._pending_decision(run_id, snapshot)
+                    if decision is None:
+                        self._settle_paused(run)
+                        return RESULT_PAUSED
+                    entry = Command(resume=decision)
+                else:
+                    # as_node=plan 的下一节点是 policy；沿刚重建的
+                    # checkpoint 继续，绝不再次调用 planner。
+                    entry = None
+            elif outcome.mode == MODE_RESUME:
+                # 健康 checkpoint 的原生续跑输入是 None。重新传初始
+                # dict 会错误回到 plan 并重置循环预算。
+                entry = None
+            elif outcome.mode == MODE_FRESH:
                 entry = {
                     'run_id': run_id,
                     'graph_version': str(run.graph_version or ''),
@@ -605,6 +790,8 @@ class AutonomyDriver:
                     'loops': 0,
                     'proposed_steps': 0,
                 }
+            else:  # pragma: no cover - RecoveryService mode set is closed.
+                raise DriveAbort('unsupported recovery mode')
 
         heartbeater = self._start_heartbeat(run_id, claimed)
         final_state = None
@@ -623,7 +810,6 @@ class AutonomyDriver:
                         # policy 已把 Run 置 waiting_approval；
                         # 释放租约等人审批。
                         self._settle_paused(run)
-                        self._release_lease(run_id)
                         return RESULT_PAUSED
                     resumes += 1
                     if resumes > MAX_RESUMES_PER_DRIVE:
@@ -657,17 +843,19 @@ class AutonomyDriver:
     def _settle_paused(self, run):
         """暂停落定：recovering 接管后重新暂停要回 waiting_approval，
         避免留在 recovering 被恢复扫描反复认领。"""
-        self.session.expire_all()
-        row = self._run_row(run.id)
+        row = self._lock_current_claim(run.id)
         if row is not None and row.status == RunStatus.RECOVERING.value:
             assert_run_transition(
                 row.status, RunStatus.WAITING_APPROVAL.value,
             )
             row.status = RunStatus.WAITING_APPROVAL.value
             self.repo._bump(row)
-            self.repo._commit()
+        self._clear_claim(row)
+        self.repo._commit()
+    # Claim-fenced terminal transitions keep status and lease atomic.
 
     def _confirm_cancel(self, run):
+        run = self._lock_current_claim(run.id)
         assert_run_transition(run.status, RunStatus.CANCELLED.value)
         run.status = RunStatus.CANCELLED.value
         run.completed_at = run.completed_at or _utcnow()
@@ -675,13 +863,12 @@ class AutonomyDriver:
         self.repo.append_event(run, 'run_cancelled', {
             'note': 'confirmed before side effects',
         })
+        self._clear_claim(run)
         self.repo._commit()
-        self._release_lease(run.id)
         return RESULT_CANCELLED
 
     def _finalize(self, run_id, final_state):
-        self.session.expire_all()
-        run = self._run_row(run_id)
+        run = self._lock_current_claim(run_id)
         decision = str(final_state.get('decision') or '')
 
         if run.status == RunStatus.NEEDS_ATTENTION.value:
@@ -713,8 +900,8 @@ class AutonomyDriver:
             self.repo.append_event(run, event, {
                 'decision': decision[:32],
             })
+        self._clear_claim(run)
         self.repo._commit()
-        self._release_lease(run_id)
         return result
 
 
@@ -736,6 +923,19 @@ def _utcnow():
     import datetime
 
     return datetime.datetime.utcnow()
+
+
+def _is_checkpoint_error(exc):
+    """Recognize saver/Redis failures without swallowing graph/domain bugs."""
+    try:
+        from redis.exceptions import RedisError
+    except ImportError:  # pragma: no cover - Redis is a locked dependency.
+        RedisError = ()
+    module = type(exc).__module__.lower()
+    return (
+        isinstance(exc, RedisError)
+        or module.startswith('langgraph.checkpoint.')
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -764,7 +964,18 @@ def make_autonomy_saver_factory():
     def factory():
         from langgraph.checkpoint.redis import ShallowRedisSaver
 
-        manager = ShallowRedisSaver.from_conn_string(url)
+        manager = ShallowRedisSaver.from_conn_string(
+            url,
+            connection_args={
+                'socket_connect_timeout': float(
+                    config.REDIS_CONF['socket_connect_timeout']
+                ),
+                'socket_timeout': float(
+                    config.REDIS_CONF['socket_timeout']
+                ),
+                'retry_on_timeout': False,
+            },
+        )
         saver = manager.__enter__()
         saver.setup()
 

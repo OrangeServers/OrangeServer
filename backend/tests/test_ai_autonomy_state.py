@@ -41,6 +41,7 @@ LEGAL_RUN_TRANSITIONS = [
     ("waiting_approval", "failed"),
     ("waiting_approval", "expired"),
     ("recovering", "running"),
+    ("recovering", "waiting_approval"),
     ("recovering", "needs_attention"),
     ("recovering", "failed"),
     ("recovering", "cancelled"),

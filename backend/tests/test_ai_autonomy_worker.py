@@ -456,6 +456,92 @@ def test_worker_ready_scan_runs_inside_flask_app_context(
     assert captured["inside_context"] is True
 
 
+def test_worker_ready_installs_periodic_recovery_after_publish_failure(
+    worker_env, monkeypatch,
+):
+    """初次 publish 失败后，Celery worker timer 必须持续扫描补投。"""
+    import app.app_factory as app_factory
+    import app.core.db.database as database_mod
+
+    class _Ctx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    class _FakeFlaskApp:
+        def app_context(self):
+            return _Ctx()
+
+    class _FakeDb:
+        session = object()
+
+    class _Timer:
+        def __init__(self):
+            self.callback = None
+            self.interval = None
+
+        def call_repeatedly(self, interval, callback):
+            self.interval = interval
+            self.callback = callback
+
+    class _Sender:
+        timer = _Timer()
+
+    attempts = []
+
+    def flaky_dispatch(session, celery_app=None):
+        attempts.append(session)
+        if len(attempts) == 1:
+            raise OSError("broker publish failed")
+        return []
+
+    monkeypatch.setattr(app_factory, "app", _FakeFlaskApp())
+    monkeypatch.setattr(database_mod, "db", _FakeDb())
+    monkeypatch.setattr(worker, "dispatch_recoverable", flaky_dispatch)
+
+    sender = _Sender()
+    worker._on_worker_ready(sender=sender)
+    assert len(attempts) == 1
+    assert sender.timer.interval == worker.RECOVERY_SCAN_INTERVAL_SECONDS
+    assert callable(sender.timer.callback)
+
+    sender.timer.callback()
+    assert len(attempts) == 2
+
+
+def test_worker_ready_registers_one_timer_per_worker_lifecycle(
+    worker_env, monkeypatch,
+):
+    scans = []
+
+    class _Timer:
+        def __init__(self):
+            self.registrations = []
+
+        def call_repeatedly(self, interval, callback):
+            self.registrations.append((interval, callback))
+
+    class _Sender:
+        def __init__(self):
+            self.timer = _Timer()
+
+    monkeypatch.setattr(
+        worker, "_run_recovery_scan", lambda: scans.append("scan"),
+    )
+    first = _Sender()
+    second = _Sender()
+
+    worker._on_worker_ready(sender=first)
+    worker._on_worker_ready(sender=first)
+    worker._on_worker_ready(sender=second)
+
+    assert scans == ["scan", "scan", "scan"]
+    assert len(first.timer.registrations) == 1
+    assert second.timer.registrations == []
+
+
 # ---------------------------------------------------------------------------
 # 启动扫描投递
 # ---------------------------------------------------------------------------

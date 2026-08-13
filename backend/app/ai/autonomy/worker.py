@@ -29,12 +29,14 @@ from app.core import config
 logger = logging.getLogger('autonomy_worker')
 
 DRIVE_RUN_TASK = 'ogs.autonomy.drive_run'
+RECOVERY_SCAN_INTERVAL_SECONDS = 30
 
 RESULT_CLAIMED = 'claimed'
 RESULT_SKIPPED = 'skipped'
 RESULT_EXECUTOR_UNAVAILABLE = 'executor_unavailable'
 
 _celery_app = None
+_periodic_recovery_app = None
 
 
 class LeaseRetryRequired(Exception):
@@ -105,8 +107,9 @@ def get_celery_app():
 
 def reset_celery_app():
     """测试辅助：丢弃全局单例，迫使按当前配置重建。"""
-    global _celery_app
+    global _celery_app, _periodic_recovery_app
     _celery_app = None
+    _periodic_recovery_app = None
 
 
 def _register_tasks(app):
@@ -197,7 +200,7 @@ def drive_run_once(session, run_id, *, executor=None, worker_id=None,
         logger.info('drive_run skipped: run %s not claimable', run_id)
         return RESULT_SKIPPED
     if executor is None:
-        lease.release_lease(run_id, identity)
+        lease.release_lease(run_id, identity, claimed['lease_token'])
         logger.warning(
             'drive_run released run %s: executor not wired', run_id,
         )
@@ -229,10 +232,26 @@ def dispatch_recoverable(session, celery_app=None):
 
 
 @worker_ready.connect
-def _on_worker_ready(**kwargs):
-    """Celery worker 就绪后补投漏掉/中断的 Run（仅功能启用时）。"""
-    if get_celery_app() is None:
+def _on_worker_ready(sender=None, **kwargs):
+    """就绪后立即补投，并用 Celery 自带 timer 持续扫漏投 Run。"""
+    global _periodic_recovery_app
+    app = get_celery_app()
+    if app is None:
         return
+
+    _run_recovery_scan()
+    timer = getattr(sender, 'timer', None)
+    if timer is not None:
+        if _periodic_recovery_app is app:
+            return
+        timer.call_repeatedly(
+            RECOVERY_SCAN_INTERVAL_SECONDS, _run_recovery_scan,
+        )
+        _periodic_recovery_app = app
+
+
+def _run_recovery_scan():
+    """One fail-safe recovery pass, suitable for Celery's worker timer."""
     from app.app_factory import app as flask_app
     from app.core.db.database import db
 
@@ -240,4 +259,4 @@ def _on_worker_ready(**kwargs):
         with flask_app.app_context():
             dispatch_recoverable(db.session)
     except Exception:
-        logger.exception('autonomy startup scan failed')
+        logger.exception('autonomy recovery scan failed')

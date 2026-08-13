@@ -10,8 +10,10 @@
   仍停在 running 时，Step 落 outcome_unknown、Run 落
   needs_attention，绝不自动重放。
 - Redis checkpoint 丢失时只能从 MySQL 重建：有待审 Step 就继续等
-  人；有已批准 Step 就从 execute 边界恢复；两者皆无（首跑即丢）才
-  允许重新规划。
+  人；有已批准 Step 就从 execute 边界恢复；已落库 proposal 从 policy
+  边界继续；只有 checkpoint 与动作 Step 都不存在时才允许重新规划。
+- 结果已落库但 post-action 游标无法从 MySQL 完整重建时进入
+  needs_attention；绝不猜测完成、重置模型循环或回 plan 重放。
 - 恢复层是驱动循环的预检：先解决 Step 层面的中断残留，再决定图的
   入场方式；所有状态写入都过白名单转换校验。
 """
@@ -37,6 +39,7 @@ MODE_BOUNDARY = 'boundary'  # checkpoint 丢失：从 MySQL 边界重建
 EVENT_WRITE_UNKNOWN = 'recovery_write_outcome_unknown'
 EVENT_READONLY_RETRY = 'recovery_readonly_retry'
 EVENT_BOUNDARY_REBUILD = 'recovery_boundary_rebuild'
+EVENT_CURSOR_UNRESOLVED = 'recovery_cursor_unresolved'
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,7 @@ class RecoveryOutcome:
     mode: str
     result: Optional[str] = None
     entry: Optional[Dict] = None
+    as_node: Optional[str] = None
 
 
 class RecoveryService:
@@ -82,7 +86,7 @@ class RecoveryService:
         return False
 
     def _transition_running(self, run):
-        """把 Run 推到可执行态：执行器只认 queued/running。"""
+        """把 Run 推到可执行态；提交由 resolve 的边界事务统一完成。"""
         if run.status in (
             RunStatus.QUEUED.value, RunStatus.RUNNING.value,
         ):
@@ -90,7 +94,23 @@ class RecoveryService:
         assert_run_transition(run.status, RunStatus.RUNNING.value)
         run.status = RunStatus.RUNNING.value
         self.repo._bump(run)
+
+    def _halt_for_cursor_review(self, run, steps, reason):
+        """Fail closed when MySQL proves work but not a safe graph cursor."""
+        if run.status != RunStatus.NEEDS_ATTENTION.value:
+            assert_run_transition(
+                run.status, RunStatus.NEEDS_ATTENTION.value,
+            )
+            run.status = RunStatus.NEEDS_ATTENTION.value
+        self.repo._bump(run)
+        self.repo.append_event(run, EVENT_CURSOR_UNRESOLVED, {
+            'reason': reason,
+            'step_ids': [step.id for step in steps],
+        })
         self.repo._commit()
+        return RecoveryOutcome(
+            mode=MODE_HALT, result='needs_attention',
+        )
 
     # ------------------------------------------------------------------
     # 预检入口
@@ -103,17 +123,46 @@ class RecoveryService:
         丢失，只能从 MySQL 已确认的安全边界重建。
         """
         steps = self._steps(run.id)
-        has_steps = any(step.kind == 'action' for step in steps)
+        action_steps = [step for step in steps if step.kind == 'action']
+        has_steps = bool(action_steps)
         needs_preflight = (
             run.status == RunStatus.RECOVERING.value
             or (not checkpoint_present and has_steps)
         )
         if not needs_preflight:
+            if not checkpoint_present:
+                # A brand-new Run has neither checkpoint nor durable action
+                # Step.  This is the only legitimate fresh-plan entry.
+                self._transition_running(run)
+                self.repo._commit()
+                return RecoveryOutcome(mode=MODE_FRESH)
+            self.repo._commit()
             return RecoveryOutcome(mode=MODE_RESUME)
 
         # 1) 结果未知的写动作：保持 needs_attention，人工介入。
         if run.status == RunStatus.NEEDS_ATTENTION.value:
+            self.repo._commit()
             return RecoveryOutcome(mode=MODE_HALT, result='needs_attention')
+
+        unknown = [
+            step for step in action_steps
+            if step.status == StepStatus.OUTCOME_UNKNOWN.value
+        ]
+        if unknown:
+            return self._halt_for_cursor_review(
+                run, unknown, 'write_outcome_unknown',
+            )
+
+        if len(action_steps) > 1:
+            # S2 does not persist a plan/DAG cursor that can prove the order
+            # between multiple durable actions after a crash.  This includes
+            # terminal + unresolved mixtures: continuing only the unresolved
+            # action could skip observation of the terminal one, while going
+            # back to plan could replay it.  S3 may replace this fail-closed
+            # boundary once it owns a durable multi-action plan cursor.
+            return self._halt_for_cursor_review(
+                run, action_steps, 'multiple_action_steps_without_plan_cursor',
+            )
 
         # 2) 中断残留：running Step 按写意图分流。
         for step in steps:
@@ -148,8 +197,6 @@ class RecoveryService:
             self.repo.append_event(run, EVENT_READONLY_RETRY, {
                 'step_id': step.id,
             })
-            self.repo._commit()
-            steps = self._steps(run.id)
 
         # 3) 从 MySQL 安全边界重建入场点。
         waiting = [
@@ -157,7 +204,10 @@ class RecoveryService:
             if step.status == StepStatus.WAITING_APPROVAL.value
         ]
         if waiting:
-            # 审批未落定：继续等人，绝不自动越过审批。
+            # 审批未落定：把 checkpoint 明确重建到 policy 之后的
+            # approval_pause。仅修改 MySQL 后暂停会留下较旧的
+            # next=policy 游标；用户批准后旧 policy 看不到 approved
+            # Step，可能跳过执行。
             if run.status in (
                 RunStatus.QUEUED.value, RunStatus.RUNNING.value,
                 RunStatus.RECOVERING.value,
@@ -167,8 +217,24 @@ class RecoveryService:
                 )
                 run.status = RunStatus.WAITING_APPROVAL.value
                 self.repo._bump(run)
-                self.repo._commit()
-            return RecoveryOutcome(mode=MODE_PAUSE)
+            step = waiting[0]
+            self.repo.append_event(run, EVENT_BOUNDARY_REBUILD, {
+                'entry': 'approval_pause', 'step_id': step.id,
+            })
+            self.repo._commit()
+            entry = {
+                'run_id': run.id,
+                'graph_version': str(run.graph_version or ''),
+                'owner': str(run.owner or ''),
+                'phase': 'policy',
+                'loops': 0,
+                'proposed_steps': 0,
+                'pending_step_id': step.id,
+                'policy_decision': 'ask',
+            }
+            return RecoveryOutcome(
+                mode=MODE_BOUNDARY, entry=entry, as_node='policy',
+            )
 
         approved = [
             step for step in steps
@@ -194,8 +260,84 @@ class RecoveryService:
                 'proposed_steps': 0,
                 'pending_step_id': step.id,
             }
-            return RecoveryOutcome(mode=MODE_BOUNDARY, entry=entry)
+            return RecoveryOutcome(
+                mode=MODE_BOUNDARY, entry=entry, as_node='policy',
+            )
 
-        # 首跑即丢（无动作 Step 落库）：允许重新规划。
+        # Planner proposals are durable MySQL facts.  If the Worker died
+        # before LangGraph persisted the plan node, re-enter at policy rather
+        # than calling the model again and duplicating the proposal.
+        proposed = [
+            step for step in steps
+            if step.kind == 'action'
+            and step.status == StepStatus.PROPOSED.value
+        ]
+        if proposed:
+            self._transition_running(run)
+            self.repo.append_event(run, EVENT_BOUNDARY_REBUILD, {
+                'entry': 'policy',
+                'step_ids': [step.id for step in proposed],
+            })
+            self.repo._commit()
+            entry = {
+                'run_id': run.id,
+                'graph_version': str(run.graph_version or ''),
+                'owner': str(run.owner or ''),
+                'phase': 'plan',
+                # One continuing loop must have produced at least one action
+                # Step.  Counting durable actions is conservative when one
+                # planner call proposed several actions and never understates
+                # the recoverable model-loop budget.
+                'loops': len([
+                    step for step in steps if step.kind == 'action'
+                ]),
+                # Recovery executes/policies the already durable proposal as
+                # one bounded closing round.  It must not automatically call
+                # the planner again after that boundary.
+                'proposed_steps': 0,
+            }
+            return RecoveryOutcome(
+                mode=MODE_BOUNDARY, entry=entry, as_node='plan',
+            )
+
+        terminal = [
+            step for step in steps
+            if step.kind == 'action'
+            and step.status in {
+                StepStatus.SUCCEEDED.value,
+                StepStatus.FAILED.value,
+                StepStatus.SKIPPED.value,
+                StepStatus.CANCELLED.value,
+            }
+        ]
+        if terminal:
+            # The action outcome is authoritative, but MySQL does not yet
+            # persist the planner loop/cursor needed to decide whether a
+            # terminal Step should observe, continue, or finish.  Guessing a
+            # post-action cursor could skip planned work; returning to plan
+            # could replay it.  Preserve the outcome and require review.
+            return self._halt_for_cursor_review(
+                run, terminal, 'post_action_cursor_unavailable',
+            )
+
+        if has_steps:
+            # Every known action state is handled above.  Unknown or mixed
+            # future states fail closed instead of silently becoming fresh.
+            return self._halt_for_cursor_review(
+                run,
+                [step for step in steps if step.kind == 'action'],
+                'unsupported_action_recovery_state',
+            )
+
+        if checkpoint_present:
+            # A recovering Run with no durable action still has a usable
+            # native cursor (for example after a zero-action planning node).
+            # Resume it so model-loop accounting is not reset.
+            self._transition_running(run)
+            self.repo._commit()
+            return RecoveryOutcome(mode=MODE_RESUME)
+
+        # 首跑即丢（无 checkpoint 且确实无动作 Step）：允许重新规划。
         self._transition_running(run)
+        self.repo._commit()
         return RecoveryOutcome(mode=MODE_FRESH)

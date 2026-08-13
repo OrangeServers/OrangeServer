@@ -4,8 +4,8 @@
 覆盖 v1 唯一回退承诺的三道防线：
 - 备份路径由 path/run/step 确定性派生（不含时钟）：提案期即可写
   入审批 digest，执行期复算一致，恢复动作无需依赖执行期产物；
-- 补丁命令结构：建备份目录 && 整文件备份 && 写入——备份失败绝不
-  写入；内容上限、控制字符清洗、单引号安全转义；
+- 补丁命令结构：整文件备份、可审 unified diff、原子替换——备份或
+  diff 失败绝不写入；内容上限、控制字符清洗、单引号安全转义；
 - 恢复只接受受管备份目录 + 后缀白名单的备份名；
 - 路径白名单（/etc、/opt）、`..` 逐段拒绝、敏感路径永久拒绝；
 - 策略层：file_patch/file_restore 永不自动。
@@ -59,15 +59,21 @@ def test_patch_command_backs_up_before_writing():
     command = build_file_patch_command(
         "/etc/app.conf", "workers=4\n", backup,
     )
-    # && 串联：备份失败（断链）绝不写入新内容。
-    assert command.count("&&") == 2
-    mkdir, copy, write = command.split("&&")
-    assert "mkdir -p" in mkdir
-    assert "'/etc/app.conf'" in copy and backup in copy
-    assert "cp -p" in copy  # 整文件备份保留权限
-    assert write.strip().startswith("printf %s")
-    assert "'workers=4\n'" in write
-    assert write.rstrip().endswith("> '/etc/app.conf'")
+    # 目标和父目录先 canonical/no-follow 校验并打开 FD；后续备份、
+    # 临时文件和原子替换均锚定 FD，不再按可被换成 symlink 的原路径写。
+    assert "realpath -e" in command
+    assert 'exec 3<"/proc/self/fd/4/$name"' in command
+    assert 'exec 4<"$parent"' in command
+    assert 'readlink -f -- "/proc/self/fd/3"' in command
+    assert 'readlink -f -- "/proc/self/fd/4"' in command
+    assert 'mktemp -- "/proc/self/fd/4/' in command
+    assert 'diff -u --label "$path.before" --label "$path.after"' in command
+    assert command.index("diff -u") < command.index(
+        'mv -fT -- "$target_tmp" "/proc/self/fd/4/$name"'
+    )
+    assert 'mv -fT -- "$target_tmp" "/proc/self/fd/4/$name"' in command
+    assert "'workers=4\n'" in command
+    assert "> '/etc/app.conf'" not in command
 
 
 def test_patch_content_is_bounded_and_cleaned():
@@ -120,7 +126,12 @@ def test_patch_path_is_whitelisted():
 def test_restore_command_copies_managed_backup_back():
     backup = patch_backup_path("/etc/app.conf", RUN_ID, STEP_ID)
     command = build_file_restore_command("/etc/app.conf", backup)
-    assert command == "cp -p -- '%s' '/etc/app.conf'" % backup
+    assert "realpath -e" in command
+    assert 'exec 4<"$parent"' in command
+    assert 'exec 6<"/proc/self/fd/5/$backup_name"' in command
+    assert 'readlink -f -- "/proc/self/fd/6"' in command
+    assert 'mv -fT -- "$target_tmp" "/proc/self/fd/4/$name"' in command
+    assert "cp -p -- '%s' '/etc/app.conf'" % backup not in command
 
 
 def test_restore_rejects_unmanaged_backup_names():

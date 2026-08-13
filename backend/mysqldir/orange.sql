@@ -163,6 +163,7 @@ CREATE TABLE `t_ai_autonomous_run` (
   `latest_event_seq` int NOT NULL DEFAULT 0,
   `cancel_requested` tinyint(1) NOT NULL DEFAULT 0,
   `lease_owner` varchar(64) DEFAULT NULL,
+  `lease_token` varchar(64) DEFAULT NULL,
   `lease_expires_at` datetime DEFAULT NULL,
   `heartbeat_at` datetime DEFAULT NULL,
   `graph_version` varchar(32) NOT NULL DEFAULT 'v1',

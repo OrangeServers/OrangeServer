@@ -80,6 +80,7 @@ def lease_env():
 
     env = {
         "session": session,
+        "repo": repo,
         "lease": RunLeaseService(session),
         "create_queued_run": create_queued_run,
     }
@@ -103,10 +104,15 @@ def test_claim_moves_queued_run_to_running_with_lease(lease_env):
     row = _row(lease_env["session"], run["id"])
     assert row.status == "running"
     assert row.lease_owner == "worker-a"
+    assert row.lease_token == claimed["lease_token"]
+    assert len(claimed["lease_token"]) >= 32
     assert row.lease_expires_at is not None
     assert row.heartbeat_at is not None
     assert claimed["revision"] == int(row.revision)
     assert claimed["revision"] == run["revision"] + 1
+    assert "lease_token" not in lease_env["repo"].get_run(
+        "admin", run["id"],
+    )
 
 
 def test_duplicate_delivery_never_runs_run_in_parallel(lease_env):
@@ -172,6 +178,31 @@ def test_expired_lease_can_be_reclaimed_by_another_worker(lease_env):
     assert row.status == "recovering"
 
 
+def test_expired_lease_reclaim_fences_stale_same_identity(lease_env):
+    """每次 claim 都产生新 token；进程 identity 复用也不能越过接管。"""
+    run = lease_env["create_queued_run"]()
+    now = datetime.datetime.utcnow()
+    first = lease_env["lease"].claim_run(
+        run["id"], "worker-a", TTL, now=now,
+    )
+    late = now + datetime.timedelta(seconds=TTL + 1)
+    second = lease_env["lease"].claim_run(
+        run["id"], "worker-a", TTL, now=late,
+    )
+
+    assert first["lease_token"] != second["lease_token"]
+    assert lease_env["lease"].heartbeat(
+        run["id"], "worker-a", first["lease_token"], TTL,
+        now=late + datetime.timedelta(seconds=1),
+    ) is None
+    assert lease_env["lease"].release_lease(
+        run["id"], "worker-a", first["lease_token"],
+        now=late + datetime.timedelta(seconds=1),
+    ) is None
+    row = _row(lease_env["session"], run["id"])
+    assert row.lease_token == second["lease_token"]
+
+
 def test_expired_waiting_approval_lease_can_be_reclaimed(lease_env):
     """waiting_approval 的租约过期后同样可被接管。"""
     session = lease_env["session"]
@@ -207,7 +238,7 @@ def test_heartbeat_refreshes_lease_without_bumping_business_revision(lease_env):
     run = lease_env["create_queued_run"]()
     claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
     renewed = lease_env["lease"].heartbeat(
-        run["id"], "worker-a", TTL,
+        run["id"], "worker-a", claimed["lease_token"], TTL,
     )
     assert renewed is not None
     assert renewed["revision"] == claimed["revision"]
@@ -222,7 +253,7 @@ def test_heartbeat_survives_unrelated_business_revision_change(lease_env):
     row.cancel_requested = True
     lease_env["session"].commit()
     renewed = lease_env["lease"].heartbeat(
-        run["id"], "worker-a", TTL,
+        run["id"], "worker-a", claimed["lease_token"], TTL,
     )
     assert renewed is not None
     assert renewed["revision"] == claimed["revision"] + 1
@@ -232,22 +263,22 @@ def test_heartbeat_by_non_owner_is_rejected(lease_env):
     run = lease_env["create_queued_run"]()
     claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
     assert lease_env["lease"].heartbeat(
-        run["id"], "worker-b", TTL,
+        run["id"], "worker-b", claimed["lease_token"], TTL,
     ) is None
 
 
 def test_expired_owner_cannot_revive_or_release_lease(lease_env):
     run = lease_env["create_queued_run"]()
     now = datetime.datetime.utcnow()
-    lease_env["lease"].claim_run(
+    claimed = lease_env["lease"].claim_run(
         run["id"], "worker-a", TTL, now=now,
     )
     expired = now + datetime.timedelta(seconds=TTL + 1)
     assert lease_env["lease"].heartbeat(
-        run["id"], "worker-a", TTL, now=expired,
+        run["id"], "worker-a", claimed["lease_token"], TTL, now=expired,
     ) is None
     assert lease_env["lease"].release_lease(
-        run["id"], "worker-a", now=expired,
+        run["id"], "worker-a", claimed["lease_token"], now=expired,
     ) is None
 
 
@@ -255,14 +286,15 @@ def test_release_clears_lease_only_for_current_owner(lease_env):
     run = lease_env["create_queued_run"]()
     claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
     assert lease_env["lease"].release_lease(
-        run["id"], "worker-b",
+        run["id"], "worker-b", claimed["lease_token"],
     ) is None
     released = lease_env["lease"].release_lease(
-        run["id"], "worker-a",
+        run["id"], "worker-a", claimed["lease_token"],
     )
     assert released is not None
     row = _row(lease_env["session"], run["id"])
     assert row.lease_owner is None
+    assert row.lease_token is None
     assert row.lease_expires_at is None
 
 

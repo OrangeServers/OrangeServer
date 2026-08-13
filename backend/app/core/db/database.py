@@ -591,11 +591,13 @@ class t_ai_autonomous_run(db.Model, TimestampMixin):
     cancel_requested = db.Column(
         db.BOOLEAN, nullable=False, default=False, server_default='0',
     )
-    # M1/S2: Worker 租约与心跳。Worker 通过 lease_owner/lease_expires_at
-    #   幂等认领 Run，启动时扫描 queued、请求恢复和租约过期的 Run。
+    # M1/S2: Worker 租约与心跳。Worker 通过 lease_owner/lease_token/
+    #   lease_expires_at 幂等认领 Run；每次认领生成不可复用 token，
+    #   即使 Worker identity 被复用，旧执行者也不能越过接管落结果。
     #   graph_version 固定每个 Run 对应的兼容图版本，升级时按此选图。
     #   同步 DDL: backend/mysqldir/rev54_ai_autonomy_lease.sql
     lease_owner = db.Column(db.String(64), nullable=True)
+    lease_token = db.Column(db.String(64), nullable=True)
     lease_expires_at = db.Column(db.DateTime, nullable=True)
     heartbeat_at = db.Column(db.DateTime, nullable=True)
     graph_version = db.Column(

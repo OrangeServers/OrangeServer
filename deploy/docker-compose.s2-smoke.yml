@@ -24,6 +24,9 @@ x-smoke-environment: &smoke-environment
   OGS_AI_AUTONOMY_REDIS_PORT: 6379
   OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_S2_SMOKE_AUTONOMY_REDIS_PASSWORD:?smoke autonomy Redis password required}
   OGS_AI_AUTONOMY_LEASE_TTL_SECONDS: 30
+  # The target is private to this disposable internal network. Host keys are
+  # generated in its exact smoke image and never trusted outside this stack.
+  OGS_SSH_HOST_KEY_POLICY: auto
 
 services:
   mysql-fresh:
@@ -121,6 +124,49 @@ services:
       timeout: 3s
       retries: 40
 
+  ssh-target:
+    build:
+      context: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/deploy/s2-smoke
+      dockerfile: Dockerfile.ssh-target
+    image: ${OGS_S2_SMOKE_SSH_IMAGE:?exact-checkout SSH smoke image required}
+    pull_policy: never
+    restart: "no"
+    read_only: true
+    networks: [smoke-internal]
+    volumes:
+      - type: bind
+        source: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/.s2-smoke/s2-client-key.pub
+        target: /run/secrets/s2-client-key.pub
+        read_only: true
+    tmpfs:
+      - /run:rw,nosuid,nodev,noexec,size=8m
+      - /tmp:rw,nosuid,nodev,size=16m
+      - /opt/s2-smoke:rw,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0750
+    healthcheck:
+      test: ["CMD-SHELL", "ssh-keyscan -T 2 -p 2222 127.0.0.1 >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  ssh-key-init:
+    image: ${OGS_S2_SMOKE_BACKEND_IMAGE:?exact-checkout smoke image required}
+    pull_policy: never
+    restart: "no"
+    user: root
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        install -m 0600 -o ogs -g ogs
+        /run/secrets/s2-client-key
+        /tmp/orangeserver-s2-smoke/key/s2-client-key
+    networks: [smoke-internal]
+    volumes:
+      - type: bind
+        source: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/.s2-smoke/s2-client-key
+        target: /run/secrets/s2-client-key
+        read_only: true
+      - smoke-ssh-client-key:/tmp/orangeserver-s2-smoke/key
+
   autonomy-worker:
     build:
       context: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/backend
@@ -142,6 +188,13 @@ services:
       mysql-fresh: {condition: service_healthy}
       business-redis: {condition: service_healthy}
       autonomy-redis: {condition: service_healthy}
+      ssh-target: {condition: service_healthy}
+      ssh-key-init: {condition: service_completed_successfully}
+    volumes:
+      - type: volume
+        source: smoke-ssh-client-key
+        target: /tmp/orangeserver-s2-smoke/key
+        read_only: true
     healthcheck:
       test:
         - CMD-SHELL
@@ -176,11 +229,17 @@ services:
         source: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/ops/smoke-ai-autonomy-s2.py
         target: /smoke/smoke-ai-autonomy-s2.py
         read_only: true
+      - type: volume
+        source: smoke-ssh-client-key
+        target: /tmp/orangeserver-s2-smoke/key
+        read_only: true
     depends_on:
       mysql-fresh: {condition: service_healthy}
       mysql-upgrade: {condition: service_healthy}
       business-redis: {condition: service_healthy}
       autonomy-redis: {condition: service_healthy}
+      ssh-target: {condition: service_healthy}
+      ssh-key-init: {condition: service_completed_successfully}
 
 networks:
   smoke-internal:
@@ -190,3 +249,4 @@ volumes:
   smoke-mysql-fresh:
   smoke-mysql-upgrade:
   smoke-autonomy-redis:
+  smoke-ssh-client-key:

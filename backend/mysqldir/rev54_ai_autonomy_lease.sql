@@ -24,6 +24,19 @@ SET @col_exists := (
     SELECT COUNT(*) FROM information_schema.COLUMNS
     WHERE TABLE_SCHEMA = DATABASE()
       AND TABLE_NAME = 't_ai_autonomous_run'
+      AND COLUMN_NAME = 'lease_token'
+);
+SET @sql := IF(@col_exists = 0,
+    'ALTER TABLE `t_ai_autonomous_run` ADD COLUMN `lease_token` VARCHAR(64) DEFAULT NULL AFTER `lease_owner`',
+    'SELECT "lease_token exists" AS info');
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @col_exists := (
+    SELECT COUNT(*) FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 't_ai_autonomous_run'
       AND COLUMN_NAME = 'lease_expires_at'
 );
 SET @sql := IF(@col_exists = 0,

@@ -277,9 +277,28 @@ def test_bounded_file_read_probe_runs_server_template(env):
     )
     assert result["step_status"] == "succeeded"
     call = env["runner"].calls[0]
-    assert call["command"] == "head -n 200 -- /var/log/app.log"
+    assert "realpath -e" in call["command"]
+    assert 'head -n "$lines" <&3' in call["command"]
+    assert "/var/log/app.log" in call["command"]
     types = [e.event_type for e in _events(env, run["id"])]
     assert "write_intent" not in types
+
+
+def test_network_probe_rechecks_authoritative_target_before_runner(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_action_step"](
+        run["id"], "probe", {
+            "probe_id": "verify.port_open",
+            "host": "198.51.100.8",
+            "port": "443",
+        },
+    )
+
+    with pytest.raises(AutonomyValidationError, match="run target"):
+        env["executor"].execute_step(
+            "admin", "admin", run["id"], step_id,
+        )
+    assert env["runner"].calls == []
 
 
 def test_approved_shell_on_permanent_deny_list_never_reaches_runner(env):
@@ -545,6 +564,7 @@ def test_runtime_probe_observes_lease_loss_and_action_tamper(env):
     step_id = env["approve_probe_step"](run["id"])
     run_row = _run_row(env, run["id"])
     run_row.lease_owner = "worker-a"
+    run_row.lease_token = "claim-a"
     run_row.lease_expires_at = datetime.datetime.utcnow() + (
         datetime.timedelta(minutes=1)
     )
@@ -554,12 +574,12 @@ def test_runtime_probe_observes_lease_loss_and_action_tamper(env):
     env["executor"].execute_step(
         "admin", "admin", run["id"], step_id,
         control_session_factory=env["control_session_factory"],
-        lease_owner="worker-a",
+        lease_owner="worker-a", lease_token="claim-a",
     )
     assert lease_runner.probe_result is None
     lease_probe = lease_runner.calls[-1]["kwargs"]["control_probe"]
     run_row = _run_row(env, run["id"])
-    run_row.lease_owner = "worker-b"
+    run_row.lease_token = "claim-b"
     env["session"].commit()
     assert lease_probe() == TERMINATION_LEASE_LOST
 
@@ -747,6 +767,7 @@ def test_outcome_commit_is_fenced_by_current_lease_owner(env):
     step_id = env["add_approved_shell_step"](run["id"])
     run_row = _run_row(env, run["id"])
     run_row.lease_owner = "worker-a"
+    run_row.lease_token = "claim-a"
     run_row.lease_expires_at = datetime.datetime.utcnow() + (
         datetime.timedelta(minutes=5)
     )
@@ -757,6 +778,7 @@ def test_outcome_commit_is_fenced_by_current_lease_owner(env):
         try:
             current = other.get(t_ai_autonomous_run, run["id"])
             current.lease_owner = "worker-b"
+            current.lease_token = "claim-b"
             current.revision += 1
             other.commit()
         finally:
@@ -767,7 +789,7 @@ def test_outcome_commit_is_fenced_by_current_lease_owner(env):
     result = env["executor"].execute_step(
         "admin", "admin", run["id"], step_id,
         control_session_factory=env["control_session_factory"],
-        lease_owner="worker-a",
+        lease_owner="worker-a", lease_token="claim-a",
     )
 
     assert result["termination"] == TERMINATION_LEASE_LOST
@@ -777,6 +799,67 @@ def test_outcome_commit_is_fenced_by_current_lease_owner(env):
     assert "step_execution_started" in event_types
     assert "write_intent" in event_types
     assert "step_executed" not in event_types
+
+
+def test_outcome_commit_is_fenced_by_lease_token_for_same_owner(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_shell_step"](run["id"])
+    run_row = _run_row(env, run["id"])
+    run_row.lease_owner = "worker-a"
+    run_row.lease_token = "claim-a"
+    run_row.lease_expires_at = datetime.datetime.utcnow() + (
+        datetime.timedelta(minutes=5)
+    )
+    env["session"].commit()
+
+    def reclaim_with_same_identity_after_remote_result():
+        other = env["control_session_factory"]()
+        try:
+            current = other.get(t_ai_autonomous_run, run["id"])
+            current.lease_token = "claim-b"
+            current.revision += 1
+            other.commit()
+        finally:
+            other.close()
+
+    env["runner"].on_call = reclaim_with_same_identity_after_remote_result
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+        control_session_factory=env["control_session_factory"],
+        lease_owner="worker-a", lease_token="claim-a",
+    )
+
+    assert result["termination"] == TERMINATION_LEASE_LOST
+    assert _step_row(env, step_id).status == "running"
+    assert _run_row(env, run["id"]).lease_token == "claim-b"
+    event_types = [event.event_type for event in _events(env, run["id"])]
+    assert "step_executed" not in event_types
+
+
+def test_stale_claim_cannot_persist_execution_intent_or_start_runner(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_shell_step"](run["id"])
+    run_row = _run_row(env, run["id"])
+    run_row.lease_owner = "worker-a"
+    run_row.lease_token = "new-claim"
+    run_row.lease_expires_at = datetime.datetime.utcnow() + (
+        datetime.timedelta(minutes=5)
+    )
+    env["session"].commit()
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+        control_session_factory=env["control_session_factory"],
+        lease_owner="worker-a", lease_token="stale-claim",
+    )
+
+    assert result["termination"] == TERMINATION_LEASE_LOST
+    assert env["runner"].calls == []
+    assert _step_row(env, step_id).status == "approved"
+    event_types = [event.event_type for event in _events(env, run["id"])]
+    assert "step_execution_started" not in event_types
+    assert "write_intent" not in event_types
 
 
 def test_unconfirmed_stop_of_read_requires_attention(env):
@@ -928,7 +1011,10 @@ def test_remote_output_is_redacted_encrypted_artifact_not_step_note(
     assert "synthetic-token" not in stored
     assert "[REDACTED]" in stored
     assert "load 0.1" in stored
-    assert all(artifact.content_ciphertext.startswith("enc:") for artifact in artifacts)
+    assert all(
+        artifact.content_ciphertext.startswith("enc:")
+        for artifact in artifacts
+    )
 
 
 def test_execution_start_event_is_durable_before_runner_call(env):
@@ -975,6 +1061,14 @@ def test_file_patch_success_writes_intent_and_backup_artifact(
         "path": "/etc/app.conf",
         "content": "workers=4\n",
     })
+    env["runner"].result = RunnerResult(
+        exit_code=0,
+        output=(
+            "--- /etc/app.conf.before\n"
+            "+++ /etc/app.conf.after\n"
+            "@@ -1 +1 @@\n-workers=2\n+workers=4\n"
+        ),
+    )
 
     result = env["executor"].execute_step(
         "admin", "admin", run["id"], step_id,
@@ -993,18 +1087,24 @@ def test_file_patch_success_writes_intent_and_backup_artifact(
     types = [e.event_type for e in _events(env, run["id"])]
     assert types.index("write_intent") < types.index("step_executed")
 
-    # 备份引用落 artifact：确定性路径，执行期复算一致。
+    # 可审 unified diff 与备份引用都落加密 artifact；备份路径确定性
+    # 派生，执行期复算一致。
     artifacts = env["session"].query(t_ai_autonomous_artifact).filter_by(
         run_id=run["id"],
     ).all()
-    assert len(artifacts) == 1
-    artifact = artifacts[0]
-    assert artifact.kind == "backup_ref"
-    assert artifact.step_id == step_id
+    assert {artifact.kind for artifact in artifacts} == {
+        "backup_ref", "patch_diff",
+    }
+    by_kind = {artifact.kind: artifact for artifact in artifacts}
+    artifact = by_kind["backup_ref"]
+    assert all(item.step_id == step_id for item in artifacts)
     expected = patch_backup_path("/etc/app.conf", run["id"], step_id)
     assert artifact.content_ciphertext == "enc:%s" % expected
     assert re.search(r"\.ogs-bak-[0-9a-f]{12}$", expected)
     assert "/etc/.ogs-autonomy-backup/app.conf.ogs-bak-" in expected
+    assert by_kind["patch_diff"].content_ciphertext.startswith(
+        "enc:--- /etc/app.conf.before\n+++ /etc/app.conf.after"
+    )
 
 
 def test_file_patch_uncertain_outcome_creates_no_artifact(
@@ -1033,9 +1133,75 @@ def test_file_patch_uncertain_outcome_creates_no_artifact(
     assert artifacts == 0
 
 
-def test_file_restore_executes_managed_backup_only(env):
+def test_file_patch_cannot_report_success_without_full_backup_reference(
+    env, monkeypatch,
+):
+    _stub_basesec(monkeypatch)
+    run = env["create_queued_run"](budget_payload={
+        "step_output_bytes": 4,
+        "run_artifact_bytes": 4,
+    })
+    step_id = env["add_approved_action_step"](run["id"], "file_patch", {
+        "path": "/etc/app.conf",
+        "content": "workers=4\n",
+    })
+    env["runner"].result = RunnerResult(
+        exit_code=0,
+        output="--- before\n+++ after\n-old\n+new\n",
+    )
+
+    with pytest.raises(AutonomyConflict, match="artifact capacity"):
+        env["executor"].execute_step(
+            "admin", "admin", run["id"], step_id,
+        )
+
+    # write_intent remains the authoritative safe boundary; no success or
+    # truncated backup reference may be committed.
+    env["session"].expire_all()
+    assert _step_row(env, step_id).status == "running"
+    assert "write_intent" in [e.event_type for e in _events(env, run["id"])]
+    assert "step_executed" not in [
+        e.event_type for e in _events(env, run["id"])
+    ]
+    assert env["session"].query(t_ai_autonomous_artifact).filter_by(
+        run_id=run["id"],
+    ).count() == 0
+
+
+def test_file_patch_persists_empty_diff_as_explicit_artifact(env, monkeypatch):
+    _stub_basesec(monkeypatch)
     run = env["create_queued_run"]()
-    backup = patch_backup_path("/etc/app.conf", run["id"], "a" * 32)
+    step_id = env["add_approved_action_step"](run["id"], "file_patch", {
+        "path": "/etc/app.conf",
+        "content": "unchanged=true\n",
+    })
+    env["runner"].result = RunnerResult(exit_code=0, output="")
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+
+    assert result["step_status"] == "succeeded"
+    artifacts = env["session"].query(t_ai_autonomous_artifact).filter_by(
+        run_id=run["id"], step_id=step_id,
+    ).all()
+    by_kind = {artifact.kind: artifact for artifact in artifacts}
+    assert set(by_kind) == {"backup_ref", "patch_diff"}
+    assert by_kind["patch_diff"].content_ciphertext == "enc:[EMPTY ARTIFACT]"
+    assert by_kind["patch_diff"].size_bytes == 0
+    assert by_kind["patch_diff"].truncated is False
+
+
+def test_file_restore_executes_managed_backup_only(env, monkeypatch):
+    _stub_basesec(monkeypatch)
+    run = env["create_queued_run"]()
+    patch_step_id = env["add_approved_action_step"](
+        run["id"], "file_patch", {
+            "path": "/etc/app.conf", "content": "workers=4\n",
+        },
+    )
+    env["executor"].execute_step("admin", "admin", run["id"], patch_step_id)
+    backup = patch_backup_path("/etc/app.conf", run["id"], patch_step_id)
     step_id = env["add_approved_action_step"](run["id"], "file_restore", {
         "path": "/etc/app.conf",
         "backup_path": backup,
@@ -1045,9 +1211,10 @@ def test_file_restore_executes_managed_backup_only(env):
         "admin", "admin", run["id"], step_id,
     )
     assert result["step_status"] == "succeeded"
-    command = env["runner"].calls[0]["command"]
-    assert command.startswith("cp -p -- ")
-    assert backup in command
+    command = env["runner"].calls[1]["command"]
+    assert "realpath -e" in command
+    assert backup.rsplit("/", 1)[0] in command
+    assert backup.rsplit("/", 1)[1] in command
 
     # 受管目录之外的“备份”在构造层拒绝，不产生任何远程副作用。
     rogue_id = env["add_approved_action_step"](run["id"], "file_restore", {
@@ -1058,5 +1225,24 @@ def test_file_restore_executes_managed_backup_only(env):
         env["executor"].execute_step(
             "admin", "admin", run["id"], rogue_id,
         )
-    assert len(env["runner"].calls) == 1
+    assert len(env["runner"].calls) == 2
     assert _step_row(env, rogue_id).status == "approved"
+
+
+def test_file_restore_rejects_unowned_or_cross_run_backup(env):
+    run = env["create_queued_run"]()
+    unrelated_step_id = "a" * 32
+    backup = patch_backup_path(
+        "/etc/app.conf", run["id"], unrelated_step_id,
+    )
+    restore_step = env["add_approved_action_step"](
+        run["id"], "file_restore", {
+            "path": "/etc/app.conf", "backup_path": backup,
+        },
+    )
+
+    with pytest.raises(AutonomyValidationError, match="successful file patch"):
+        env["executor"].execute_step(
+            "admin", "admin", run["id"], restore_step,
+        )
+    assert env["runner"].calls == []

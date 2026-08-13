@@ -373,12 +373,12 @@ def test_rev54_autonomy_migration_matches_baseline_and_orm():
         r"ADD COLUMN `(\w+)`", rev54,
     ))
     assert added == {
-        "lease_owner", "lease_expires_at", "heartbeat_at", "graph_version",
-        "active_host_id",
+        "lease_owner", "lease_token", "lease_expires_at", "heartbeat_at",
+        "graph_version", "active_host_id",
     }, added
     # 每个 ALTER 都有幂等守卫，脚本可重复执行。
-    assert rev54.count("information_schema.COLUMNS") == 5
-    assert rev54.count("PREPARE stmt FROM @sql;") == 7
+    assert rev54.count("information_schema.COLUMNS") == 6
+    assert rev54.count("PREPARE stmt FROM @sql;") == 8
 
     rev53_columns = create_columns(rev53, "t_ai_autonomous_run")
     baseline_columns = create_columns(schema, "t_ai_autonomous_run")
@@ -394,6 +394,7 @@ def test_rev54_autonomy_migration_matches_baseline_and_orm():
     )
     assert run_ddl, "orange.sql must define t_ai_autonomous_run"
     assert "`lease_owner` varchar(64) DEFAULT NULL" in run_ddl.group(1)
+    assert "`lease_token` varchar(64) DEFAULT NULL" in run_ddl.group(1)
     assert "`lease_expires_at` datetime DEFAULT NULL" in run_ddl.group(1)
     assert "`heartbeat_at` datetime DEFAULT NULL" in run_ddl.group(1)
     assert (

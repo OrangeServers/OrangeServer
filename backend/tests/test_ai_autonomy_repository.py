@@ -495,6 +495,14 @@ def test_cancel_queued_run_is_atomic_terminal_and_releases_host(repo_env):
     repo_env["platform_state"]["credential_ok"] = False
     platform_calls = len(repo_env["platform_state"]["calls"])
 
+    row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    row.lease_owner = "stale-worker"
+    row.lease_token = "stale-claim"
+    row.lease_expires_at = datetime.datetime.utcnow() + (
+        datetime.timedelta(minutes=2)
+    )
+    repo_env["session"].commit()
+
     requested = repo.request_cancel("admin", "admin", run["id"])
     repeated = repo.request_cancel("admin", "admin", run["id"])
 
@@ -506,6 +514,7 @@ def test_cancel_queued_run_is_atomic_terminal_and_releases_host(repo_env):
     assert row.completed_at is not None
     assert row.active_host_id is None
     assert row.lease_owner is None
+    assert row.lease_token is None
     assert row.lease_expires_at is None
     assert len(repo_env["platform_state"]["calls"]) == platform_calls
     events = repo_env["session"].query(t_ai_autonomous_event).filter_by(
@@ -547,6 +556,7 @@ def test_cancel_running_run_stays_request_only(repo_env):
     row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
     row.status = "running"
     row.lease_owner = "worker-a"
+    row.lease_token = "claim-a"
     row.lease_expires_at = (
         row.updated_at + datetime.timedelta(minutes=2)
     )
@@ -561,6 +571,7 @@ def test_cancel_running_run_stays_request_only(repo_env):
     repo_env["session"].expire_all()
     row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
     assert row.lease_owner == "worker-a"
+    assert row.lease_token == "claim-a"
     assert row.lease_expires_at is not None
 
 
@@ -618,6 +629,23 @@ def test_propose_probe_rejects_unknown_or_injected_parameters(repo_env):
         repo.propose_probe(
             "admin", "admin", run["id"], "system.load",
             params={"command": "rm -rf /"},
+        )
+
+
+def test_propose_network_probe_is_bound_to_authoritative_run_host(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+
+    accepted = repo.propose_probe(
+        "admin", "admin", run["id"], "verify.port_open",
+        params={"host": "203.0.113.10", "port": "443"},
+    )
+    assert accepted["status"] == "proposed"
+
+    with pytest.raises(AutonomyValidationError, match="run target"):
+        repo.propose_probe(
+            "admin", "admin", run["id"], "verify.http_status",
+            params={"url": "http://198.51.100.8/metadata"},
         )
 
 
@@ -742,7 +770,9 @@ def test_allowed_operations_is_server_authoritative(waiting_env):
     assert snapshot["allowed_operations"] == ["approve", "reject"]
 
 
-def test_decision_input_is_exactly_operation_and_expected_revision(waiting_env):
+def test_decision_input_is_exactly_operation_and_expected_revision(
+    waiting_env,
+):
     repo = waiting_env["repo"]
     step = repo.decide(
         "admin", "admin", waiting_env["run_id"], waiting_env["step_id"],
@@ -1033,6 +1063,35 @@ def test_create_artifact_enforces_run_total_and_audits_exhaustion(
     assert second["truncated"] is True
     assert exhausted["size_bytes"] == 0
     assert exhausted["truncated"] is True
+
+
+def test_required_artifact_fails_instead_of_storing_a_truncated_reference(
+    repo_env, monkeypatch,
+):
+    import app.tools.basesec as basesec
+
+    monkeypatch.setattr(
+        basesec, "encrypt_secret", lambda text: "enc:%s" % text,
+    )
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"](
+        budget_payload={
+            "step_output_bytes": 4,
+            "run_artifact_bytes": 4,
+        },
+    )
+
+    with pytest.raises(AutonomyConflict, match="artifact capacity"):
+        repo.create_artifact(
+            "admin", run["id"],
+            kind="backup_ref", title="required",
+            content="/etc/.ogs-autonomy-backup/app.conf.ogs-bak-0123456789ab",
+            require_full_content=True,
+        )
+
+    assert repo_env["session"].query(t_ai_autonomous_artifact).filter_by(
+        run_id=run["id"],
+    ).count() == 0
 
 
 def test_event_payload_is_sanitized_of_credentials(repo_env):

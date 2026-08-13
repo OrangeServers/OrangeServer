@@ -16,10 +16,10 @@
 - 取消是请求：cancel_requested 后执行器拒绝开跑新 Step。
 """
 import datetime
+import hmac
 import json
 import logging
 import time
-import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 from app.ai.autonomy.actions import (
@@ -40,7 +40,6 @@ from app.ai.autonomy.policy import (
 )
 from app.ai.autonomy.repository import (
     AutonomyConflict,
-    AutonomyPermissionError,
     AutonomyRepository,
     AutonomyValidationError,
 )
@@ -179,7 +178,8 @@ def default_runner(
         )
     except Exception:
         # The authoritative Run/Step Events are committed separately. Preserve
-        # execution semantics if the legacy auxiliary audit sink is unavailable.
+        # execution semantics if the legacy auxiliary audit sink is
+        # unavailable.
         logger.exception('AI autonomy command audit failed')
     return result
 
@@ -223,7 +223,9 @@ class AutonomyExecutor:
             raise AutonomyConflict('action digest mismatch')
         return action
 
-    def _build_command(self, action, run_id: str) -> str:
+    def _build_command(
+        self, action, run_id: str, *, target_host: str = '',
+    ) -> str:
         kind = str(action.kind)
         if kind == 'probe':
             probe_id = str(action.parameters.get('probe_id') or '')
@@ -231,7 +233,12 @@ class AutonomyExecutor:
                 key: value for key, value in action.parameters.items()
                 if key != 'probe_id'
             }
-            return build_probe_command(probe_id, params)
+            try:
+                return build_probe_command(
+                    probe_id, params, target_host=target_host,
+                )
+            except ActionValidationError as exc:
+                raise AutonomyValidationError(str(exc)) from exc
         if kind == 'shell':
             command = str(action.parameters.get('command') or '')
             if not command.strip():
@@ -269,6 +276,38 @@ class AutonomyExecutor:
             'executor does not support action kind %r yet' % (kind,)
         )
 
+    def _validate_restore_source(self, action, run_id: str) -> None:
+        """Require a restore to name this Run's successful patch backup."""
+        from app.core.db.database import t_ai_autonomous_step
+
+        path = str(action.parameters.get('path') or '')
+        requested = str(action.parameters.get('backup_path') or '')
+        candidates = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id,
+            kind=StepKind.ACTION.value,
+            status=StepStatus.SUCCEEDED.value,
+        ).all()
+        for source in candidates:
+            try:
+                source_action = self._load_action(source)
+            except AutonomyConflict:
+                continue
+            if (
+                str(source_action.kind) != 'file_patch'
+                or str(source_action.step_id) != str(source.id)
+                or int(source_action.target_id) != int(action.target_id)
+                or int(source_action.system_user_id)
+                != int(action.system_user_id)
+                or str(source_action.parameters.get('path') or '') != path
+            ):
+                continue
+            expected = patch_backup_path(path, run_id, str(source.id))
+            if hmac.compare_digest(requested, expected):
+                return
+        raise AutonomyValidationError(
+            'restore backup is not owned by a successful file patch'
+        )
+
     def _runtime_control_probe(
         self, owner: str, role: str, run_id: str,
         *, action, action_digest: str,
@@ -277,6 +316,7 @@ class AutonomyExecutor:
         host_environment: str,
         control_session_factory=None,
         lease_owner: Optional[str] = None,
+        lease_token: Optional[str] = None,
         external_probe=None,
     ):
         """Compose worker control with short-lived authoritative DB checks."""
@@ -322,9 +362,12 @@ class AutonomyExecutor:
                 if (
                     lease_owner is not None
                     and (
-                        str(current.lease_owner or '') != str(lease_owner)
+                        not lease_token
+                        or str(current.lease_owner or '') != str(lease_owner)
+                        or str(current.lease_token or '') != str(lease_token)
                         or current.lease_expires_at is None
-                        or current.lease_expires_at < datetime.datetime.utcnow()
+                        or current.lease_expires_at
+                        < datetime.datetime.utcnow()
                     )
                 ):
                     return TERMINATION_LEASE_LOST
@@ -354,7 +397,8 @@ class AutonomyExecutor:
                         action, action_digest, self.repo.secret_key,
                     )
                     or int(current.host_id) != int(action.target_id)
-                    or int(current.system_user_id) != int(action.system_user_id)
+                    or int(current.system_user_id)
+                    != int(action.system_user_id)
                     or host is None
                     or credential is None
                     or str(host.host_ip) != host_address
@@ -381,12 +425,14 @@ class AutonomyExecutor:
     def _reload_execution_rows(
         self, owner: str, run_id: str, step_id: str,
         *, lease_owner: Optional[str] = None,
+        lease_token: Optional[str] = None,
     ):
-        """Lock and fence fresh authority rows before outcome persistence.
+        """Lock and fence fresh authority rows before execution persistence.
 
-        Locking the Run row serializes this final check with a competing
-        expired-lease claim.  Once the lease is verified under the lock, the
-        outcome transaction commits before a new owner can take over.
+        Locking the Run row serializes intent and outcome commits with a
+        competing expired-lease claim.  Once the lease is verified under the
+        lock, the current transaction commits before a new owner can take
+        over.
         """
         from app.core.db.database import (
             t_ai_autonomous_run, t_ai_autonomous_step,
@@ -400,7 +446,9 @@ class AutonomyExecutor:
             id=step_id, run_id=run_id,
         ).with_for_update().one()
         if lease_owner is not None and (
-            str(run.lease_owner or '') != str(lease_owner)
+            not lease_token
+            or str(run.lease_owner or '') != str(lease_owner)
+            or str(run.lease_token or '') != str(lease_token)
             or run.lease_expires_at is None
             or run.lease_expires_at < datetime.datetime.utcnow()
         ):
@@ -426,6 +474,7 @@ class AutonomyExecutor:
 
     def _stage_remote_output_artifacts(
         self, owner: str, run_id: str, step_id: str, result: RunnerResult,
+        *, action_kind: str = '',
     ) -> Dict[str, str]:
         """Redact and encrypt untrusted SSH streams in the outcome txn."""
         artifacts = {}
@@ -434,12 +483,23 @@ class AutonomyExecutor:
             ('stderr', result.stderr, bool(result.stderr_truncated)),
         )
         for stream, content, truncated in streams:
-            if not content and not truncated:
+            required_empty_diff = (
+                stream == 'stdout'
+                and action_kind == 'file_patch'
+                and result.exit_code == 0
+                and not result.uncertain
+            )
+            if not content and not truncated and not required_empty_diff:
                 continue
+            kind = 'step_%s' % stream
+            title = 'remote %s for step %s' % (stream, step_id[:32])
+            if stream == 'stdout' and action_kind == 'file_patch':
+                kind = 'patch_diff'
+                title = 'file patch diff for step %s' % step_id[:32]
             artifact = self.repo.create_artifact(
                 owner, run_id,
-                kind='step_%s' % stream,
-                title='remote %s for step %s' % (stream, step_id[:32]),
+                kind=kind,
+                title=title,
                 content=sanitize_evidence(content),
                 step_id=step_id,
                 force_truncated=truncated,
@@ -470,10 +530,20 @@ class AutonomyExecutor:
         control_probe=None,
         control_session_factory=None,
         lease_owner: Optional[str] = None,
+        lease_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         """执行已审批的 Step；任何前置复核失败都不产生副作用。"""
-        run = self.repo._get_run_row(owner, run_id)
-        step = self._get_step_row(run_id, step_id)
+        if lease_owner is not None:
+            try:
+                run, step = self._reload_execution_rows(
+                    owner, run_id, step_id,
+                    lease_owner=lease_owner, lease_token=lease_token,
+                )
+            except _ExecutionLeaseLost:
+                return self._lease_lost_response(owner, run_id, step_id)
+        else:
+            run = self.repo._get_run_row(owner, run_id)
+            step = self._get_step_row(run_id, step_id)
 
         if bool(run.cancel_requested):
             raise AutonomyConflict('run cancellation was requested')
@@ -505,7 +575,13 @@ class AutonomyExecutor:
         if executed >= budget.max_actions:
             raise AutonomyConflict('action budget exhausted')
 
-        command = self._build_command(action, run_id)
+        if str(action.kind) == 'file_restore':
+            self._validate_restore_source(action, run_id)
+        host = self.repo._get_host_row(run.host_id)
+        host_address = str(host.host_ip)
+        command = self._build_command(
+            action, run_id, target_host=host_address,
+        )
         try:
             validate_working_directory(str(action.working_directory or ''))
         except ValueError as exc:
@@ -525,8 +601,6 @@ class AutonomyExecutor:
                 raise AutonomyConflict('run duration budget exhausted')
             timeout = min(timeout, remaining_timeout)
         is_write = action.kind in WRITE_KINDS
-        host = self.repo._get_host_row(run.host_id)
-        host_address = str(host.host_ip)
         host_port = int(host.host_port)
         host_alias = str(host.alias or run.host_alias or '')
         host_environment = str(host.ai_environment or '')
@@ -572,6 +646,7 @@ class AutonomyExecutor:
                 host_environment=host_environment,
                 control_session_factory=control_session_factory,
                 lease_owner=lease_owner,
+                lease_token=lease_token,
                 external_probe=control_probe,
             ),
             audit_name=owner,
@@ -590,12 +665,38 @@ class AutonomyExecutor:
         try:
             run, step = self._reload_execution_rows(
                 owner, run_id, step_id, lease_owner=lease_owner,
+                lease_token=lease_token,
             )
         except _ExecutionLeaseLost:
             return self._lease_lost_response(owner, run_id, step_id)
 
+        # A successful file patch cannot be reported as succeeded unless the
+        # complete deterministic rollback reference can be committed in the
+        # same outcome transaction.  Stage this tiny required artifact before
+        # the bounded diff so output cannot consume its remaining budget.
+        if (
+            str(action.kind) == 'file_patch'
+            and result.exit_code == 0
+            and not result.uncertain
+        ):
+            backup = patch_backup_path(
+                str(action.parameters.get('path') or ''),
+                run_id,
+                str(action.step_id),
+            )
+            self.repo.create_artifact(
+                owner, run_id,
+                kind='backup_ref',
+                title='file_patch backup for %s'
+                % str(action.parameters.get('path') or '')[:96],
+                content=backup,
+                step_id=step_id,
+                require_full_content=True,
+                commit=False,
+            )
         output_artifacts = self._stage_remote_output_artifacts(
             owner, run_id, step_id, result,
+            action_kind=str(action.kind),
         )
         if result.control_reason == TERMINATION_AUTHORIZATION_REVOKED:
             if is_write and result.started is not False:
@@ -690,26 +791,6 @@ class AutonomyExecutor:
             run, step, action, result, is_write,
             output_artifacts=output_artifacts,
         )
-        # 文件补丁成功后把受管备份引用落 artifact（v1 回退承诺的
-        # 可追溯凭据）；备份路径由 path/run/step 确定性派生，执行
-        # 期复算一致，无需解析远端输出。
-        if (
-            str(action.kind) == 'file_patch'
-            and step.status == StepStatus.SUCCEEDED.value
-        ):
-            backup = patch_backup_path(
-                str(action.parameters.get('path') or ''),
-                run_id,
-                str(action.step_id),
-            )
-            self.repo.create_artifact(
-                owner, run_id,
-                kind='backup_ref',
-                title='file_patch backup for %s'
-                % str(action.parameters.get('path') or '')[:96],
-                content=backup,
-                step_id=step_id,
-            )
         return {
             'step_id': step_id,
             'step_status': step.status,
