@@ -7,6 +7,7 @@ MemorySaver 验证暂停/恢复语义（真实 Redis 8 上的 ShallowRedisSaver
 """
 import datetime
 import json
+import threading
 
 import pytest
 from cryptography.fernet import Fernet
@@ -94,6 +95,34 @@ def test_checkpoint_saver_uses_bounded_socket_timeouts(monkeypatch):
     assert observed["setup"] is True
     close()
     assert observed["closed"] is True
+
+
+def test_heartbeat_session_factory_works_in_background_thread():
+    """Celery creates the factory in-app, then heartbeat calls it out-of-app."""
+    from app.app_factory import app
+
+    with app.app_context():
+        factory = drive_mod.make_autonomy_heartbeat_session_factory()
+
+    observed = {}
+
+    def open_session():
+        try:
+            observed["session"] = factory()
+        except Exception as exc:  # pragma: no branch - regression signal
+            observed["error"] = exc
+
+    thread = threading.Thread(target=open_session)
+    thread.start()
+    thread.join(timeout=2)
+
+    assert thread.is_alive() is False
+    assert "error" not in observed
+    session = observed["session"]
+    try:
+        assert session.get_bind() is not None
+    finally:
+        session.close()
 
 
 def test_checkpoint_writes_require_the_exact_current_claim(env):

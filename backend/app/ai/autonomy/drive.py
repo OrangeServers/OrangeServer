@@ -989,11 +989,13 @@ def make_autonomy_saver_factory():
 
 def make_autonomy_heartbeat_session_factory():
     """心跳线程的独立 session 工厂（不与驱动主 session 跨线程共享）。"""
+    from sqlalchemy.orm import Session
+
+    from app.core.db.database import db
+
+    engine = db.engine
+
     def factory():
-        from sqlalchemy.orm import Session
-
-        from app.core.db.database import db
-
-        return Session(bind=db.engine)
+        return Session(bind=engine)
 
     return factory
