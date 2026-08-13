@@ -141,6 +141,9 @@ STEP_TRANSITIONS = {
     StepStatus.WAITING_APPROVAL: {
         StepStatus.APPROVED, StepStatus.FAILED,
         StepStatus.SKIPPED, StepStatus.CANCELLED,
+        # Guardian 复核中的计划：唯一允许进入 running 的路径，复核
+        # 结果只会落 approved/failed 或回退 waiting，绝不自动放行。
+        StepStatus.RUNNING,
     },
     StepStatus.APPROVED: {
         StepStatus.RUNNING, StepStatus.FAILED, StepStatus.CANCELLED,
@@ -151,6 +154,9 @@ STEP_TRANSITIONS = {
         # 只读动作执行中被强杀：恢复层把它回退到 approved 自动重试
         # （人工审批仍然有效）；是否允许由恢复层按写意图判定。
         StepStatus.APPROVED,
+        # 计划被 Guardian 复核中进程崩溃：唯一允许回 waiting 的路径，
+        # 回退后由人工决策，绝不自动放行。
+        StepStatus.WAITING_APPROVAL,
     },
     # 写动作结果未知：绝不自动重放，只能由人工决策落到终态。
     StepStatus.OUTCOME_UNKNOWN: {StepStatus.SUCCEEDED, StepStatus.FAILED},

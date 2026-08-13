@@ -156,6 +156,7 @@ CREATE TABLE `t_ai_autonomous_run` (
   `system_user_id` int NOT NULL,
   `system_user_alias` varchar(24) NOT NULL,
   `mode` varchar(16) NOT NULL,
+  `custom_profile_json` text DEFAULT NULL,
   `status` varchar(20) NOT NULL,
   `outcome` varchar(16) DEFAULT NULL,
   `revision` int NOT NULL DEFAULT 0,

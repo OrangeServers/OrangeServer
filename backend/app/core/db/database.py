@@ -583,6 +583,10 @@ class t_ai_autonomous_run(db.Model, TimestampMixin):
     system_user_id = db.Column(db.INTEGER, nullable=False)
     system_user_alias = db.Column(db.String(24), nullable=False)
     mode = db.Column(db.String(16), nullable=False)
+    # M1/S3: custom 权限档案（仅 mode='custom' 时非空）。服务端固定
+    #   动作类别集合 + Run 已绑定的单一主机；不引入策略表达式语言。
+    #   同步 DDL: backend/mysqldir/rev55_ai_autonomy_custom_profile.sql
+    custom_profile_json = db.Column(db.Text, nullable=True)
     status = db.Column(db.String(20), nullable=False, index=True)
     outcome = db.Column(db.String(16), nullable=True)
     revision = db.Column(db.INTEGER, nullable=False, default=0)

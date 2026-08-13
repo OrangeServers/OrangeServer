@@ -35,6 +35,10 @@ from app.ai.autonomy.actions import (
 )
 from app.ai.autonomy.executor import AutonomyExecutor
 from app.ai.autonomy.graph import AutonomyGraphError, build_graph
+from app.ai.autonomy.guardian import (
+    GUARDIAN_APPROVE,
+    GUARDIAN_REJECT,
+)
 from app.ai.autonomy.lease import RunLeaseService
 from app.ai.autonomy.planner import (
     PlannerProposalError,
@@ -57,11 +61,13 @@ from app.ai.autonomy.recovery import (
 )
 from app.ai.autonomy.repository import redacted_summary, sanitize_text
 from app.ai.autonomy.state import (
+    RunMode,
     RunStatus,
     StepKind,
     StepStatus,
     assert_run_transition,
     assert_step_transition,
+    normalize_run_mode,
 )
 from app.core import config
 
@@ -207,6 +213,7 @@ class AutonomyDriver:
     def __init__(
         self, session, secret_key, *,
         planner=None,
+        guardian=None,
         runner=None,
         platform_factory=None,
         saver_factory=None,
@@ -219,6 +226,7 @@ class AutonomyDriver:
         self.session = session
         self.role = role
         self.planner = planner
+        self.guardian = guardian
         self.saver_factory = saver_factory
         self.executor = AutonomyExecutor(
             session, secret_key, runner=runner,
@@ -623,7 +631,12 @@ class AutonomyDriver:
     # ------------------------------------------------------------------
 
     def _policy_plan_pending(self, run_id):
-        """无待批动作时查未决计划：waiting→ask 暂停，approved→直接执行。"""
+        """无待批动作时查未决计划：waiting→ask 暂停，approved→直接执行。
+
+        ai_review 档案且接线了 Guardian 时，waiting 计划先交给独立
+        复核（每个计划边界至多一次）；其余情况照常人工审批。运行中
+        计划：复核中断的回退人工，其余按 S2 契约重入展开执行。
+        """
         from app.core.db.database import t_ai_autonomous_step
 
         plan_step = (
@@ -633,6 +646,7 @@ class AutonomyDriver:
                 t_ai_autonomous_step.status.in_([
                     StepStatus.WAITING_APPROVAL.value,
                     StepStatus.APPROVED.value,
+                    StepStatus.RUNNING.value,
                 ]),
             )
             .order_by(t_ai_autonomous_step.seq.desc())
@@ -644,14 +658,216 @@ class AutonomyDriver:
                 'policy_decision': PolicyDecision.ALLOW.value,
                 'decision': '',
             }
-        decision = (
-            PolicyDecision.ASK.value
-            if plan_step.status == StepStatus.WAITING_APPROVAL.value
-            else PolicyDecision.ALLOW.value
-        )
+        if plan_step.status == StepStatus.RUNNING.value:
+            note = str(plan_step.note or '')
+            if not note.startswith('guardian review pending'):
+                # 展开执行中崩溃的计划：重入执行器继续（S2 契约）。
+                return {
+                    'pending_step_id': plan_step.id,
+                    'policy_decision': PolicyDecision.ALLOW.value,
+                    'decision': '',
+                }
+            self._recover_interrupted_guardian_review(run_id, plan_step.id)
+            plan_step = self._step_row(run_id, plan_step.id)
+        if plan_step.status == StepStatus.WAITING_APPROVAL.value:
+            review = self._maybe_guardian_review(run_id, plan_step.id)
+            if review is not None:
+                return review
+            decision = PolicyDecision.ASK.value
+        else:
+            decision = PolicyDecision.ALLOW.value
         return {
             'pending_step_id': plan_step.id,
             'policy_decision': decision,
+            'decision': '',
+        }
+
+    # ------------------------------------------------------------------
+    # Guardian：稳定计划边界的可选独立复核（S3 切片 3）
+    # ------------------------------------------------------------------
+
+    def _maybe_guardian_review(self, run_id, plan_step_id):
+        """ai_review + 已接线 Guardian 时复核 waiting 计划。
+
+        返回 policy 节点结果表示复核已处置该计划；返回 None 表示
+        照常 ask 暂停（非 ai_review、未接线或 escalate 兜底）。每个
+        计划边界至多一次模型调用：认领标记先落库，重入不再复核。
+        """
+        run = self._run_row(run_id)
+        try:
+            canonical_mode = normalize_run_mode(str(run.mode or ''))
+        except Exception:
+            return None
+        if canonical_mode != RunMode.AI_REVIEW or self.guardian is None:
+            return None
+        if not self._claim_guardian_review(run_id, plan_step_id):
+            return None
+
+        plan_step = self._step_row(run_id, plan_step_id)
+        try:
+            snapshot = parse_plan_snapshot(plan_step.action_json or '')
+        except PlanAuthorizationError:
+            snapshot = {'summary': '', 'actions': []}
+        host = self.repo._get_host_row(run.host_id)
+        try:
+            result = self.guardian({
+                'goal': str(run.goal or ''),
+                'host_alias': str(host.alias or ''),
+                'environment': str(host.ai_environment or ''),
+                'summary': str(snapshot.get('summary') or ''),
+                'snapshot': snapshot,
+            })
+        except Exception as exc:
+            # Guardian 是可选增强：复核器自身异常也一律回退人工。
+            logger.warning('autonomy guardian raised: %s', exc)
+            result = None
+        decision = str((result or {}).get('decision') or '')
+        reason = sanitize_text(
+            str((result or {}).get('reason') or ''),
+        )[:64]
+
+        if decision == GUARDIAN_APPROVE:
+            return self._guardian_approve(run_id, plan_step_id, reason)
+        if decision == GUARDIAN_REJECT:
+            return self._guardian_reject(run_id, plan_step_id, reason)
+        return self._guardian_escalate(run_id, plan_step_id, reason)
+
+    def _claim_guardian_review(self, run_id, plan_step_id):
+        """把 waiting 计划标记为复核中并先落库；不可复核时返回 False。
+
+        标记落库后才调用模型：进程在调用中途崩溃时，重入看到的是
+        已复核标记，绝不对同一计划边界发起第二次模型调用。
+        """
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step_id)
+        if plan_step is None:
+            self.repo._commit()
+            return False
+        note = str(plan_step.note or '')
+        if (
+            plan_step.status != StepStatus.WAITING_APPROVAL.value
+            or note.startswith('guardian ')
+        ):
+            self.repo._commit()
+            return False
+        assert_step_transition(plan_step.status, StepStatus.RUNNING.value)
+        plan_step.status = StepStatus.RUNNING.value
+        plan_step.note = 'guardian review pending'
+        self.repo._bump(run)
+        self.repo._commit()
+        return True
+
+    def _recover_interrupted_guardian_review(self, run_id, plan_step_id):
+        """复核中进程崩溃：计划回 waiting 交人工，绝不二次调用模型。"""
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step_id)
+        if (
+            plan_step is None
+            or plan_step.status != StepStatus.RUNNING.value
+            or not str(plan_step.note or '').startswith(
+                'guardian review pending',
+            )
+        ):
+            self.repo._commit()
+            return
+        assert_step_transition(
+            plan_step.status, StepStatus.WAITING_APPROVAL.value,
+        )
+        plan_step.status = StepStatus.WAITING_APPROVAL.value
+        plan_step.note = 'guardian review interrupted'
+        self.repo._bump(run)
+        self.repo.append_event(run, 'guardian_decision', {
+            'step_id': plan_step.id,
+            'decision': 'escalate',
+            'reason': 'review_interrupted',
+        })
+        self.repo._commit()
+
+    def _guardian_result_lock(self, run_id, plan_step_id):
+        """复核落库前重新锁定并复核状态；已被人工处置时返回 (None, None)。"""
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step_id)
+        if (
+            plan_step is None
+            or plan_step.status != StepStatus.RUNNING.value
+        ):
+            self.repo._commit()
+            return None, None
+        return run, plan_step
+
+    def _guardian_approve(self, run_id, plan_step_id, reason):
+        """approve：计划转 approved，Run 回 queued，直达展开执行。
+
+        放行只到状态层：展开前的 digest/绑定/预算复核照旧独立完成，
+        Guardian 从不授予权限。
+        """
+        run, plan_step = self._guardian_result_lock(run_id, plan_step_id)
+        if run is None:
+            return None
+        assert_step_transition(plan_step.status, StepStatus.APPROVED.value)
+        plan_step.status = StepStatus.APPROVED.value
+        plan_step.note = ('guardian approved: %s' % reason)[:255]
+        assert_run_transition(run.status, RunStatus.QUEUED.value)
+        run.status = RunStatus.QUEUED.value
+        self.repo._bump(run)
+        self.repo.append_event(run, 'guardian_decision', {
+            'step_id': plan_step.id,
+            'decision': GUARDIAN_APPROVE,
+            'reason': reason,
+        })
+        self.repo._commit()
+        return {
+            'pending_step_id': plan_step.id,
+            'policy_decision': PolicyDecision.ALLOW.value,
+            'decision': '',
+        }
+
+    def _guardian_reject(self, run_id, plan_step_id, reason):
+        """reject：计划落 failed，Run 回 queued，下一轮重新提议。"""
+        run, plan_step = self._guardian_result_lock(run_id, plan_step_id)
+        if run is None:
+            return None
+        assert_step_transition(plan_step.status, StepStatus.FAILED.value)
+        plan_step.status = StepStatus.FAILED.value
+        plan_step.note = ('guardian rejected: %s' % reason)[:255]
+        assert_run_transition(run.status, RunStatus.QUEUED.value)
+        run.status = RunStatus.QUEUED.value
+        self.repo._bump(run)
+        self.repo.append_event(run, 'guardian_decision', {
+            'step_id': plan_step.id,
+            'decision': GUARDIAN_REJECT,
+            'reason': reason,
+        })
+        self.repo._commit()
+        return {
+            'pending_step_id': '',
+            'policy_decision': PolicyDecision.ALLOW.value,
+            'decision': '',
+        }
+
+    def _guardian_escalate(self, run_id, plan_step_id, reason):
+        """escalate/任何不确定：计划回 waiting，照常人工审批。"""
+        run, plan_step = self._guardian_result_lock(run_id, plan_step_id)
+        if run is None:
+            return None
+        assert_step_transition(
+            plan_step.status, StepStatus.WAITING_APPROVAL.value,
+        )
+        plan_step.status = StepStatus.WAITING_APPROVAL.value
+        plan_step.note = ('guardian escalated: %s' % reason)[:255]
+        self.repo._bump(run)
+        self.repo.append_event(run, 'guardian_decision', {
+            'step_id': plan_step.id,
+            'decision': 'escalate',
+            'reason': reason or 'uncertain',
+        })
+        self.repo.append_event(run, 'steps_waiting_approval', {
+            'step_ids': [plan_step.id],
+        })
+        self.repo._commit()
+        return {
+            'pending_step_id': plan_step.id,
+            'policy_decision': PolicyDecision.ASK.value,
             'decision': '',
         }
 
@@ -1136,6 +1352,13 @@ class AutonomyDriver:
             assert_run_transition(run.status, RunStatus.FAILED.value)
             run.status = RunStatus.FAILED.value
             event = 'budget_exhausted'
+        elif run.status == RunStatus.QUEUED.value:
+            # Guardian reject 后 Run 已回 queued 等下一轮重新提议：
+            # 本驱动已收敛，保持 queued 释放租约交给扫描认领，绝
+            # 不把仍在队列里的 Run 误标 completed，也不落终态时间。
+            self._clear_claim(run)
+            self.repo._commit()
+            return RESULT_COMPLETED
         else:
             result = RESULT_COMPLETED
             assert_run_transition(run.status, RunStatus.COMPLETED.value)

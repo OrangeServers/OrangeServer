@@ -155,16 +155,23 @@ def test_product_permission_profiles_create_v2_runs(repo_env, mode):
     repo = repo_env["repo"]
     repo.set_host_environment(repo_env["host_id"], "lab")
 
+    # custom 档案必须显式携带服务端固定类别集合（S3 切片 3）。
+    profile_payload = (
+        {"action_categories": ["systemd", "file_read"]}
+        if mode == "custom" else None
+    )
     run = repo.create_run(
         "admin", "admin",
         goal="investigate service health",
         host_id=repo_env["host_id"],
         system_user_id=19,
         mode=mode,
+        profile_payload=profile_payload,
     )
 
     assert run["mode"] == mode
     assert run["graph_version"] == "v2"
+    assert run["custom_profile"] == profile_payload
 
 
 @pytest.mark.parametrize("legacy_mode", [
@@ -181,6 +188,133 @@ def test_new_runs_reject_legacy_permission_modes(repo_env, legacy_mode):
             system_user_id=19,
             mode=legacy_mode,
         )
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 3：custom 权限档案——服务端固定类别 + 单一主机绑定
+# ---------------------------------------------------------------------------
+
+def test_custom_run_requires_an_action_categories_profile(repo_env):
+    repo = repo_env["repo"]
+
+    with pytest.raises(AutonomyValidationError, match="custom mode requires"):
+        repo.create_run(
+            "admin", "admin",
+            goal="custom without profile",
+            host_id=repo_env["host_id"],
+            system_user_id=19,
+            mode="custom",
+        )
+
+
+def test_custom_profile_is_rejected_for_other_modes(repo_env):
+    repo = repo_env["repo"]
+
+    with pytest.raises(AutonomyValidationError, match="mode=custom"):
+        repo.create_run(
+            "admin", "admin",
+            goal="ask run with profile",
+            host_id=repo_env["host_id"],
+            system_user_id=19,
+            mode="ask",
+            profile_payload={"action_categories": ["systemd"]},
+        )
+
+
+@pytest.mark.parametrize("bad_payload", [
+    {"action_categories": ["reboot_world"]},
+    {"action_categories": []},
+    {"action_categories": "systemd"},
+    {"action_categories": ["systemd"], "script": "rm -rf /"},
+    "systemd",
+])
+def test_custom_profile_rejects_unknown_or_malformed_input(
+    repo_env, bad_payload,
+):
+    repo = repo_env["repo"]
+
+    with pytest.raises(AutonomyValidationError):
+        repo.create_run(
+            "admin", "admin",
+            goal="bad custom profile",
+            host_id=repo_env["host_id"],
+            system_user_id=19,
+            mode="custom",
+            profile_payload=bad_payload,
+        )
+
+
+def test_custom_profile_dedupes_and_persists_categories(repo_env):
+    repo = repo_env["repo"]
+
+    run = repo.create_run(
+        "admin", "admin",
+        goal="custom profile roundtrip",
+        host_id=repo_env["host_id"],
+        system_user_id=19,
+        mode="custom",
+        profile_payload={
+            "action_categories": ["systemd", "systemd", "file_read"],
+        },
+    )
+
+    assert run["custom_profile"] == {
+        "action_categories": ["systemd", "file_read"],
+    }
+    row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    assert json.loads(row.custom_profile_json) == run["custom_profile"]
+
+
+def test_ask_run_exposes_no_custom_profile(repo_env):
+    run = repo_env["create_started_run"]()
+
+    assert run["custom_profile"] is None
+
+
+def test_custom_run_blocks_out_of_profile_plan_actions(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"](
+        mode="custom",
+        profile_payload={"action_categories": ["systemd"]},
+    )
+
+    # 档案外的类别在提案时拒绝，绝不落半张计划。
+    with pytest.raises(AutonomyValidationError, match="custom profile"):
+        repo.propose_plan(
+            "admin", "admin", run["id"], "install updates",
+            [{"kind": "package_install", "params": {
+                "manager": "apt", "package": "curl",
+            }}],
+        )
+    assert repo_env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"],
+    ).count() == 0
+
+    # 档案内的类别照常走服务端策略（写动作仍需人工审批）。
+    step = repo.propose_plan(
+        "admin", "admin", run["id"], "restart nginx", _systemd_actions(),
+    )
+    assert step["status"] == "waiting_approval"
+
+
+def test_custom_run_probes_stay_allowed_outside_profile(repo_env):
+    """探针是服务端自有只读能力，不属于可配置类别，永不受限。"""
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"](
+        mode="custom",
+        profile_payload={"action_categories": ["systemd"]},
+    )
+
+    step = repo.propose_probe(
+        "admin", "admin", run["id"], "system.load",
+    )
+    assert step["status"] == "proposed"
+
+    plan = repo.propose_plan(
+        "admin", "admin", run["id"], "recheck load",
+        [{"kind": "probe", "params": {"probe_id": "system.load"}}],
+    )
+    assert plan["status"] == "approved"
 
 
 def test_create_run_inserts_run_before_first_event_under_fk():

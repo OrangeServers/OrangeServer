@@ -346,7 +346,10 @@ def test_rev53_autonomy_migration_matches_baseline_and_orm():
 
 
 def test_rev54_autonomy_migration_matches_baseline_and_orm():
-    """M1/S2: rev54 追加列后，rev53+rev54、orange.sql 与 ORM 三方一致。"""
+    """M1/S2: rev54 追加列仍是 orange.sql 基线与 ORM 的子集。
+
+    rev54 迁移文件本身不可变；后续迁移（rev55+）向同表追加列，
+    完整三方一致由最新迁移的契约测试断言。"""
     from app.core.db.database import db
 
     rev53 = (
@@ -385,7 +388,8 @@ def test_rev54_autonomy_migration_matches_baseline_and_orm():
     orm_columns = set(
         db.metadata.tables["t_ai_autonomous_run"].columns.keys()
     )
-    assert rev53_columns | added == baseline_columns == orm_columns
+    assert rev53_columns | added <= baseline_columns
+    assert rev53_columns | added <= orm_columns
 
     run_ddl = re.search(
         r"CREATE TABLE `t_ai_autonomous_run` \((.*?)\)\s*ENGINE=",
@@ -420,6 +424,60 @@ def test_rev54_autonomy_migration_matches_baseline_and_orm():
     for status in ("completed", "failed", "cancelled", "expired"):
         assert f"_utf8mb4'{status}'" in run_ddl.group(1)
         assert f"_utf8mb4''{status}''" in rev54
+
+
+def test_rev55_autonomy_migration_matches_baseline_and_orm():
+    """M1/S3: rev55 追加列后，rev53+rev54+rev55、orange.sql 与 ORM 一致。"""
+    from app.core.db.database import db
+
+    def migration_columns(path):
+        text = (BACKEND / "mysqldir" / path).read_text(encoding="utf-8")
+        return set(re.findall(r"ADD COLUMN `(\w+)`", text))
+
+    rev53 = (
+        BACKEND / "mysqldir" / "rev53_ai_autonomy_baseline.sql"
+    ).read_text(encoding="utf-8")
+    rev55 = (
+        BACKEND / "mysqldir" / "rev55_ai_autonomy_custom_profile.sql"
+    ).read_text(encoding="utf-8")
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+
+    def create_columns(source, table):
+        match = re.search(
+            r"CREATE TABLE(?: IF NOT EXISTS)? `" + table
+            + r"` \((.*?)\)\s*ENGINE=",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        assert match, f"{table} is missing from the schema source"
+        return set(
+            re.findall(r"^\s*`([^`]+)`\s+", match.group(1), re.MULTILINE)
+        )
+
+    added = set(re.findall(r"ADD COLUMN `(\w+)`", rev55))
+    assert added == {"custom_profile_json"}, added
+    # 每个 ALTER 都有幂等守卫，脚本可重复执行。
+    assert rev55.count("information_schema.COLUMNS") == 1
+    assert rev55.count("PREPARE stmt FROM @sql;") == 1
+
+    rev53_columns = create_columns(rev53, "t_ai_autonomous_run")
+    rev54_added = migration_columns("rev54_ai_autonomy_lease.sql")
+    baseline_columns = create_columns(schema, "t_ai_autonomous_run")
+    orm_columns = set(
+        db.metadata.tables["t_ai_autonomous_run"].columns.keys()
+    )
+    assert (
+        rev53_columns | rev54_added | added
+        == baseline_columns == orm_columns
+    )
+
+    run_ddl = re.search(
+        r"CREATE TABLE `t_ai_autonomous_run` \((.*?)\)\s*ENGINE=",
+        schema,
+        re.DOTALL,
+    )
+    assert run_ddl, "orange.sql must define t_ai_autonomous_run"
+    assert "`custom_profile_json` text DEFAULT NULL" in run_ddl.group(1)
 
 
 def test_dockerfile_builds_from_committed_requirements_without_resolving_lock():

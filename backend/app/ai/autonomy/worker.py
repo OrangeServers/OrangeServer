@@ -144,6 +144,7 @@ def build_default_executor(session):
         make_autonomy_heartbeat_session_factory,
         make_autonomy_saver_factory,
     )
+    from app.ai.autonomy.guardian import make_default_guardian
     from app.ai.autonomy.planner import make_default_planner
     from app.core.config import FLASK_SECRET_KEY
 
@@ -151,6 +152,7 @@ def build_default_executor(session):
         driver = AutonomyDriver(
             session, FLASK_SECRET_KEY,
             planner=make_default_planner(),
+            guardian=make_default_guardian(),
             saver_factory=make_autonomy_saver_factory(),
             heartbeat_session_factory=(
                 make_autonomy_heartbeat_session_factory()

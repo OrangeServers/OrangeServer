@@ -266,6 +266,12 @@ AI_AUTONOMY_LEASE_TTL_SECONDS = max(
 AI_AUTONOMY_APPROVAL_TTL_SECONDS = max(
     60, int(_env('OGS_AI_AUTONOMY_APPROVAL_TTL_SECONDS', '86400')),
 )
+#   M1/S3: 可选 Guardian（ai_review 档案的稳定计划边界独立复核）。
+#   默认关闭；关闭或 Provider 未配置时 ai_review 计划照常走人工审批，
+#   任何复核失败/不确定也一律回退人工。
+AI_AUTONOMY_GUARDIAN_ENABLED = str(
+    _env('OGS_AI_AUTONOMY_GUARDIAN_ENABLED', ''),
+).strip().lower() in ('1', 'true', 'yes', 'on')
 
 # REVIEW-11-P1-1: SSH 危险命令黑名单
 #   拦截 rm -rf / / mkfs / dd if= / shutdown / reboot / fork 炸弹 等

@@ -111,6 +111,7 @@ def create_run():
             system_user_id=payload.get('system_user_id'),
             mode=str(payload.get('mode') or ''),
             budget_payload=payload.get('budget'),
+            profile_payload=payload.get('profile'),
         )
         return api_response(data=run, run=run)
     except Exception as exc:

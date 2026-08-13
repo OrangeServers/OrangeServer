@@ -208,6 +208,7 @@ def test_create_run_passes_boundary_inputs_to_repository(api, monkeypatch):
         "system_user_id": 19,
         "mode": "ask",
         "budget_payload": {"max_actions": 3},
+        "profile_payload": None,
     }
 
 

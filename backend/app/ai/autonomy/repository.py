@@ -57,6 +57,7 @@ from app.ai.autonomy.state import (
     CANONICAL_RUN_MODES,
     AiEnvironment,
     DecisionOperation,
+    RunMode,
     RunStatus,
     StepKind,
     StepStatus,
@@ -91,6 +92,46 @@ _CONTROL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 _SECRET_KEY_MARKERS = (
     'password', 'secret', 'token', 'credential', 'private_key',
 )
+# M1/S3 切片 3：custom 档案可选的动作类别是服务端固定集合（与
+# classify_action 支持的 kind 一致）；不引入策略表达式语言，目标
+# 范围就是 Run 创建时绑定的单一主机。probe 是服务端自有只读探针，
+# 不在可选集合里，任何档案下都不受 custom 限制。
+CUSTOM_ACTION_CATEGORIES = frozenset({
+    'file_read', 'file_patch', 'file_restore', 'package_install',
+    'shell', 'systemd',
+})
+
+
+def parse_custom_profile(payload):
+    """解析 custom 权限档案；只接受 {action_categories: [...]}。
+
+    类别必须来自服务端固定集合：非空、去重、未知拒绝。非法输入
+    直接拒绝而不是静默钳制。
+    """
+    if not isinstance(payload, dict):
+        raise AutonomyValidationError('custom profile must be an object')
+    unknown = set(payload) - {'action_categories'}
+    if unknown:
+        raise AutonomyValidationError(
+            'unknown custom profile fields: %s' % ', '.join(sorted(unknown))
+        )
+    raw = payload.get('action_categories')
+    if not isinstance(raw, list) or not raw:
+        raise AutonomyValidationError(
+            'custom profile requires a non-empty action_categories list'
+        )
+    categories = []
+    for item in raw:
+        name = str(item or '')
+        if name not in CUSTOM_ACTION_CATEGORIES:
+            raise AutonomyValidationError(
+                'unknown action category: %r' % (name,)
+            )
+        if name not in categories:
+            categories.append(name)
+    return {'action_categories': categories}
+
+
 _ACTIVE_HOST_UNIQUE_KEY = 'uq_ai_auto_run_active_host'
 _SQLITE_ACTIVE_HOST_UNIQUE_ERROR = (
     'UNIQUE constraint failed: t_ai_autonomous_run.active_host_id'
@@ -314,6 +355,10 @@ class AutonomyRepository:
             'system_user_id': int(row.system_user_id),
             'system_user_alias': row.system_user_alias,
             'mode': row.mode,
+            'custom_profile': (
+                json.loads(row.custom_profile_json)
+                if getattr(row, 'custom_profile_json', None) else None
+            ),
             'status': row.status,
             'outcome': row.outcome,
             'revision': int(row.revision or 0),
@@ -353,6 +398,7 @@ class AutonomyRepository:
         system_user_id: int,
         mode: str,
         budget_payload: Optional[Dict[str, Any]] = None,
+        profile_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         from app.core.db.database import t_ai_autonomous_run
 
@@ -361,6 +407,18 @@ class AutonomyRepository:
             raise AutonomyValidationError('goal must be 1..512 characters')
         if mode not in {m.value for m in CANONICAL_RUN_MODES}:
             raise AutonomyValidationError('unknown mode: %r' % (mode,))
+        if mode == RunMode.CUSTOM.value:
+            if profile_payload is None:
+                raise AutonomyValidationError(
+                    'custom mode requires an action_categories profile'
+                )
+            custom_profile = parse_custom_profile(profile_payload)
+        else:
+            if profile_payload is not None:
+                raise AutonomyValidationError(
+                    'custom profile is only valid with mode=custom'
+                )
+            custom_profile = None
         try:
             budget = parse_budget(budget_payload)
         except Exception as exc:
@@ -410,6 +468,10 @@ class AutonomyRepository:
             system_user_id=system_user_id,
             system_user_alias=str(credential.get('alias') or ''),
             mode=mode,
+            custom_profile_json=(
+                json.dumps(custom_profile, sort_keys=True)
+                if custom_profile else None
+            ),
             graph_version=DEFAULT_GRAPH_VERSION,
             status=RunStatus.DRAFT.value,
             revision=0,
@@ -435,6 +497,7 @@ class AutonomyRepository:
         self.append_event(run, 'run_created', {
             'mode': mode, 'host_id': host_id,
             'system_user_id': system_user_id,
+            'custom_profile': custom_profile,
         })
         self._commit()
         return self._run_to_dict(run)
@@ -610,6 +673,7 @@ class AutonomyRepository:
             raise AutonomyValidationError(str(exc)) from exc
 
         self._revalidate_boundaries(owner, role, run)
+        self._enforce_custom_profile(run, 'probe')
         budget = Budget(**json.loads(run.budget_json or '{}'))
         action_count = self.session.query(t_ai_autonomous_step).filter_by(
             run_id=run_id, kind=StepKind.ACTION.value,
@@ -683,6 +747,39 @@ class AutonomyRepository:
                 self._bump(run)
         self._commit()
         return self._step_to_dict(step)
+
+    # ------------------------------------------------------------------
+    # 权限档案：custom 类别在提案时强制（S3 切片 3）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _custom_profile(run):
+        raw = getattr(run, 'custom_profile_json', None)
+        if not raw:
+            return None
+        try:
+            profile = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return profile if isinstance(profile, dict) else None
+
+    def _enforce_custom_profile(self, run, kind) -> None:
+        """custom 档案只放行选定的动作类别；probe 永不受限。
+
+        档案缺失/损坏时 fail-closed：写动作拒绝，探针放行（探针是
+        服务端自有只读能力，不属于管理员可配置的动作类别）。
+        """
+        if str(run.mode or '') != RunMode.CUSTOM.value:
+            return
+        if str(kind) == 'probe':
+            return
+        profile = self._custom_profile(run)
+        allowed = set((profile or {}).get('action_categories') or [])
+        if str(kind) not in allowed:
+            raise AutonomyValidationError(
+                'action category %r is not in the custom profile'
+                % (str(kind),)
+            )
 
     # ------------------------------------------------------------------
     # 计划提案：一次授权一个稳定计划（S3 切片 2）
@@ -781,6 +878,7 @@ class AutonomyRepository:
                 )
             except ActionValidationError as exc:
                 raise AutonomyValidationError(str(exc)) from exc
+            self._enforce_custom_profile(run, kind)
             action = StructuredAction(
                 kind=kind,
                 target_id=int(run.host_id),
