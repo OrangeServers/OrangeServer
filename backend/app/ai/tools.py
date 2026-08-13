@@ -310,8 +310,10 @@ class ToolRegistry:
         聊天工具面不存在任何 start/approve/cancel 自治 Run 的能力。
         """
         from app.ai.autonomy.repository import (
+            AutonomyConflict,
             AutonomyRepository,
             AutonomyValidationError,
+            AutonomyPermissionError,
         )
         from app.core.config import AI_AUTONOMY_ENABLED, FLASK_SECRET_KEY
         from app.core.db.database import db
@@ -346,6 +348,18 @@ class ToolRegistry:
             )
         except AutonomyValidationError as exc:
             raise ToolValidationError(str(exc)) from exc
+        except AutonomyConflict as exc:
+            # 单活唯一冲突（含草稿）等领域冲突不能重试；给模型可读
+            # 的明确文案，避免盲目重试撞穿工具步数上限。
+            raise ToolValidationError(
+                "无法创建自治任务草稿：该主机已有活动自治任务（含草稿），"
+                "请先在自治任务工作台处理已有任务。detail: %s" % exc
+            ) from exc
+        except AutonomyPermissionError as exc:
+            raise ToolValidationError(
+                "无法创建自治任务草稿：主机或系统账号授权校验失败。"
+                "detail: %s" % exc
+            ) from exc
         except Exception as exc:
             db.session.rollback()
             raise ToolError("autonomy draft creation failed") from exc

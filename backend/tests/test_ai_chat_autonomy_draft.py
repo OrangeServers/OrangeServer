@@ -183,6 +183,50 @@ def test_create_autonomy_draft_rejects_custom_mode(autonomy_env):
         )
 
 
+def test_create_autonomy_draft_conflict_becomes_readable_validation_error(
+    monkeypatch, autonomy_env
+):
+    """单活唯一冲突（手测复现）必须给模型可读文案，而不是笼统
+    ToolError 导致盲目重试撞穿工具步数上限。"""
+    from app.ai.autonomy.repository import AutonomyConflict
+    from app.ai.tools import ToolValidationError
+
+    def conflict(self, owner, role, **kwargs):
+        raise AutonomyConflict(
+            "an active autonomous run already exists for this host"
+        )
+
+    monkeypatch.setattr(FakeAutonomyRepository, "create_run", conflict)
+    _, _, registry = _registry(role="admin")
+
+    with pytest.raises(ToolValidationError) as excinfo:
+        registry.execute(
+            "create_autonomy_draft",
+            {"goal": "巡检", "host_id": 2, "system_user_id": 6},
+        )
+    assert "已有活动自治任务" in str(excinfo.value)
+
+
+def test_create_autonomy_draft_permission_error_becomes_validation_error(
+    monkeypatch, autonomy_env
+):
+    from app.ai.autonomy.repository import AutonomyPermissionError
+    from app.ai.tools import ToolValidationError
+
+    def denied(self, owner, role, **kwargs):
+        raise AutonomyPermissionError("host is not authorized")
+
+    monkeypatch.setattr(FakeAutonomyRepository, "create_run", denied)
+    _, _, registry = _registry(role="admin")
+
+    with pytest.raises(ToolValidationError) as excinfo:
+        registry.execute(
+            "create_autonomy_draft",
+            {"goal": "巡检", "host_id": 2, "system_user_id": 6},
+        )
+    assert "授权校验失败" in str(excinfo.value)
+
+
 # =============================================================================
 # Runner：引用卡事件持久化 + SSE 广播；绝不启动 Run
 # =============================================================================
