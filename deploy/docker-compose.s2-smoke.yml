@@ -217,6 +217,9 @@ services:
     networks: [smoke-internal]
     environment:
       <<: *smoke-environment
+      # An absolute script entrypoint makes Python use /smoke as sys.path[0].
+      # Keep the exact-head application package importable from the image.
+      PYTHONPATH: /app
       OGS_S2_SMOKE_UPGRADE_MYSQL_HOST: mysql-upgrade
       OGS_S2_SMOKE_GIT_HEAD: ${OGS_S2_SMOKE_GIT_HEAD:?reviewed Git HEAD required}
     entrypoint: ["python", "/smoke/smoke-ai-autonomy-s2.py"]

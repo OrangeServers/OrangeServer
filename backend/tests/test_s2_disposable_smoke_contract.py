@@ -29,6 +29,7 @@ def test_s2_smoke_compose_is_isolated_and_builds_current_backend():
     assert 'OGS_AI_AUTONOMY_LEASE_TTL_SECONDS: 30' in compose
     assert 'OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis' in compose
     assert 'OGS_S2_SMOKE_UPGRADE_MYSQL_HOST: mysql-upgrade' in compose
+    assert 'PYTHONPATH: /app' in compose
     assert 'ssh-target:' in compose
     assert 'dockerfile: Dockerfile.ssh-target' in compose
     assert 'OGS_SSH_HOST_KEY_POLICY: auto' in compose
@@ -302,7 +303,10 @@ def test_s2_smoke_proves_feature_off_without_autonomy_dependencies():
     assert "'dangerous command blocked:'" in probe
     assert "response.status_code == 401" not in probe
     assert 'serves legacy HTTP' not in wrapper[stopped:isolated]
-    assert 'exercises legacy Flask route/application' in wrapper[stopped:isolated]
+    assert (
+        'exercises legacy Flask route/application'
+        in wrapper[stopped:isolated]
+    )
     assert 'Gunicorn/listener/network-path smoke' in wrapper[stopped:isolated]
     # Compare decoded JSON, not source text.
     assert "'status' == 'ok'" not in probe
