@@ -35,6 +35,10 @@ from app.ai.autonomy.actions import (
 from app.ai.autonomy.executor import AutonomyExecutor
 from app.ai.autonomy.graph import AutonomyGraphError, build_graph
 from app.ai.autonomy.lease import RunLeaseService
+from app.ai.autonomy.planner import (
+    PlannerProposalError,
+    summarize_step_history,
+)
 from app.ai.autonomy.policy import Budget, PolicyDecision, classify_action
 from app.ai.autonomy.recovery import (
     MODE_BOUNDARY,
@@ -384,6 +388,14 @@ class AutonomyDriver:
             # State/checkpoints, where user-supplied secrets would persist in
             # Redis AOF. The planner receives it only at the call boundary.
             current_run = self._run_row(run_id)
+            from app.core.db.database import t_ai_autonomous_step
+
+            budget = Budget(**json.loads(current_run.budget_json or '{}'))
+            action_count = self.session.query(
+                t_ai_autonomous_step,
+            ).filter_by(
+                run_id=run_id, kind=StepKind.ACTION.value,
+            ).count()
             context = {
                 'run_id': run_id,
                 'owner': str(state.get('owner') or ''),
@@ -391,6 +403,17 @@ class AutonomyDriver:
                 'goal': str(current_run.goal or ''),
                 'loops': int(state.get('loops', 0)),
                 'repo': planner_repo,
+                # 服务端权威的预算余量与有界脱敏观察；模型只能读，
+                # 不能以此改写预算或绕过白名单。
+                'budget': {
+                    'remaining_loops': max(
+                        0, int(budget.max_loops) - int(state.get('loops', 0)),
+                    ),
+                    'remaining_actions': max(
+                        0, int(budget.max_actions) - int(action_count),
+                    ),
+                },
+                'history': summarize_step_history(self.session, run_id),
             }
             proposed = list(self.planner(context) or [])
             return {
@@ -819,6 +842,11 @@ class AutonomyDriver:
                     entry = Command(resume=decision)
             except PlannerUnavailable:
                 self._fail_run(run, 'planner_unavailable', 'planner not wired')
+                return RESULT_FAILED
+            except PlannerProposalError as exc:
+                # 模型/供应商侧可预期失败：fail-closed 落终态，绝不
+                # 重试或留下半执行 Step。
+                self._fail_run(run, 'planner_failed', exc.reason)
                 return RESULT_FAILED
             except DurationBudgetExhausted:
                 self.session.expire_all()

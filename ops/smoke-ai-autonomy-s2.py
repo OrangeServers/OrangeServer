@@ -1812,10 +1812,27 @@ def verify_ssh_pre_intent_recovery():
         connection.close()
 
 
+def _require_no_enabled_provider(connection):
+    """S2 门的 fail-closed 前提：实验室不得配置启用的 Provider。
+
+    S3 接线后 planner 真实可用；若实验室配置了 Provider，这些
+    场景的 Run 会真正开始调查而不是在规划边界失败，门就不再
+    确定。S3 纵向闭环在独立的 S3 门脚本里配置 Provider。
+    """
+    row = fetch_one(
+        connection,
+        'SELECT COUNT(*) AS count FROM t_ai_provider WHERE enabled = 1',
+        (),
+    )
+    require(int(row['count']) == 0,
+            'S2 gate requires a lab without an enabled AI provider')
+
+
 def worker_timer_recovery():
     """Require the real Worker timer to find an unpublished queued Run."""
     connection = mysql_connection(os.environ['OGS_MYSQL_HOST'])
     try:
+        _require_no_enabled_provider(connection)
         delete_run(connection, WORKER_TIMER_RUN_ID)
         insert_run(connection, WORKER_TIMER_RUN_ID, 190021, 'queued')
         # Intentionally no dispatch_run/send_task call in this phase.
@@ -1835,7 +1852,8 @@ def worker_timer_recovery():
             connection,
             """
             SELECT COUNT(*) AS count FROM t_ai_autonomous_event
-             WHERE run_id = %s AND event_type = 'planner_unavailable'
+             WHERE run_id = %s
+               AND event_type IN ('planner_unavailable', 'planner_failed')
             """,
             (WORKER_TIMER_RUN_ID,),
         )
@@ -2083,6 +2101,7 @@ def worker_and_duplicate():
     connection = mysql_connection(os.environ['OGS_MYSQL_HOST'])
     run_id = 'smoke-celery-duplicate'
     try:
+        _require_no_enabled_provider(connection)
         with connection.cursor() as cursor:
             cursor.execute(
                 'DELETE FROM t_ai_autonomous_run WHERE id = %s',
@@ -2115,7 +2134,7 @@ def worker_and_duplicate():
             time.sleep(0.25)
         require(
             row is not None and row['status'] == 'failed',
-            'duplicate delivery did not fail closed at planner boundary',
+            'duplicate delivery did not fail closed at the planner boundary',
         )
         require(
             row['lease_owner'] is None
@@ -2128,7 +2147,8 @@ def worker_and_duplicate():
             """
             SELECT COUNT(*) AS count
               FROM t_ai_autonomous_event
-             WHERE run_id = %s AND event_type = 'planner_unavailable'
+             WHERE run_id = %s
+               AND event_type IN ('planner_unavailable', 'planner_failed')
             """,
             (run_id,),
         )

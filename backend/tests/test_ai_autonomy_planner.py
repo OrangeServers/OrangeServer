@@ -1,0 +1,325 @@
+# -*- coding: utf-8 -*-
+"""M1/S3 切片 1：ToolCallingPlanner 契约测试（Issue #16）。
+
+替身 adapter/repo 验证提议边界：模型输出只是不可信提议，白名单、
+预算与 fail-closed 全部在服务端裁决；不碰真实网络与 Provider。
+"""
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.ai.autonomy import planner as planner_mod
+from app.ai.autonomy.planner import (
+    FINISH_TOOL_NAME,
+    PROPOSAL_TOOL_NAME,
+    PlannerProposalError,
+    ToolCallingPlanner,
+    proposal_tool_schemas,
+    summarize_step_history,
+)
+from app.ai.autonomy.repository import (
+    AutonomyConflict,
+    AutonomyValidationError,
+)
+from app.core.db.database import db, t_ai_autonomous_step
+
+
+class FakeToolCall:
+    def __init__(self, name, arguments, call_id="call-1"):
+        self.id = call_id
+        self.name = name
+        self.arguments = arguments
+
+
+class FakeChatResult:
+    def __init__(self, tool_calls=(), truncated=False, finish_reason="stop"):
+        self.tool_calls = tuple(tool_calls)
+        self.truncated = truncated
+        self.finish_reason = finish_reason
+
+
+class FakeAdapter:
+    def __init__(self, results=None, error=None):
+        self.results = list(results or [])
+        self.error = error
+        self.requests = []
+
+    def complete(self, *, messages, tools=None, tool_choice=None, **kwargs):
+        self.requests.append(
+            {"messages": messages, "tools": tools, "tool_choice": tool_choice},
+        )
+        if self.error is not None:
+            error, self.error = self.error, None
+            if isinstance(error, Exception):
+                raise error
+            raise RuntimeError(error)
+        return self.results.pop(0)
+
+
+class FakeRepo:
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = []
+
+    def propose_probe(self, owner, role, run_id, probe_id, params=None):
+        self.calls.append(
+            {"owner": owner, "role": role, "run_id": run_id,
+             "probe_id": probe_id, "params": params},
+        )
+        if self.error is not None:
+            raise self.error
+        return {"id": "step-%d" % len(self.calls)}
+
+
+def make_context(repo, **budget_overrides):
+    budget = {"remaining_loops": 5, "remaining_actions": 5}
+    budget.update(budget_overrides)
+    return {
+        "run_id": "run-1",
+        "owner": "admin",
+        "role": "admin",
+        "goal": "diagnose latency",
+        "loops": 0,
+        "repo": repo,
+        "budget": budget,
+        "history": [],
+    }
+
+
+def probe_call(probe_id="system.load", params=None):
+    return FakeToolCall(
+        PROPOSAL_TOOL_NAME, {"probe_id": probe_id, "params": params or {}},
+    )
+
+
+def make_planner(adapter):
+    return ToolCallingPlanner(lambda: adapter)
+
+
+def test_single_probe_proposal_goes_through_the_fenced_repo():
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[FakeChatResult([probe_call()])])
+    planner = make_planner(adapter)
+
+    proposed = planner(make_context(repo))
+
+    assert proposed == ["step-1"]
+    assert repo.calls == [{
+        "owner": "admin", "role": "admin", "run_id": "run-1",
+        "probe_id": "system.load", "params": {},
+    }]
+    request = adapter.requests[0]
+    assert request["tool_choice"] == "required"
+    tool_names = {
+        tool["function"]["name"] for tool in request["tools"]
+    }
+    assert tool_names == {PROPOSAL_TOOL_NAME, FINISH_TOOL_NAME}
+
+
+def test_finish_tool_ends_the_loop_without_a_proposal():
+    repo = FakeRepo()
+    adapter = FakeAdapter(
+        results=[FakeChatResult([FakeToolCall(FINISH_TOOL_NAME, {})])],
+    )
+
+    assert make_planner(adapter)(make_context(repo)) == []
+    assert repo.calls == []
+
+
+def test_missing_provider_configuration_fails_closed():
+    from app.ai.provider_config import ProviderConfigError
+
+    def factory():
+        raise ProviderConfigError("所选模型服务未启用或配置不完整")
+
+    planner = ToolCallingPlanner(factory)
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        planner(make_context(FakeRepo()))
+    assert excinfo.value.reason == "provider_not_configured"
+
+
+def test_provider_exception_fails_closed_without_half_steps():
+    repo = FakeRepo()
+    adapter = FakeAdapter(error=TimeoutError("provider timed out"))
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+    assert excinfo.value.reason == "provider_call_failed"
+    assert repo.calls == []
+
+
+@pytest.mark.parametrize("result", [
+    FakeChatResult([probe_call()], truncated=True),
+    FakeChatResult([probe_call()], finish_reason="length"),
+])
+def test_truncated_provider_output_fails_closed(result):
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[result])
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+    assert excinfo.value.reason == "provider_output_truncated"
+    assert repo.calls == []
+
+
+@pytest.mark.parametrize("calls", [
+    (),
+    (probe_call(), probe_call()),
+])
+def test_ambiguous_tool_calls_fail_closed(calls):
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[FakeChatResult(list(calls))])
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+    assert excinfo.value.reason == "ambiguous_proposal"
+    assert repo.calls == []
+
+
+def test_unknown_tool_name_is_unsupported():
+    repo = FakeRepo()
+    adapter = FakeAdapter(
+        results=[FakeChatResult([FakeToolCall("rm_rf", {})])],
+    )
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+    assert excinfo.value.reason == "unsupported_proposal"
+
+
+def test_server_side_probe_validation_is_authoritative():
+    repo = FakeRepo(error=AutonomyValidationError("unknown probe"))
+    adapter = FakeAdapter(
+        results=[FakeChatResult([probe_call("not.a.real.probe")])],
+    )
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+    assert excinfo.value.reason == "unsupported_proposal"
+
+
+def test_conflicting_run_state_fails_closed():
+    repo = FakeRepo(error=AutonomyConflict("run not active"))
+    adapter = FakeAdapter(results=[FakeChatResult([probe_call()])])
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+    assert excinfo.value.reason == "run_not_active"
+
+
+def test_non_object_params_are_malformed():
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[FakeChatResult([
+        FakeToolCall(
+            PROPOSAL_TOOL_NAME, {"probe_id": "system.load", "params": "x"},
+        ),
+    ])])
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+    assert excinfo.value.reason == "malformed_proposal"
+    assert repo.calls == []
+
+
+@pytest.mark.parametrize("budget", [
+    {"remaining_actions": 0},
+    {"remaining_loops": 0},
+])
+def test_exhausted_budget_never_calls_the_provider(budget):
+    adapter = FakeAdapter(results=[FakeChatResult([probe_call()])])
+    planner = make_planner(adapter)
+
+    assert planner(make_context(FakeRepo(), **budget)) == []
+    assert adapter.requests == []
+
+
+def test_unsupported_tool_choice_degrades_once_then_decides():
+    repo = FakeRepo()
+    adapter = FakeAdapter(
+        results=[FakeChatResult([probe_call()])],
+        error="tool_choice is not supported by this provider",
+    )
+
+    assert make_planner(adapter)(make_context(repo)) == ["step-1"]
+    assert [request["tool_choice"] for request in adapter.requests] == [
+        "required", None,
+    ]
+
+
+def test_provider_response_error_does_not_trigger_tool_choice_retry():
+    from app.ai.provider import ProviderResponseError
+
+    repo = FakeRepo()
+    adapter = FakeAdapter(
+        error=ProviderResponseError("模型返回了无效的 Tool Call JSON 参数"),
+    )
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+    assert excinfo.value.reason == "provider_call_failed"
+    assert len(adapter.requests) == 1
+
+
+def test_tool_schemas_pin_the_probe_registry_enum():
+    from app.ai.autonomy.actions import list_probe_ids
+
+    schemas = proposal_tool_schemas()
+    proposal = next(
+        tool for tool in schemas
+        if tool["function"]["name"] == PROPOSAL_TOOL_NAME
+    )
+    enum = proposal["function"]["parameters"]["properties"]["probe_id"]["enum"]
+    assert enum == list_probe_ids()
+
+
+@pytest.fixture
+def step_session(tmp_path):
+    engine = create_engine(
+        "sqlite:///%s" % (tmp_path / "planner-history.db").as_posix(),
+    )
+    db.metadata.create_all(engine, tables=[t_ai_autonomous_step.__table__])
+    session = sessionmaker(bind=engine)()
+    yield session
+    session.close()
+
+
+def _add_step(session, seq, status, summary, note=""):
+    session.add(t_ai_autonomous_step(
+        id="step-%d" % seq, run_id="run-1", kind="action",
+        status=status, seq=seq, summary=summary, action_json="{}",
+        action_digest="d", note=note,
+    ))
+    session.commit()
+
+
+def test_history_is_bounded_ordered_and_sanitized(step_session):
+    for seq in range(1, planner_mod.HISTORY_STEP_LIMIT + 4):
+        _add_step(step_session, seq, "succeeded", "probe %d" % seq)
+    _add_step(step_session, 99, "failed", "ignored: wrong run")
+    step = step_session.query(t_ai_autonomous_step).filter_by(
+        id="step-99",
+    ).one()
+    step.run_id = "run-2"
+    step_session.commit()
+    _add_step(step_session, 100, "failed", "red\x1b[31mteam", "bad")
+
+    history = summarize_step_history(step_session, "run-1")
+
+    assert len(history) == planner_mod.HISTORY_STEP_LIMIT
+    # run-1 共 12 条（seq 1..11 + 100）；取最近 8 条后时序正排首条为 #5。
+    assert history[0].startswith("#5 succeeded")
+    assert history[-1].startswith("#100 failed")
+    assert "\x1b" not in "".join(history)
+    assert all(len(entry) <= planner_mod.HISTORY_ENTRY_CHARS
+               for entry in history)
+    assert all("run-2" not in entry for entry in history)
+
+
+def test_history_entries_are_capped_per_line(step_session):
+    _add_step(step_session, 1, "succeeded", "x" * 5000)
+
+    history = summarize_step_history(step_session, "run-1")
+
+    assert len(history) == 1
+    assert len(history[0]) == planner_mod.HISTORY_ENTRY_CHARS

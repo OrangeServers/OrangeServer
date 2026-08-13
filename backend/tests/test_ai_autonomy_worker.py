@@ -603,3 +603,33 @@ def test_dispatch_recoverable_disabled_sends_nothing(worker_env):
         config.AI_AUTONOMY_ENABLED = True
     assert candidates == []
     assert fake_app.sent == []
+
+
+def test_build_default_executor_wires_the_tool_calling_planner(monkeypatch):
+    """S3：默认执行器必须携带规划器；不再出现 planner=None 的
+    planner_unavailable 默认路径。"""
+    from app.ai.autonomy import drive as drive_mod
+    from app.ai.autonomy.planner import ToolCallingPlanner
+
+    captured = {}
+
+    class FakeDriver:
+        def __init__(self, session, secret_key, **kwargs):
+            captured["session"] = session
+            captured.update(kwargs)
+
+        def drive(self, run_id, claimed):
+            captured["drive"] = (run_id, claimed)
+            return drive_mod.RESULT_COMPLETED
+
+    monkeypatch.setattr(drive_mod, "AutonomyDriver", FakeDriver)
+
+    from app.app_factory import app as flask_app
+
+    with flask_app.app_context():
+        executor = worker.build_default_executor(object())
+        result = executor("run-x", {"lease_token": "token-x"})
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert isinstance(captured["planner"], ToolCallingPlanner)
+    assert captured["drive"] == ("run-x", {"lease_token": "token-x"})

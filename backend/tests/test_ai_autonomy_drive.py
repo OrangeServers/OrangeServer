@@ -599,6 +599,54 @@ def test_no_planner_fails_closed(env):
     assert env["runner"].calls == []
 
 
+def test_planner_proposal_error_fails_run_closed(env):
+    """S3：模型/供应商侧可预期失败一律 fail-closed，不重试。"""
+    from app.ai.autonomy.planner import PlannerProposalError
+
+    def failing_planner(context):
+        raise PlannerProposalError("provider_call_failed")
+
+    run = env["create_queued_run"]()
+    driver = env["make_driver"](planner=failing_planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_FAILED
+    row = _run_row(env, run["id"])
+    assert row.status == "failed"
+    assert row.lease_owner is None
+    assert row.lease_token is None
+    events = _events(env, run["id"])
+    failed = [e for e in events if e.event_type == "planner_failed"]
+    assert len(failed) == 1
+    assert json.loads(failed[0].payload_json)["note"] == (
+        "provider_call_failed"
+    )
+    assert env["runner"].calls == []
+
+
+def test_planner_context_carries_authoritative_budget_and_history(env):
+    """S3：预算余量与观察回灌由服务端从 MySQL 推导，模型只能读。"""
+    observed = {}
+
+    def capturing_planner(context):
+        observed.update(context)
+        return []
+
+    run = env["create_queued_run"]()
+    driver = env["make_driver"](planner=capturing_planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert observed["budget"] == {
+        "remaining_loops": 20,
+        "remaining_actions": 30,
+    }
+    assert observed["history"] == []
+    assert observed["goal"] == "diagnose latency"
+
+
 def test_no_saver_fails_closed(env):
     run = env["create_queued_run"]()
     driver = env["make_driver"](saver_factory=None)
