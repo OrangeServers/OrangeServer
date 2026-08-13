@@ -374,10 +374,11 @@ def test_rev54_autonomy_migration_matches_baseline_and_orm():
     ))
     assert added == {
         "lease_owner", "lease_expires_at", "heartbeat_at", "graph_version",
+        "active_host_id",
     }, added
     # 每个 ALTER 都有幂等守卫，脚本可重复执行。
-    assert rev54.count("information_schema.COLUMNS") == 4
-    assert rev54.count("PREPARE stmt FROM @sql;") == 5
+    assert rev54.count("information_schema.COLUMNS") == 5
+    assert rev54.count("PREPARE stmt FROM @sql;") == 7
 
     rev53_columns = create_columns(rev53, "t_ai_autonomous_run")
     baseline_columns = create_columns(schema, "t_ai_autonomous_run")
@@ -404,6 +405,12 @@ def test_rev54_autonomy_migration_matches_baseline_and_orm():
     assert (
         "ADD KEY `idx_ai_auto_run_lease_expires` (`lease_expires_at`)"
     ) in rev54
+    assert "`active_host_id` int GENERATED ALWAYS AS" in run_ddl.group(1)
+    assert "UNIQUE KEY `uq_ai_auto_run_active_host` (`active_host_id`)" in (
+        run_ddl.group(1)
+    )
+    assert "ADD UNIQUE KEY `uq_ai_auto_run_active_host`" in rev54
+    assert "HAVING COUNT(*) > 1" in rev54
 
 
 def test_dockerfile_builds_from_committed_requirements_without_resolving_lock():
@@ -428,6 +435,47 @@ def test_full_container_dev_is_isolated_and_source_mapped():
     assert "fetch('http://127.0.0.1:5173/')" in compose
 
 
+def test_autonomy_dev_overlay_uses_dedicated_redis8_and_worker():
+    overlay = (
+        DEPLOY / "docker-compose.dev-autonomy.yml"
+    ).read_text(encoding="utf-8")
+    makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+
+    assert "redis:8.0-alpine" in overlay
+    assert "dev-autonomy-redis-data:/data" in overlay
+    assert "--appendonly yes" in overlay
+    assert "--appendfsync everysec" in overlay
+    assert "--maxmemory-policy noeviction" in overlay
+    assert "OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis" in overlay
+    assert "OGS_AI_AUTONOMY_REDIS_PORT: 6379" in overlay
+    assert overlay.count("OGS_AI_AUTONOMY_REDIS_PASSWORD: ${") == 3
+    assert overlay.count(":?Set OGS_AI_AUTONOMY_REDIS_PASSWORD") == 3
+    assert overlay.count(
+        "OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-false}"
+    ) == 2
+    assert "autonomy-worker:" in overlay
+    image = (
+        "${OGS_DEV_AUTONOMY_BACKEND_IMAGE:-orangeserver-autonomy-dev}:"
+        "${OGS_DEV_AUTONOMY_BACKEND_TAG:-local}"
+    )
+    assert overlay.count("image: " + image) == 2
+    assert overlay.count("context: ../backend") == 2
+    assert overlay.count("pull_policy: never") == 2
+    assert "app.ai.autonomy.celery_entry:celery_app" in overlay
+    assert "--concurrency=1" in overlay
+    assert "inspect ping" in overlay
+    assert "../backend:/app" in overlay
+    assert overlay.count("condition: service_healthy") == 4
+    assert "docker-compose.dev-autonomy.yml" in makefile
+    assert "docker-dev-autonomy-up:" in makefile
+    assert "OGS_AI_AUTONOMY_ENABLED=true" in makefile
+    assert "-u OGS_AI_AUTONOMY_ENABLED" in makefile
+    assert "-u OGS_AI_AUTONOMY_REDIS_PASSWORD" in makefile
+    assert "[ -z \"$$password\" ]" in makefile
+    assert "make docker-dev-autonomy-ps" in makefile
+    assert "--build" in makefile
+
+
 def test_dev_env_is_generated_and_not_committed():
     makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
     gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
@@ -437,3 +485,5 @@ def test_dev_env_is_generated_and_not_committed():
     assert "up -d --wait --wait-timeout 180" in makefile
     assert ".env.dev" in gitignore
     assert "umask 077" in init_script
+    assert "OGS_AI_AUTONOMY_ENABLED=false" in init_script
+    assert "OGS_AI_AUTONOMY_REDIS_PASSWORD=$(random_hex 24)" in init_script

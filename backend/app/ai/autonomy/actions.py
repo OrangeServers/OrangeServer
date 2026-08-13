@@ -558,6 +558,8 @@ def verify_action_digest(
 def action_from_dict(data: Dict[str, Any]) -> StructuredAction:
     """从落库快照重建动作（审批复核用）。缺字段即视为篡改。"""
     try:
+        if int(data['action_version']) != ACTION_VERSION:
+            raise ActionValidationError('unsupported action snapshot version')
         return StructuredAction(
             kind=str(data['kind']),
             target_id=int(data['target_id']),

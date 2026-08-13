@@ -187,7 +187,6 @@ class RecoveryService:
                 'run_id': run.id,
                 'graph_version': str(run.graph_version or ''),
                 'owner': str(run.owner or ''),
-                'goal': sanitize_text(run.goal or '')[:120],
                 'phase': 'policy',
                 'loops': 0,
                 # 边界重建按单轮收敛：执行完已批准 Step 后 decide

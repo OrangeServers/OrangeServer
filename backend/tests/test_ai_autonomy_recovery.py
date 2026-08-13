@@ -17,6 +17,7 @@ import json
 import uuid
 
 import pytest
+from cryptography.fernet import Fernet
 from langgraph.checkpoint.memory import MemorySaver
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -29,6 +30,7 @@ from app.ai.autonomy.lease import RunLeaseService
 from app.ai.autonomy.repository import AutonomyRepository
 from app.core.db.database import (
     db,
+    t_ai_autonomous_artifact,
     t_ai_autonomous_event,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
@@ -75,7 +77,10 @@ class FakeHeartbeater:
 
 
 @pytest.fixture
-def env():
+def env(monkeypatch):
+    monkeypatch.setenv(
+        "OGS_FERNET_KEYS", Fernet.generate_key().decode("ascii"),
+    )
     engine = create_engine("sqlite:///:memory:")
     session_factory = sessionmaker(bind=engine)
     session = session_factory()
@@ -84,7 +89,8 @@ def env():
         tables=[t_group.__table__, t_host.__table__,
                 t_ai_autonomous_run.__table__,
                 t_ai_autonomous_step.__table__,
-                t_ai_autonomous_event.__table__],
+                t_ai_autonomous_event.__table__,
+                t_ai_autonomous_artifact.__table__],
     )
 
     repo = AutonomyRepository(

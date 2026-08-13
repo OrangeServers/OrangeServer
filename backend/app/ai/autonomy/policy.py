@@ -138,7 +138,10 @@ _PERMANENT_DENY_PATTERNS = (
     (re.compile(r'\brm\b[^\n]*--no-preserve-root'),
      'root filesystem deletion is permanently denied'),
     # rm 带任意旗标且目标是 / 或 /*：根目录宽范围删除。
-    (re.compile(r'\brm\s+(-[a-zA-Z]+\s+)+/\*?(\s|$)'),
+    (re.compile(
+        r'\brm\s+(?:-[a-zA-Z]+\s+)+(?:--\s+)?'
+        r'[\'\"]?/\*?[\'\"]?(?=\s|[;&|)]|$)'
+    ),
      'root filesystem deletion is permanently denied'),
     (re.compile(r'\bssh\s'), 'lateral SSH is permanently denied'),
     (re.compile(r'\b(scp|sftp)\s'),
@@ -177,7 +180,7 @@ def permanent_deny_reason(command: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Shell 命令风险特征：黑名单只提供风险信号，命中即不可自动
+# Shell 命令风险特征：只用于提高审批风险提示，绝不是安全证明
 # ---------------------------------------------------------------------------
 
 _SHELL_RISK_PATTERNS = (
@@ -195,9 +198,9 @@ _SHELL_RISK_PATTERNS = (
 def classify_shell_command(command: str) -> Tuple[ApprovalDecision, str]:
     """对任意 Shell 文本做风险分级。
 
-    shell 动作永远不可能自动执行；永久拒绝清单命中直接拒绝，
-    再把伪装写入、管道、重定向、解释器和下载命令标记为拒绝，
-    其余要求精确审批。
+    shell 动作永远不可能自动执行；永久拒绝清单命中直接拒绝。
+    管道、重定向、解释器、下载等只提供风险信号，仍必须绑定完整
+    动作摘要进行精确人工审批，不能把黑名单当成安全判定器。
     """
     text = str(command or '')
     if not text.strip():
@@ -207,7 +210,9 @@ def classify_shell_command(command: str) -> Tuple[ApprovalDecision, str]:
         return ApprovalDecision.DENIED, deny_reason
     for pattern, reason in _SHELL_RISK_PATTERNS:
         if pattern.search(text):
-            return ApprovalDecision.DENIED, reason
+            return ApprovalDecision.APPROVAL_REQUIRED, (
+                'high-risk shell requires exact approval: %s' % reason
+            )
     return ApprovalDecision.APPROVAL_REQUIRED, 'arbitrary shell requires exact approval'
 
 

@@ -15,7 +15,8 @@ from app.ai.autonomy.repository import (
     AutonomyRepository,
     AutonomyValidationError,
 )
-from app.ai.autonomy.state import AutonomyStateError
+from app.ai.autonomy.readiness import autonomy_readiness
+from app.ai.autonomy.state import AutonomyStateError, TERMINAL_RUN_STATUSES
 from app.core.config import AI_AUTONOMY_ENABLED, FLASK_SECRET_KEY
 from app.core.db.database import db
 from app.tools.apierr import ApiCode, api_error, api_response
@@ -71,10 +72,9 @@ def _handle(exc):
 
 
 def autonomy_status():
-    """GET /ai/autonomy/status：功能开关探测（不受 flag 阻断）。"""
-    return api_response(data={
-        'enabled': bool(AI_AUTONOMY_ENABLED),
-    }, enabled=bool(AI_AUTONOMY_ENABLED))
+    """GET /ai/autonomy/status：功能与基础设施状态（不受 flag 阻断）。"""
+    status = autonomy_readiness(enabled=bool(AI_AUTONOMY_ENABLED))
+    return api_response(data=status, enabled=status['enabled'])
 
 
 def _guarded(role):
@@ -126,6 +126,24 @@ def start_run(run_id):
     try:
         run = _repo().start_run(owner, role, run_id)
         _dispatch_drive(run_id)
+        return api_response(data=run, run=run)
+    except Exception as exc:
+        db.session.rollback()
+        return _handle(exc)
+
+
+def cancel_run(run_id):
+    """请求取消；Worker/执行器确认远端停止后才允许进入 cancelled。"""
+    _holder, owner, role = _identity()
+    blocked = _guarded(role)
+    if blocked:
+        return blocked
+    try:
+        run = _repo().request_cancel(owner, role, run_id)
+        if run.get('status') not in {
+            status.value for status in TERMINAL_RUN_STATUSES
+        }:
+            _dispatch_drive(run_id)
         return api_response(data=run, run=run)
     except Exception as exc:
         db.session.rollback()

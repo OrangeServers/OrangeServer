@@ -34,8 +34,8 @@ class AutonomyGraphError(Exception):
 class GraphCursor(TypedDict, total=False):
     """紧凑流程游标：进 checkpoint 的只有这些字段。
 
-    禁止包含凭据、完整命令、原始日志、完整提示词；goal 只进
-    截断后的短摘要。
+    禁止包含凭据、完整命令、原始日志、目标文本或完整提示词。
+    ``goal`` 只为读取未发布 v1 checkpoint 保留；新 Driver 不写入。
     """
 
     run_id: str

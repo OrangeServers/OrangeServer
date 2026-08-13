@@ -1,0 +1,192 @@
+# Disposable, exact-checkout M1/S2 integration smoke.
+#
+# This file is test-only. Use ops/smoke-ai-autonomy-s2.ps1 instead of invoking
+# Compose manually: the wrapper generates ephemeral credentials, extracts the
+# pinned v1.0.4 schema fixture, and always runs `down --volumes` by default.
+
+name: ${COMPOSE_PROJECT_NAME:-orangeserver_s2_smoke}
+
+x-smoke-environment: &smoke-environment
+  OGS_ENV: dev
+  OGS_DATA_DIR: /tmp/orangeserver-s2-smoke
+  OGS_FLASK_SECRET_KEY: ${OGS_S2_SMOKE_FLASK_SECRET:?smoke secret required}
+  OGS_FERNET_KEYS: ${OGS_S2_SMOKE_FERNET_KEY:?smoke Fernet key required}
+  OGS_MYSQL_HOST: mysql-fresh
+  OGS_MYSQL_PORT: 3306
+  OGS_MYSQL_DBNAME: orange
+  OGS_MYSQL_USER: smoke_app
+  OGS_MYSQL_PASSWORD: ${OGS_S2_SMOKE_MYSQL_PASSWORD:?smoke MySQL password required}
+  OGS_REDIS_HOST: business-redis
+  OGS_REDIS_PORT: 6379
+  OGS_REDIS_PASSWORD: ${OGS_S2_SMOKE_BUSINESS_REDIS_PASSWORD:?smoke business Redis password required}
+  OGS_AI_AUTONOMY_ENABLED: "true"
+  OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis
+  OGS_AI_AUTONOMY_REDIS_PORT: 6379
+  OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_S2_SMOKE_AUTONOMY_REDIS_PASSWORD:?smoke autonomy Redis password required}
+  OGS_AI_AUTONOMY_LEASE_TTL_SECONDS: 30
+
+services:
+  mysql-fresh:
+    image: ${OGS_S2_SMOKE_MYSQL_IMAGE:-mysql:8.0.42}
+    restart: "no"
+    networks: [smoke-internal]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${OGS_S2_SMOKE_MYSQL_ROOT_PASSWORD:?smoke MySQL root password required}
+      MYSQL_DATABASE: orange
+      MYSQL_USER: smoke_app
+      MYSQL_PASSWORD: ${OGS_S2_SMOKE_MYSQL_PASSWORD:?smoke MySQL password required}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      - --default-authentication-plugin=caching_sha2_password
+    volumes:
+      - smoke-mysql-fresh:/var/lib/mysql
+      - type: bind
+        source: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/backend/mysqldir/orange.sql
+        target: /docker-entrypoint-initdb.d/00-orange.sql
+        read_only: true
+    healthcheck:
+      test: ["CMD", "sh", "-c", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysqladmin ping -h 127.0.0.1 -u root --silent"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+      start_period: 10s
+
+  mysql-upgrade:
+    image: ${OGS_S2_SMOKE_MYSQL_IMAGE:-mysql:8.0.42}
+    restart: "no"
+    networks: [smoke-internal]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${OGS_S2_SMOKE_MYSQL_ROOT_PASSWORD:?smoke MySQL root password required}
+      MYSQL_DATABASE: orange
+      MYSQL_USER: smoke_app
+      MYSQL_PASSWORD: ${OGS_S2_SMOKE_MYSQL_PASSWORD:?smoke MySQL password required}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      - --default-authentication-plugin=caching_sha2_password
+    volumes:
+      - smoke-mysql-upgrade:/var/lib/mysql
+      - type: bind
+        source: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/.s2-smoke/v1.0.4-orange.sql
+        target: /docker-entrypoint-initdb.d/00-v1.0.4-orange.sql
+        read_only: true
+    healthcheck:
+      test: ["CMD", "sh", "-c", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysqladmin ping -h 127.0.0.1 -u root --silent"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+      start_period: 10s
+
+  business-redis:
+    image: ${OGS_S2_SMOKE_BUSINESS_REDIS_IMAGE:-redis:7.4-alpine}
+    restart: "no"
+    networks: [smoke-internal]
+    environment:
+      OGS_S2_SMOKE_REDIS_PASSWORD: ${OGS_S2_SMOKE_BUSINESS_REDIS_PASSWORD:?smoke business Redis password required}
+    command:
+      - sh
+      - -c
+      - >-
+        exec redis-server
+        --save ""
+        --appendonly no
+        --requirepass "$$OGS_S2_SMOKE_REDIS_PASSWORD"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "redis-cli --no-auth-warning -a \"$$OGS_S2_SMOKE_REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  autonomy-redis:
+    image: ${OGS_S2_SMOKE_AUTONOMY_REDIS_IMAGE:-redis:8.0-alpine}
+    restart: "no"
+    networks: [smoke-internal]
+    environment:
+      OGS_S2_SMOKE_REDIS_PASSWORD: ${OGS_S2_SMOKE_AUTONOMY_REDIS_PASSWORD:?smoke autonomy Redis password required}
+    command:
+      - sh
+      - -c
+      - >-
+        exec redis-server
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory-policy noeviction
+        --requirepass "$$OGS_S2_SMOKE_REDIS_PASSWORD"
+    volumes:
+      - smoke-autonomy-redis:/data
+    healthcheck:
+      test: ["CMD", "sh", "-c", "redis-cli --no-auth-warning -a \"$$OGS_S2_SMOKE_REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  autonomy-worker:
+    build:
+      context: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/backend
+      dockerfile: Dockerfile
+    image: ${OGS_S2_SMOKE_BACKEND_IMAGE:?exact-checkout smoke image required}
+    pull_policy: never
+    restart: "no"
+    working_dir: /app
+    networks: [smoke-internal]
+    environment: *smoke-environment
+    command:
+      - celery
+      - -A
+      - app.ai.autonomy.celery_entry:celery_app
+      - worker
+      - --loglevel=INFO
+      - --concurrency=1
+    depends_on:
+      mysql-fresh: {condition: service_healthy}
+      business-redis: {condition: service_healthy}
+      autonomy-redis: {condition: service_healthy}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          celery -A app.ai.autonomy.celery_entry:celery_app inspect ping
+          --destination "celery@$$HOSTNAME" --timeout 3 | grep -q pong
+      interval: 4s
+      timeout: 6s
+      retries: 45
+      start_period: 10s
+
+  smoke-runner:
+    build:
+      context: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/backend
+      dockerfile: Dockerfile
+    image: ${OGS_S2_SMOKE_BACKEND_IMAGE:?exact-checkout smoke image required}
+    pull_policy: never
+    restart: "no"
+    working_dir: /app
+    networks: [smoke-internal]
+    environment:
+      <<: *smoke-environment
+      OGS_S2_SMOKE_UPGRADE_MYSQL_HOST: mysql-upgrade
+      OGS_S2_SMOKE_GIT_HEAD: ${OGS_S2_SMOKE_GIT_HEAD:?reviewed Git HEAD required}
+    entrypoint: ["python", "/smoke/smoke-ai-autonomy-s2.py"]
+    volumes:
+      - type: bind
+        source: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/backend/mysqldir
+        target: /smoke/sql
+        read_only: true
+      - type: bind
+        source: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/ops/smoke-ai-autonomy-s2.py
+        target: /smoke/smoke-ai-autonomy-s2.py
+        read_only: true
+    depends_on:
+      mysql-fresh: {condition: service_healthy}
+      mysql-upgrade: {condition: service_healthy}
+      business-redis: {condition: service_healthy}
+      autonomy-redis: {condition: service_healthy}
+
+networks:
+  smoke-internal:
+    internal: true
+
+volumes:
+  smoke-mysql-fresh:
+  smoke-mysql-upgrade:
+  smoke-autonomy-redis:

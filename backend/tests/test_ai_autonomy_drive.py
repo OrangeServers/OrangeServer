@@ -6,8 +6,10 @@ MemorySaver 验证暂停/恢复语义（真实 Redis 8 上的 ShallowRedisSaver
 由 WP0 门槛脚本验证），心跳用替身，不碰真实线程与连接。
 """
 import datetime
+import json
 
 import pytest
+from cryptography.fernet import Fernet
 from langgraph.checkpoint.memory import MemorySaver
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -18,8 +20,10 @@ from app.ai.autonomy.executor import RunnerResult
 from app.ai.autonomy.lease import RunLeaseService
 from app.ai.autonomy.repository import AutonomyRepository
 from app.ai.autonomy.state import StepStatus
+from app.core import config
 from app.core.db.database import (
     db,
+    t_ai_autonomous_artifact,
     t_ai_autonomous_event,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
@@ -29,6 +33,17 @@ from app.core.db.database import (
 
 SECRET_KEY = "unit-test-secret-key-for-autonomy-drive"
 TTL = 300
+
+
+def test_checkpoint_url_uses_db0_and_encodes_password(monkeypatch):
+    monkeypatch.setattr(config, "AI_AUTONOMY_REDIS_HOST", "192.0.2.10")
+    monkeypatch.setattr(config, "AI_AUTONOMY_REDIS_PORT", 6390)
+    monkeypatch.setattr(
+        config, "AI_AUTONOMY_REDIS_PASSWORD", "fake@pass:/#% ?",
+    )
+    assert drive_mod.autonomy_checkpoint_url() == (
+        "redis://:fake%40pass%3A%2F%23%25%20%3F@192.0.2.10:6390/0"
+    )
 
 
 class FakePlatform:
@@ -52,6 +67,16 @@ class FakeRunner:
         return self.result
 
 
+class FakeExecutor:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def execute_step(self, owner, role, run_id, step_id, **kwargs):
+        self.calls.append((owner, role, run_id, step_id, kwargs))
+        return dict(self.result)
+
+
 class FakeHeartbeater:
     """替身心跳：记录 renew 调用；lost 可直接置位模拟租约被抢。"""
 
@@ -73,7 +98,10 @@ class FakeHeartbeater:
 
 
 @pytest.fixture
-def env():
+def env(monkeypatch):
+    monkeypatch.setenv(
+        "OGS_FERNET_KEYS", Fernet.generate_key().decode("ascii"),
+    )
     FakeHeartbeater.instances = []
     engine = create_engine("sqlite:///:memory:")
     session_factory = sessionmaker(bind=engine)
@@ -83,7 +111,8 @@ def env():
         tables=[t_group.__table__, t_host.__table__,
                 t_ai_autonomous_run.__table__,
                 t_ai_autonomous_step.__table__,
-                t_ai_autonomous_event.__table__],
+                t_ai_autonomous_event.__table__,
+                t_ai_autonomous_artifact.__table__],
     )
 
     platform_state = {"asset_ok": True}
@@ -221,6 +250,26 @@ def test_first_drive_pauses_at_approval(env):
     assert row.lease_expires_at is None
     types = [e.event_type for e in _events(env, run["id"])]
     assert "steps_waiting_approval" in types
+
+
+def test_checkpoint_does_not_store_the_run_goal(env):
+    secret_goal = "diagnose password=checkpoint-secret"
+    run = env["create_queued_run"](goal=secret_goal)
+    driver = env["make_driver"]()
+
+    assert driver.drive(run["id"], env["claim"](run["id"])) == (
+        drive_mod.RESULT_PAUSED
+    )
+
+    checkpoint = env["saver"].get_tuple({
+        "configurable": {
+            "thread_id": drive_mod.THREAD_ID_PREFIX + run["id"],
+        },
+    })
+    assert checkpoint is not None
+    serialized = json.dumps(checkpoint.checkpoint, sort_keys=True)
+    assert secret_goal not in serialized
+    assert "checkpoint-secret" not in serialized
 
 
 def test_second_drive_without_decision_stays_paused(env):
@@ -372,6 +421,37 @@ def test_cancel_before_start_confirms_cancelled(env):
     assert env["runner"].calls == []
 
 
+def test_cancel_request_cannot_overwrite_needs_attention(env):
+    run = env["create_queued_run"]()
+    row = _run_row(env, run["id"])
+    row.status = "needs_attention"
+    row.cancel_requested = True
+    env["session"].commit()
+    driver = env["make_driver"]()
+
+    result = driver.drive(run["id"], {"revision": int(row.revision)})
+
+    assert result == drive_mod.RESULT_NEEDS_ATTENTION
+    assert _run_row(env, run["id"]).status == "needs_attention"
+    assert env["runner"].calls == []
+
+
+def test_finalize_preserves_unknown_outcome_over_cancel(env):
+    run = env["create_queued_run"]()
+    row = _run_row(env, run["id"])
+    row.status = "needs_attention"
+    row.cancel_requested = True
+    env["session"].commit()
+    driver = env["make_driver"]()
+
+    result = driver._finalize(run["id"], {"decision": "cancelled"})
+
+    assert result == drive_mod.RESULT_NEEDS_ATTENTION
+    row = _run_row(env, run["id"])
+    assert row.status == "needs_attention"
+    assert row.completed_at is None
+
+
 def test_terminal_run_is_skipped(env):
     run = env["create_queued_run"]()
     driver = env["make_driver"]()
@@ -426,6 +506,74 @@ def test_loop_budget_exhausted_marks_failed(env):
     assert row.status == "failed"
     types = [e.event_type for e in _events(env, run["id"])]
     assert "budget_exhausted" in types
+
+
+def test_duration_budget_exhausted_before_side_effects(env):
+    run = env["create_queued_run"]()
+    row = _run_row(env, run["id"])
+    row.started_at = (
+        drive_mod._utcnow() - datetime.timedelta(seconds=3601)
+    )
+    env["session"].commit()
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_FAILED
+    assert _run_row(env, run["id"]).status == "failed"
+    assert env["runner"].calls == []
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "budget_exhausted" in types
+
+
+def test_remaining_duration_caps_command_timeout(env):
+    run = env["create_queued_run"]()
+    row = _run_row(env, run["id"])
+    row.started_at = (
+        drive_mod._utcnow() - datetime.timedelta(seconds=3590)
+    )
+    env["session"].commit()
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+    assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
+
+    result = _approve_and_drive(env, driver, run["id"], "approve")
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    timeout = env["runner"].calls[0]["timeout_seconds"]
+    assert 1 <= timeout <= 10
+
+
+def test_lease_loss_during_remote_execution_aborts_graph(env):
+    run = env["create_queued_run"]()
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+    assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
+    row = _run_row(env, run["id"])
+    step = _pending_step(env, run["id"])
+    env["repo"].decide(
+        "admin", "admin", run["id"], step.id,
+        operation="approve", expected_revision=int(row.revision),
+    )
+    fake_executor = FakeExecutor({
+        "step_status": "running",
+        "run_status": "running",
+        "revision": int(_run_row(env, run["id"]).revision),
+        "termination": "lease_lost",
+    })
+    driver.executor = fake_executor
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_LEASE_LOST
+    assert len(fake_executor.calls) == 1
+    call_kwargs = fake_executor.calls[0][4]
+    assert call_kwargs["lease_owner"] == "driver-test-worker"
+    assert callable(call_kwargs["control_probe"])
+    assert _run_row(env, run["id"]).status == "running"
 
 
 def test_heartbeat_started_and_stopped(env):

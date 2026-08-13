@@ -59,6 +59,19 @@ PREPARE stmt FROM @sql;
 EXECUTE stmt;
 DEALLOCATE PREPARE stmt;
 
+SET @col_exists := (
+    SELECT COUNT(*) FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 't_ai_autonomous_run'
+      AND COLUMN_NAME = 'active_host_id'
+);
+SET @sql := IF(@col_exists = 0,
+    'ALTER TABLE `t_ai_autonomous_run` ADD COLUMN `active_host_id` INT GENERATED ALWAYS AS (CASE WHEN `status` IN (''completed'', ''failed'', ''cancelled'', ''expired'') THEN NULL ELSE `host_id` END) STORED',
+    'SELECT "active_host_id exists" AS info');
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
 SET @idx_exists := (
     SELECT COUNT(*) FROM information_schema.STATISTICS
     WHERE TABLE_SCHEMA = DATABASE()
@@ -68,6 +81,29 @@ SET @idx_exists := (
 SET @sql := IF(@idx_exists = 0,
     'ALTER TABLE `t_ai_autonomous_run` ADD KEY `idx_ai_auto_run_lease_expires` (`lease_expires_at`)',
     'SELECT "idx_ai_auto_run_lease_expires exists" AS info');
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+-- Adding the unique key intentionally fails closed if an experimental
+-- database already contains more than one active Run for the same host.
+-- Operators must inspect and reconcile those Runs; this migration never
+-- chooses a winner or deletes durable state automatically.
+SELECT `host_id`, COUNT(*) AS `active_run_count`
+FROM `t_ai_autonomous_run`
+WHERE `active_host_id` IS NOT NULL
+GROUP BY `host_id`
+HAVING COUNT(*) > 1;
+
+SET @idx_exists := (
+    SELECT COUNT(*) FROM information_schema.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 't_ai_autonomous_run'
+      AND INDEX_NAME = 'uq_ai_auto_run_active_host'
+);
+SET @sql := IF(@idx_exists = 0,
+    'ALTER TABLE `t_ai_autonomous_run` ADD UNIQUE KEY `uq_ai_auto_run_active_host` (`active_host_id`)',
+    'SELECT "uq_ai_auto_run_active_host exists" AS info');
 PREPARE stmt FROM @sql;
 EXECUTE stmt;
 DEALLOCATE PREPARE stmt;

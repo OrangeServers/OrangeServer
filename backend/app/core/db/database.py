@@ -1,5 +1,6 @@
 from datetime import datetime
 
+from sqlalchemy import Computed
 from sqlalchemy.dialects.mysql import LONGTEXT
 
 from app.core.db.settings import db
@@ -569,6 +570,11 @@ class t_ai_autonomous_run(db.Model, TimestampMixin):
     审批决策必须携带当前 revision；budget/目标/凭据引用创建后不可变。"""
 
     __tablename__ = 't_ai_autonomous_run'
+    __table_args__ = (
+        db.UniqueConstraint(
+            'active_host_id', name='uq_ai_auto_run_active_host',
+        ),
+    )
     id = db.Column(db.String(32), primary_key=True)
     owner = db.Column(db.String(24), nullable=False, index=True)
     goal = db.Column(db.String(512), nullable=False)
@@ -595,6 +601,20 @@ class t_ai_autonomous_run(db.Model, TimestampMixin):
     graph_version = db.Column(
         db.String(32), nullable=False,
         default='v1', server_default='v1',
+    )
+    # M1/S2: MySQL 不支持带 WHERE 的部分唯一索引；把活动态映射为
+    # host_id、终态映射为 NULL，再利用 UNIQUE 允许多个 NULL 的语义，
+    # 在数据库层封住“同一资产最多一个活动 Run”的并发竞态。
+    # 未知/未来状态默认走 ELSE，按活动态 fail-closed。
+    active_host_id = db.Column(
+        db.INTEGER,
+        Computed(
+            "CASE WHEN status IN "
+            "('completed', 'failed', 'cancelled', 'expired') "
+            "THEN NULL ELSE host_id END",
+            persisted=True,
+        ),
+        nullable=True,
     )
     started_at = db.Column(db.DateTime, nullable=True)
     completed_at = db.Column(db.DateTime, nullable=True)

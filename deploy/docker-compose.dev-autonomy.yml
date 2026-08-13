@@ -1,0 +1,105 @@
+# =============================================================================
+# OrangeServer M1 autonomy development overlay
+# =============================================================================
+# Compose together with docker-compose.dev.yml. The public feature flag stays
+# disabled unless the operator explicitly sets OGS_AI_AUTONOMY_ENABLED=true in
+# .env.dev and starts the autonomy profile through the Makefile target.
+
+services:
+  autonomy-redis:
+    image: ${OGS_AUTONOMY_REDIS_IMAGE:-redis:8.0-alpine}
+    restart: unless-stopped
+    networks:
+      - dev-internal
+    environment:
+      OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_AI_AUTONOMY_REDIS_PASSWORD:?Set OGS_AI_AUTONOMY_REDIS_PASSWORD in .env.dev}
+    command:
+      - sh
+      - -c
+      - >-
+        exec redis-server
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory-policy noeviction
+        --requirepass "$$OGS_AI_AUTONOMY_REDIS_PASSWORD"
+    volumes:
+      - dev-autonomy-redis-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - sh
+        - -c
+        - >-
+          redis-cli -a "$$OGS_AI_AUTONOMY_REDIS_PASSWORD"
+          ping | grep -q PONG
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    image: ${OGS_DEV_AUTONOMY_BACKEND_IMAGE:-orangeserver-autonomy-dev}:${OGS_DEV_AUTONOMY_BACKEND_TAG:-local}
+    pull_policy: never
+    environment:
+      OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-false}
+      OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis
+      OGS_AI_AUTONOMY_REDIS_PORT: 6379
+      OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_AI_AUTONOMY_REDIS_PASSWORD:?Set OGS_AI_AUTONOMY_REDIS_PASSWORD in .env.dev}
+    depends_on:
+      autonomy-redis:
+        condition: service_healthy
+
+  autonomy-worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    image: ${OGS_DEV_AUTONOMY_BACKEND_IMAGE:-orangeserver-autonomy-dev}:${OGS_DEV_AUTONOMY_BACKEND_TAG:-local}
+    pull_policy: never
+    restart: unless-stopped
+    working_dir: /app
+    networks:
+      - dev-internal
+    env_file:
+      - ../.env.dev
+    environment:
+      OGS_ENV: dev
+      OGS_MYSQL_HOST: mysql
+      OGS_MYSQL_PORT: 3306
+      OGS_REDIS_HOST: redis
+      OGS_REDIS_PORT: 6379
+      OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-false}
+      OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis
+      OGS_AI_AUTONOMY_REDIS_PORT: 6379
+      OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_AI_AUTONOMY_REDIS_PASSWORD:?Set OGS_AI_AUTONOMY_REDIS_PASSWORD in .env.dev}
+    command:
+      - celery
+      - -A
+      - app.ai.autonomy.celery_entry:celery_app
+      - worker
+      - --loglevel=INFO
+      - --concurrency=1
+    volumes:
+      - ../backend:/app
+      - dev-backend-data:/app/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      autonomy-redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          celery -A app.ai.autonomy.celery_entry:celery_app inspect ping
+          --destination "celery@$$HOSTNAME" --timeout 2 | grep -q pong
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  dev-autonomy-redis-data:

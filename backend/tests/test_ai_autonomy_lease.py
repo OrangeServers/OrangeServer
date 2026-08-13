@@ -200,51 +200,65 @@ def test_claim_rejects_non_queued_or_unknown_run(lease_env):
 
 
 # ---------------------------------------------------------------------------
-# 心跳 / 释放：revision 守卫挡住陈旧 Worker
+# 心跳 / 释放：lease owner 隔离，不与业务 revision 相互干扰
 # ---------------------------------------------------------------------------
 
-def test_heartbeat_refreshes_lease_and_bumps_revision(lease_env):
+def test_heartbeat_refreshes_lease_without_bumping_business_revision(lease_env):
     run = lease_env["create_queued_run"]()
     claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
     renewed = lease_env["lease"].heartbeat(
-        run["id"], "worker-a", claimed["revision"], TTL,
+        run["id"], "worker-a", TTL,
+    )
+    assert renewed is not None
+    assert renewed["revision"] == claimed["revision"]
+
+
+def test_heartbeat_survives_unrelated_business_revision_change(lease_env):
+    """审批/取消等业务 revision 变化不能误杀仍持有租约的 Worker。"""
+    run = lease_env["create_queued_run"]()
+    claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
+    row = _row(lease_env["session"], run["id"])
+    row.revision += 1
+    row.cancel_requested = True
+    lease_env["session"].commit()
+    renewed = lease_env["lease"].heartbeat(
+        run["id"], "worker-a", TTL,
     )
     assert renewed is not None
     assert renewed["revision"] == claimed["revision"] + 1
-
-
-def test_heartbeat_with_stale_revision_is_rejected(lease_env):
-    """持有旧 revision 的陈旧 Worker 无法续租。"""
-    run = lease_env["create_queued_run"]()
-    claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
-    lease_env["lease"].heartbeat(
-        run["id"], "worker-a", claimed["revision"], TTL,
-    )
-    stale = lease_env["lease"].heartbeat(
-        run["id"], "worker-a", claimed["revision"], TTL,
-    )
-    assert stale is None
 
 
 def test_heartbeat_by_non_owner_is_rejected(lease_env):
     run = lease_env["create_queued_run"]()
     claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
     assert lease_env["lease"].heartbeat(
-        run["id"], "worker-b", claimed["revision"], TTL,
+        run["id"], "worker-b", TTL,
     ) is None
 
 
-def test_release_clears_lease_only_for_owner_with_current_revision(lease_env):
+def test_expired_owner_cannot_revive_or_release_lease(lease_env):
+    run = lease_env["create_queued_run"]()
+    now = datetime.datetime.utcnow()
+    lease_env["lease"].claim_run(
+        run["id"], "worker-a", TTL, now=now,
+    )
+    expired = now + datetime.timedelta(seconds=TTL + 1)
+    assert lease_env["lease"].heartbeat(
+        run["id"], "worker-a", TTL, now=expired,
+    ) is None
+    assert lease_env["lease"].release_lease(
+        run["id"], "worker-a", now=expired,
+    ) is None
+
+
+def test_release_clears_lease_only_for_current_owner(lease_env):
     run = lease_env["create_queued_run"]()
     claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
     assert lease_env["lease"].release_lease(
-        run["id"], "worker-b", claimed["revision"],
-    ) is None
-    assert lease_env["lease"].release_lease(
-        run["id"], "worker-a", claimed["revision"] - 1,
+        run["id"], "worker-b",
     ) is None
     released = lease_env["lease"].release_lease(
-        run["id"], "worker-a", claimed["revision"],
+        run["id"], "worker-a",
     )
     assert released is not None
     row = _row(lease_env["session"], run["id"])
