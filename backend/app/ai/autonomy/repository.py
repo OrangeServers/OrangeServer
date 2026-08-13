@@ -654,6 +654,97 @@ class AutonomyRepository:
         return run
 
     # ------------------------------------------------------------------
+    # 权威读取器：Event / Artifact（S3 切片 5）
+    #
+    # MySQL 快照是唯一权威来源；这些读取器只做 owner 隔离与脱敏
+    # 边界复核，绝不改写任何状态（SSE 轮询依赖其纯读语义）。
+    # ------------------------------------------------------------------
+
+    MAX_EVENT_BATCH = 500
+
+    @staticmethod
+    def _event_to_dict(row) -> Dict[str, Any]:
+        try:
+            payload = json.loads(row.payload_json or '{}')
+        except ValueError:
+            payload = {}
+        return {
+            'sequence': int(row.sequence),
+            'event_type': row.event_type,
+            'payload': payload,
+            'created_at': row.created_at,
+        }
+
+    def list_events(
+        self,
+        owner: str,
+        run_id: str,
+        after_seq: int = 0,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """按单调递增 sequence 回放 after_seq 之后的事件（不含 after_seq）。"""
+        from app.core.db.database import t_ai_autonomous_event
+
+        self._get_run_row(owner, run_id)
+        batch = max(1, min(int(limit or self.MAX_EVENT_BATCH), self.MAX_EVENT_BATCH))
+        rows = self.session.query(t_ai_autonomous_event).filter(
+            t_ai_autonomous_event.run_id == run_id,
+            t_ai_autonomous_event.sequence > int(after_seq),
+        ).order_by(
+            t_ai_autonomous_event.sequence.asc(),
+        ).limit(batch).all()
+        return [self._event_to_dict(row) for row in rows]
+
+    @staticmethod
+    def _artifact_meta(row) -> Dict[str, Any]:
+        return {
+            'id': row.id,
+            'run_id': row.run_id,
+            'step_id': row.step_id,
+            'kind': row.kind,
+            'title': row.title,
+            'size_bytes': int(row.size_bytes or 0),
+            'truncated': bool(row.truncated),
+            'expired': bool(
+                row.expires_at is not None and row.expires_at < _utcnow()
+            ),
+            'created_at': row.created_at,
+        }
+
+    def list_artifacts(self, owner: str, run_id: str) -> List[Dict[str, Any]]:
+        """只返回 Artifact 元数据；正文必须走 get_artifact 单条读取。"""
+        from app.core.db.database import t_ai_autonomous_artifact
+
+        self._get_run_row(owner, run_id)
+        rows = self.session.query(t_ai_autonomous_artifact).filter_by(
+            run_id=run_id,
+        ).order_by(t_ai_autonomous_artifact.created_at.asc()).all()
+        return [self._artifact_meta(row) for row in rows]
+
+    def get_artifact(
+        self, owner: str, run_id: str, artifact_id: str,
+    ) -> Dict[str, Any]:
+        """解密读取单个 Artifact 正文。
+
+        跨 Run 的 artifact_id 与已过保留期的 Artifact 一律 Not Found，
+        不泄露其他 Run 内 Artifact 的存在性。
+        """
+        from app.core.db.database import t_ai_autonomous_artifact
+        from app.tools.basesec import decrypt_secret
+
+        self._get_run_row(owner, run_id)
+        row = self.session.query(t_ai_autonomous_artifact).filter_by(
+            id=artifact_id, run_id=run_id,
+        ).first()
+        if row is None:
+            raise AutonomyNotFound('artifact not found')
+        if row.expires_at is not None and row.expires_at < _utcnow():
+            raise AutonomyNotFound('artifact expired')
+        meta = self._artifact_meta(row)
+        meta['content'] = decrypt_secret(row.content_ciphertext)
+        return meta
+
+    # ------------------------------------------------------------------
     # Step 提议（服务端自有探针）
     # ------------------------------------------------------------------
 

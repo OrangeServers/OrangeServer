@@ -54,6 +54,27 @@ def register_autonomy_routes(app: Any) -> None:
         _secure(views.decide_step, *admins), methods=["POST"],
     )
     app.add_url_rule(
+        "/ai/autonomous-runs/<string:run_id>/artifacts",
+        "ai_autonomy_artifact_list",
+        _secure(views.list_artifacts, *admins), methods=["GET"],
+    )
+    app.add_url_rule(
+        "/ai/autonomous-runs/<string:run_id>/artifacts/"
+        "<string:artifact_id>",
+        "ai_autonomy_artifact_detail",
+        _secure(views.artifact_content, *admins), methods=["GET"],
+    )
+    app.add_url_rule(
+        "/ai/autonomous-runs/<string:run_id>/evidence",
+        "ai_autonomy_evidence_list",
+        _secure(views.list_evidence, *admins), methods=["GET"],
+    )
+    app.add_url_rule(
+        "/ai/autonomous-runs/<string:run_id>/stream",
+        "ai_autonomy_run_stream",
+        _secure(views.stream_run, *admins), methods=["GET"],
+    )
+    app.add_url_rule(
         "/ai/autonomy/hosts/<int:host_id>/environment",
         "ai_autonomy_host_environment",
         _secure(views.set_host_environment, *admins), methods=["POST"],

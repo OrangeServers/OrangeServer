@@ -1719,3 +1719,125 @@ def test_conclude_run_first_conclusion_wins(repo_env):
 
     run_row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
     assert run_row.outcome == "not_resolved"
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 5：权威读取器（Event 回放 / Artifact owner 隔离）
+# ---------------------------------------------------------------------------
+
+def test_list_events_replays_monotonic_sequence_from_cursor(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    # create/start/probe 自然产生至少三条单调递增事件。
+    repo.propose_probe("admin", "admin", run["id"], "system.load")
+
+    full = repo.list_events("admin", run["id"])
+    sequences = [item["sequence"] for item in full]
+    assert sequences == sorted(sequences)
+    assert sequences[0] == 1
+    assert [item["event_type"] for item in full][:2] == [
+        "run_created", "run_started",
+    ]
+    assert all("password" not in json.dumps(item["payload"]) for item in full)
+
+    # after_seq 是严格游标：不含自身，之后的事件按序回放。
+    cursor = sequences[0]
+    tail = repo.list_events("admin", run["id"], after_seq=cursor)
+    assert [item["sequence"] for item in tail] == sequences[1:]
+
+    # 超出最新游标回放为空，重连不重复业务转换。
+    assert repo.list_events(
+        "admin", run["id"], after_seq=sequences[-1],
+    ) == []
+
+
+def test_list_events_enforces_owner_isolation(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+
+    with pytest.raises(AutonomyNotFound):
+        repo.list_events("intruder", run["id"])
+
+
+def test_list_artifacts_returns_metadata_without_content(
+    repo_env, monkeypatch,
+):
+    from app.tools import basesec
+
+    monkeypatch.setattr(
+        basesec, "encrypt_secret", lambda text: "enc:%s" % text,
+    )
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    created = repo.create_artifact(
+        "admin", run["id"],
+        kind="step_output", title="probe output", content="load 0.1",
+    )
+
+    items = repo.list_artifacts("admin", run["id"])
+    assert [item["id"] for item in items] == [created["id"]]
+    item = items[0]
+    assert item["kind"] == "step_output"
+    assert item["title"] == "probe output"
+    assert item["expired"] is False
+    # 列表只给元数据，正文必须走单条读取。
+    assert "content" not in item
+
+    with pytest.raises(AutonomyNotFound):
+        repo.list_artifacts("intruder", run["id"])
+
+
+def test_get_artifact_decrypts_content_and_enforces_boundaries(
+    repo_env, monkeypatch,
+):
+    from app.tools import basesec
+
+    monkeypatch.setattr(
+        basesec, "encrypt_secret", lambda text: "enc:%s" % text,
+    )
+    monkeypatch.setattr(
+        basesec, "decrypt_secret", lambda stored: str(stored)[4:],
+    )
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    created = repo.create_artifact(
+        "admin", run["id"],
+        kind="step_output", title="probe output", content="load 0.1",
+    )
+
+    artifact = repo.get_artifact("admin", run["id"], created["id"])
+    assert artifact["content"] == "load 0.1"
+    assert artifact["truncated"] is False
+
+    # 虚构 ID、跨 owner 一律 Not Found，不泄露存在性。
+    with pytest.raises(AutonomyNotFound, match="artifact"):
+        repo.get_artifact("admin", run["id"], "deadbeef" * 4)
+    with pytest.raises(AutonomyNotFound):
+        repo.get_artifact("intruder", run["id"], created["id"])
+
+
+def test_get_artifact_refuses_expired_content(repo_env, monkeypatch):
+    from app.tools import basesec
+
+    monkeypatch.setattr(
+        basesec, "encrypt_secret", lambda text: "enc:%s" % text,
+    )
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    created = repo.create_artifact(
+        "admin", run["id"],
+        kind="step_output", title="probe output", content="load 0.1",
+    )
+    # 模拟保留期已过：过期正文绝不再对外可读。
+    repo_env["session"].query(t_ai_autonomous_artifact).filter_by(
+        id=created["id"],
+    ).update(
+        {"expires_at": datetime.datetime.utcnow()
+         - datetime.timedelta(days=1)},
+    )
+    repo_env["session"].commit()
+
+    listed = repo.list_artifacts("admin", run["id"])
+    assert listed[0]["expired"] is True
+    with pytest.raises(AutonomyNotFound, match="expired"):
+        repo.get_artifact("admin", run["id"], created["id"])
