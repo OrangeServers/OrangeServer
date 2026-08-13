@@ -26,7 +26,8 @@ async function responseError(response: Response): Promise<Error> {
   return error
 }
 
-function parseEventBlock(block: string): AiSseEvent | null {
+/** 解析单个 SSE 帧块（id:/event:/data:）；供 POST 与 GET SSE 消费共用。 */
+export function parseEventBlock(block: string): AiSseEvent | null {
   let eventType = ''
   let eventId = ''
   const dataLines: string[] = []

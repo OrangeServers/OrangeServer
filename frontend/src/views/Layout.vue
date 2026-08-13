@@ -72,6 +72,10 @@
           <el-menu-item index="/ai-agent" v-if="isAdmin || isUser" @click="$router.push('/ai-agent')">
             <el-icon><Cpu /></el-icon><span>{{ $t('menu.aiAgent') }}</span>
           </el-menu-item>
+          <!-- 自治任务：v1 后端 admin-only，菜单同样只对管理员可见 -->
+          <el-menu-item index="/ai-runs" v-if="isAdmin" @click="$router.push('/ai-runs')">
+            <el-icon><Stopwatch /></el-icon><span>{{ $t('menu.aiRuns') }}</span>
+          </el-menu-item>
 
           <!-- 审计 -->
           <div v-show="!collapsed && (isAdmin || isAudit)" class="sidebar-section">{{ $t('menu.group.audit') }}</div>
@@ -184,7 +188,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
   Fold, Expand, ArrowDown, User, SwitchButton,
-  MagicStick, Sunny, Moon, Promotion, Cpu,
+  MagicStick, Sunny, Moon, Promotion, Cpu, Stopwatch,
 } from '@element-plus/icons-vue'
 import { store, loadUserInfo, loadUserRole, loadSettings, applyTheme, clearAuthState } from '@/store'
 import { t } from '@/i18n'

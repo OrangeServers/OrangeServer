@@ -9,6 +9,7 @@ import assets from './assets'
 import users from './users'
 import ops from './ops'
 import ai from './ai'
+import aiRuns from './aiRuns'
 import cron from './cron'
 import fileTransfer from './fileTransfer'
 import ssh from './ssh'
@@ -28,6 +29,7 @@ export default {
   users,
   ops,
   ai,
+  aiRuns,
   cron,
   fileTransfer,
   ssh,

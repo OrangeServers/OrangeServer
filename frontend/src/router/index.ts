@@ -77,6 +77,18 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/AIAgent.vue'),
         meta: { titleKey: 'menu.aiAgent' },
       },
+      {
+        path: 'ai-runs',
+        name: 'AiRuns',
+        component: () => import('@/views/AiRuns.vue'),
+        meta: { titleKey: 'menu.aiRuns' },
+      },
+      {
+        path: 'ai-runs/:runId',
+        name: 'AiRunDetail',
+        component: () => import('@/views/AiRunDetail.vue'),
+        meta: { titleKey: 'menu.aiRuns' },
+      },
       { path: 'authority', name: 'Authority', component: () => import('@/views/Authority.vue'), meta: { titleKey: 'menu.authority' } },
       { path: 'cron', name: 'Cron', component: () => import('@/views/Cron.vue'), meta: { titleKey: 'menu.cron' } },
       { path: 'file', name: 'FileTransfer', component: () => import('@/views/FileTransfer.vue'), meta: { titleKey: 'menu.fileTransfer' } },
@@ -95,11 +107,16 @@ const router: Router = createRouter({
 })
 
 // 需要 admin 角色的路由
-const adminRoutes: readonly string[] = ['/authority', '/settings', '/user-list', '/user-group', '/sys-user', '/batch-script']
+const adminRoutes: readonly string[] = ['/authority', '/settings', '/user-list', '/user-group', '/sys-user', '/batch-script', '/ai-runs']
 // 需要 admin 或 audit 角色的路由
 const auditRoutes: readonly string[] = ['/log-login', '/log-exec', '/log-op']
 // 需要 admin 或 user 角色的运维路由
 const operatorRoutes: readonly string[] = ['/ai-agent', '/batch-command']
+
+// 守卫匹配：精确命中或子路径命中（/ai-runs/:runId 这类参数路由按路由族前缀匹配）
+function matchesGuard(routes: readonly string[], path: string): boolean {
+  return routes.some((route) => path === route || path.startsWith(`${route}/`))
+}
 
 // 全局前置守卫：未登录跳转 + 角色权限检查
 router.beforeEach(async (to: RouteLocationNormalized, _from: RouteLocationNormalized, next: NavigationGuardNext) => {
@@ -116,9 +133,9 @@ router.beforeEach(async (to: RouteLocationNormalized, _from: RouteLocationNormal
     const devUser = new URLSearchParams(window.location.search).get('dev_login')
     const devRole = devUser === 'admin' ? 'admin' : devUser === 'user' ? 'user' : ''
     if (devRole) {
-      if (adminRoutes.includes(to.path) && devRole !== 'admin') return next('/dashboard')
-      if (auditRoutes.includes(to.path) && devRole !== 'admin') return next('/dashboard')
-      if (operatorRoutes.includes(to.path) && !['admin', 'user'].includes(devRole)) return next('/dashboard')
+      if (matchesGuard(adminRoutes, to.path) && devRole !== 'admin') return next('/dashboard')
+      if (matchesGuard(auditRoutes, to.path) && devRole !== 'admin') return next('/dashboard')
+      if (matchesGuard(operatorRoutes, to.path) && !['admin', 'user'].includes(devRole)) return next('/dashboard')
       return next()
     }
   }
@@ -161,23 +178,23 @@ router.beforeEach(async (to: RouteLocationNormalized, _from: RouteLocationNormal
     // P0-8: role 为 null（加载失败）或 ''（未加载）都按未知处理
     // 未知角色禁止访问 admin/audit/operator 页 → 走 /login 重新认证
     if (!role) {
-      if (adminRoutes.includes(to.path) || auditRoutes.includes(to.path) || operatorRoutes.includes(to.path)) {
+      if (matchesGuard(adminRoutes, to.path) || matchesGuard(auditRoutes, to.path) || matchesGuard(operatorRoutes, to.path)) {
         return next('/login')
       }
       return next()
     }
-    if (adminRoutes.includes(to.path) && role !== 'admin') {
+    if (matchesGuard(adminRoutes, to.path) && role !== 'admin') {
       return next('/dashboard')
     }
-    if (auditRoutes.includes(to.path) && !['admin', 'audit'].includes(role)) {
+    if (matchesGuard(auditRoutes, to.path) && !['admin', 'audit'].includes(role)) {
       return next('/dashboard')
     }
-    if (operatorRoutes.includes(to.path) && !['admin', 'user'].includes(role)) {
+    if (matchesGuard(operatorRoutes, to.path) && !['admin', 'user'].includes(role)) {
       return next('/dashboard')
     }
   } catch (e) {
     // 角色加载函数本身抛异常（极端情况）→ 未知处理
-    if (adminRoutes.includes(to.path) || auditRoutes.includes(to.path) || operatorRoutes.includes(to.path)) {
+    if (matchesGuard(adminRoutes, to.path) || matchesGuard(auditRoutes, to.path) || matchesGuard(operatorRoutes, to.path)) {
       return next('/login')
     }
   }
