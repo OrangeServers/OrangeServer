@@ -300,7 +300,8 @@ def test_s2_smoke_proves_feature_off_without_autonomy_dependencies():
 
     assert 'def feature_off_isolation():' in probe
     assert "client.get('/local/health')" in probe
-    assert "client.get('/local/captcha/get')" in probe
+    assert "client.post('/local/captcha/get')" in probe
+    assert "client.get('/local/captcha/get')" not in probe
     assert "client.post('/account/login_dl2'" in probe
     assert "client.get('/ai/diagnostic-profiles')" in probe
     assert "client.get('/server/host/list_all')" in probe

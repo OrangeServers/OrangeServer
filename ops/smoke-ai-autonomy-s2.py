@@ -479,7 +479,7 @@ def feature_off_isolation():
         # This proves business Redis, MySQL and the normal session/CSRF
         # boundaries remain usable while the separate autonomy dependencies
         # are absent.
-        captcha = client.get('/local/captcha/get')
+        captcha = client.post('/local/captcha/get')
         require(
             captcha.status_code == 200,
             'feature-off captcha request failed',
