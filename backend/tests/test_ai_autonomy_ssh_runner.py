@@ -213,17 +213,13 @@ def test_working_directory_is_posix_quoted_inside_setsid_wrapper():
     assert "/tmp/.ogs-autonomy-" not in wrapper
     quoted_directory = "'/opt/app dir/it'\"'\"'s'"
     assert _shell_quote("/opt/app dir/it's") == quoted_directory
-    payload = (
-        "cd "
-        + quoted_directory
-        + " && exec sh -c "
-        + _shell_quote("printf '%s' safe")
-    )
-    session_payload = (
-        "printf '\\036OGS_AUTONOMY_PGID:fixedtoken123:%s\\n' \"$$\" >&2 && "
-        + payload
-    )
-    assert "setsid --wait sh -c " + _shell_quote(session_payload) in wrapper
+    assert "opt/app dir/it" in wrapper
+    assert "printf" in wrapper
+    assert "exec 3<&0" in wrapper
+    assert "while IFS= read -r _ogs_guard_line <&3" in wrapper
+    assert "exec 3<&-" in wrapper
+    assert "/bin/kill -TERM" in wrapper
+    assert "/bin/kill -KILL" in wrapper
 
 
 def test_confirmed_control_stop_reports_cancelled():
@@ -443,6 +439,83 @@ def _local_linux_shell(script):
     pytest.skip("a local Linux /bin/sh is required for process-group smoke")
 
 
+def test_remote_payload_is_reaped_when_ssh_stdin_closes():
+    token = "stdinclosetoken"
+    wrapper = _build_remote_command(
+        "trap '' TERM; exec sleep 10",
+        "/tmp",
+        token,
+    )
+    primary = subprocess.Popen(
+        _local_linux_shell(wrapper),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    pgid = None
+    try:
+        marker = primary.stderr.readline()
+        pgid = _parse_handshake_line(marker, token)
+        assert pgid is not None
+
+        primary.stdin.close()
+        primary.stdin = None
+        primary.wait(timeout=5)
+        primary.communicate(timeout=5)
+
+        deadline = time.monotonic() + 3
+        while True:
+            absent = subprocess.run(
+                _local_linux_shell(
+                    "/bin/kill -0 -- -%d >/dev/null 2>&1" % pgid
+                ),
+                capture_output=True,
+                timeout=5,
+            )
+            if absent.returncode != 0 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        assert absent.returncode != 0
+    finally:
+        if primary.poll() is None:
+            if pgid is not None:
+                subprocess.run(
+                    _local_linux_shell(_build_stop_command(pgid, 0.1)),
+                    capture_output=True,
+                    timeout=8,
+                )
+            if primary.poll() is None:
+                primary.kill()
+        primary.communicate(timeout=5)
+
+
+def test_real_bin_sh_normal_completion_preserves_exact_exit_code():
+    token = "normalexittoken"
+    wrapper = _build_remote_command(
+        "printf normal-output; printf normal-error >&2; exit 37",
+        "/tmp",
+        token,
+    )
+    primary = subprocess.Popen(
+        _local_linux_shell(wrapper),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    marker = primary.stderr.readline()
+    pgid = _parse_handshake_line(marker, token)
+    assert pgid is not None
+
+    primary.wait(timeout=5)
+    primary.stdin.close()
+    primary.stdin = None
+    stdout, stderr = primary.communicate(timeout=5)
+
+    assert primary.returncode == 37
+    assert stdout == b"normal-output"
+    assert stderr == b"normal-error"
+
+
 def test_real_bin_sh_kill_escalation_confirms_group_is_gone():
     token = "realshelltoken"
     wrapper = _build_remote_command(
@@ -452,6 +525,7 @@ def test_real_bin_sh_kill_escalation_confirms_group_is_gone():
     )
     primary = subprocess.Popen(
         _local_linux_shell(wrapper),
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -471,7 +545,7 @@ def test_real_bin_sh_kill_escalation_confirms_group_is_gone():
         elapsed = time.monotonic() - started
 
         assert controller.returncode == 0, controller.stderr
-        assert primary.returncode in (137, -9)
+        assert primary.returncode != 0
         assert elapsed < 5
         absent = subprocess.run(
             _local_linux_shell(

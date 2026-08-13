@@ -5,6 +5,9 @@ does reuse the existing credential-resolving connection factory, while owning
 an independent Paramiko channel so stdout and stderr can be drained together
 and a second channel can stop the remote process group.
 
+The remote wrapper also treats SSH stdin EOF as loss of its supervising
+Worker and reaps the process group before read-only recovery can retry it.
+
 ``control_probe`` is server-owned and must return ``None`` to continue or one
 of the public control reasons below to stop.  A probe failure is fail-closed.
 """
@@ -191,14 +194,45 @@ def _build_remote_command(command: str, working_directory: str, token: str) -> s
         # sufficient and avoids depending on non-portable ``cd --`` support.
         payload = "cd " + _shell_quote(working_directory) + " && " + payload
 
-    # The marker is emitted by the new session leader before the payload starts.
-    # It is stripped from stderr and the PGID is retained only in client memory,
-    # so the payload cannot rewrite a pidfile to redirect a later kill.
-    session_payload = (
-        "printf '\\036OGS_AUTONOMY_PGID:"
-        + token
-        + ":%s\\n' \"$$\" >&2 && "
-        + payload
+    # The guardian owns the SSH channel's stdin while the non-interactive
+    # payload receives /dev/null.  A hard Worker/transport loss closes stdin;
+    # the guardian then terminates the entire dedicated process group before a
+    # read-only recovery may retry it.  It ignores TERM itself so it can still
+    # escalate a TERM-resistant payload to KILL.
+    guardian = " ".join(
+        [
+            "(",
+            "trap '' HUP INT TERM;",
+            "while IFS= read -r _ogs_guard_line <&3; do :; done;",
+            (
+                '/bin/kill -TERM -- "-$_ogs_pgid" 2>/dev/null '
+                "|| exit 0;"
+            ),
+            "sleep 1;",
+            '/bin/kill -KILL -- "-$_ogs_pgid" 2>/dev/null || :',
+            ") &",
+        ]
+    )
+    session_payload = "\n".join(
+        [
+            "set -u",
+            "[ -x /bin/kill ] || exit 126",
+            "exec 3<&0",
+            "_ogs_pgid=$$",
+            guardian,
+            "_ogs_guard_pid=$!",
+            "exec 3<&-",
+            (
+                "printf '\\036OGS_AUTONOMY_PGID:"
+                + token
+                + ":%s\\n' \"$_ogs_pgid\" >&2"
+            ),
+            "(" + payload + ") </dev/null",
+            "_ogs_rc=$?",
+            '/bin/kill -KILL -- "$_ogs_guard_pid" 2>/dev/null || :',
+            'wait "$_ogs_guard_pid" 2>/dev/null || :',
+            'exit "$_ogs_rc"',
+        ]
     )
 
     # setsid makes the approved payload the leader of a dedicated process
