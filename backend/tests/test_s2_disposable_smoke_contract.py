@@ -304,7 +304,9 @@ def test_s2_smoke_proves_feature_off_without_autonomy_dependencies():
     assert "client.get('/local/captcha/get')" not in probe
     assert "client.post('/account/login_dl2'" in probe
     assert "client.get('/ai/diagnostic-profiles')" in probe
-    assert "client.get('/server/host/list_all')" in probe
+    assert 'inventory = client.post(' in probe
+    assert "'/server/host/list_all'" in probe
+    assert "client.get('/server/host/list_all')" not in probe
     assert "client.post('/ai/chat'" in probe
     assert "client.post('/server/group/cmd'" in probe
     assert "login.get_json()['code'] == 0" in probe

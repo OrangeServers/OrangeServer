@@ -521,7 +521,9 @@ def feature_off_isolation():
             'feature-off diagnostic profiles were unavailable',
         )
 
-        inventory = client.get('/server/host/list_all')
+        inventory = client.post(
+            '/server/host/list_all', headers=csrf_headers, json={},
+        )
         require(
             inventory.status_code == 200
             and inventory.get_json().get('code') == 0,
