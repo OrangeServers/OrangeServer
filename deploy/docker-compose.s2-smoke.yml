@@ -108,14 +108,15 @@ services:
     environment:
       OGS_S2_SMOKE_REDIS_PASSWORD: ${OGS_S2_SMOKE_AUTONOMY_REDIS_PASSWORD:?smoke autonomy Redis password required}
     command:
-      - sh
-      - -c
-      - >-
-        exec redis-server
-        --appendonly yes
-        --appendfsync everysec
-        --maxmemory-policy noeviction
-        --requirepass "$$OGS_S2_SMOKE_REDIS_PASSWORD"
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction
+      - --requirepass
+      - ${OGS_S2_SMOKE_AUTONOMY_REDIS_PASSWORD:?smoke autonomy Redis password required}
     volumes:
       - smoke-autonomy-redis:/data
     healthcheck:

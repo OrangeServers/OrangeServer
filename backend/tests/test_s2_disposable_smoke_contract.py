@@ -11,6 +11,9 @@ PROBE = ROOT / 'ops' / 'smoke-ai-autonomy-s2.py'
 
 def test_s2_smoke_compose_is_isolated_and_builds_current_backend():
     compose = COMPOSE.read_text(encoding='utf-8')
+    autonomy_redis = compose.split(
+        '  autonomy-redis:\n', 1,
+    )[1].split('\n  ssh-target:\n', 1)[0]
 
     assert compose.count('context: ${OGS_S2_SMOKE_SOURCE_ROOT') == 3
     assert compose.count('source: ${OGS_S2_SMOKE_SOURCE_ROOT') == 6
@@ -22,9 +25,17 @@ def test_s2_smoke_compose_is_isolated_and_builds_current_backend():
     assert 'redis:7.4-alpine' in compose
     assert 'target: /docker-entrypoint-initdb.d/00-orange.sql' in compose
     assert '/.s2-smoke/v1.0.4-orange.sql' in compose
-    assert '--appendonly yes' in compose
-    assert '--appendfsync everysec' in compose
-    assert '--maxmemory-policy noeviction' in compose
+    assert '--appendonly\n      - "yes"' in autonomy_redis
+    assert '--appendfsync\n      - everysec' in autonomy_redis
+    assert '--maxmemory-policy\n      - noeviction' in autonomy_redis
+    assert 'command:\n      - redis-server' in autonomy_redis
+    assert 'exec redis-server' not in autonomy_redis
+    assert '\n      - sh\n' not in autonomy_redis
+    assert (
+        '--requirepass\n'
+        '      - ${OGS_S2_SMOKE_AUTONOMY_REDIS_PASSWORD:'
+        '?smoke autonomy Redis password required}'
+    ) in autonomy_redis
     assert '--concurrency=1' in compose
     assert 'OGS_AI_AUTONOMY_LEASE_TTL_SECONDS: 30' in compose
     assert 'OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis' in compose

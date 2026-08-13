@@ -14,14 +14,15 @@ services:
     environment:
       OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_AI_AUTONOMY_REDIS_PASSWORD:?Set OGS_AI_AUTONOMY_REDIS_PASSWORD in .env.dev}
     command:
-      - sh
-      - -c
-      - >-
-        exec redis-server
-        --appendonly yes
-        --appendfsync everysec
-        --maxmemory-policy noeviction
-        --requirepass "$$OGS_AI_AUTONOMY_REDIS_PASSWORD"
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction
+      - --requirepass
+      - ${OGS_AI_AUTONOMY_REDIS_PASSWORD:?Set OGS_AI_AUTONOMY_REDIS_PASSWORD in .env.dev}
     volumes:
       - dev-autonomy-redis-data:/data
     healthcheck:

@@ -448,17 +448,29 @@ def test_autonomy_dev_overlay_uses_dedicated_redis8_and_worker():
     overlay = (
         DEPLOY / "docker-compose.dev-autonomy.yml"
     ).read_text(encoding="utf-8")
+    autonomy_redis = overlay.split(
+        "  autonomy-redis:\n", 1
+    )[1].split("\n  backend:\n", 1)[0]
     makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
 
     assert "redis:8.0-alpine" in overlay
     assert "dev-autonomy-redis-data:/data" in overlay
-    assert "--appendonly yes" in overlay
-    assert "--appendfsync everysec" in overlay
-    assert "--maxmemory-policy noeviction" in overlay
+    assert '--appendonly\n      - "yes"' in autonomy_redis
+    assert "--appendfsync\n      - everysec" in autonomy_redis
+    assert "--maxmemory-policy\n      - noeviction" in autonomy_redis
+    assert "command:\n      - redis-server" in autonomy_redis
+    assert "exec redis-server" not in autonomy_redis
+    assert "\n      - sh\n" not in autonomy_redis
+    assert (
+        "--requirepass\n"
+        "      - ${OGS_AI_AUTONOMY_REDIS_PASSWORD:"
+        "?Set OGS_AI_AUTONOMY_REDIS_PASSWORD in .env.dev}"
+    ) in autonomy_redis
     assert "OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis" in overlay
     assert "OGS_AI_AUTONOMY_REDIS_PORT: 6379" in overlay
     assert overlay.count("OGS_AI_AUTONOMY_REDIS_PASSWORD: ${") == 3
-    assert overlay.count(":?Set OGS_AI_AUTONOMY_REDIS_PASSWORD") == 3
+    # Three service environments plus the redis-server command argument.
+    assert overlay.count(":?Set OGS_AI_AUTONOMY_REDIS_PASSWORD") == 4
     assert overlay.count(
         "OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-false}"
     ) == 2
