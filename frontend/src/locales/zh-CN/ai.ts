@@ -30,6 +30,13 @@ export default {
     auditText: '查看今天失败的批量命令审计记录',
   },
   thinking: 'Agent 正在分析',
+  autonomyDraft: {
+    kicker: '自治任务草稿',
+    untitled: '未命名任务',
+    hint: '已创建草稿，尚未启动。聊天中不能直接执行，请到自治任务工作台决定是否启动。',
+    host: '目标主机',
+    open: '打开任务',
+  },
   tool: {
     running: '调用中',
     done: '已完成',
@@ -44,6 +51,7 @@ export default {
       searchAuditLogs: '查询审计记录',
       prepareBatchCommand: '生成批量执行计划',
       runReadonlyDiagnostic: '运行只读诊断',
+      createAutonomyDraft: '创建自治任务草稿',
       default: '调用平台能力',
     },
   },

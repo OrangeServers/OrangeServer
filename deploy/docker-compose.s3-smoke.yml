@@ -1,0 +1,14 @@
+# M1/S3 切片 7 薄 overlay：挂载在 S2 exact-head smoke 栈之上。
+#
+# 复用 deploy/docker-compose.s2-smoke.yml 的服务与镜像，仅追加 S3 探针脚本
+# 并改写 smoke-runner 入口。使用方式见 ops/smoke-ai-autonomy-s3.ps1：
+#   docker compose -f docker-compose.s2-smoke.yml -f docker-compose.s3-smoke.yml ...
+
+services:
+  smoke-runner:
+    entrypoint: ["python", "/smoke/smoke-ai-autonomy-s3.py"]
+    volumes:
+      - type: bind
+        source: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/ops/smoke-ai-autonomy-s3.py
+        target: /smoke/smoke-ai-autonomy-s3.py
+        read_only: true

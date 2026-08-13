@@ -31,6 +31,13 @@ export default {
     auditText: 'Show audit records of batch commands that failed today',
   },
   thinking: 'Agent is analyzing',
+  autonomyDraft: {
+    kicker: 'Autonomy task draft',
+    untitled: 'Untitled task',
+    hint: 'Draft created, not started. Chat cannot run it directly — open it in the autonomy task workbench to decide whether to start.',
+    host: 'Target host',
+    open: 'Open task',
+  },
   tool: {
     running: 'Calling',
     done: 'Done',
@@ -45,6 +52,7 @@ export default {
       searchAuditLogs: 'Search audit logs',
       prepareBatchCommand: 'Prepare batch execution plan',
       runReadonlyDiagnostic: 'Run read-only diagnostic',
+      createAutonomyDraft: 'Create autonomy task draft',
       default: 'Call platform capability',
     },
   },

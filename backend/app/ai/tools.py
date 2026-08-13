@@ -152,10 +152,29 @@ TOOL_DEFINITIONS = {
         },
         required=["profile_id", "result_set_id", "system_user_id"],
     ),
+    "create_autonomy_draft": _tool(
+        "create_autonomy_draft",
+        "创建 AI 自治任务草稿（仅落库，绝不执行）。创建后由用户在自治任务"
+        "工作台打开并自行决定是否启动；聊天侧不能启动、批准或取消。"
+        "host_id 与 system_user_id 必须来自已有查询工具返回的授权 ID。"
+        "自定义模式需在工作台配置动作类别，不能在聊天中创建。",
+        {
+            "goal": {"type": "string", "minLength": 1, "maxLength": 512},
+            "host_id": {"type": "integer", "minimum": 1},
+            "system_user_id": {"type": "integer", "minimum": 1},
+            "mode": {
+                "type": "string",
+                "enum": ["ask", "ai_review", "auto"],
+            },
+        },
+        required=["goal", "host_id", "system_user_id"],
+    ),
 }
 
 
-ADMIN_ONLY_TOOLS = frozenset({"search_accounts", "search_audit_logs"})
+ADMIN_ONLY_TOOLS = frozenset({
+    "search_accounts", "search_audit_logs", "create_autonomy_draft",
+})
 
 
 class ToolRegistry:
@@ -202,6 +221,8 @@ class ToolRegistry:
             return self._prepare_batch_command(arguments)
         if name == "run_diagnostic":
             return self._run_diagnostic(arguments)
+        if name == "create_autonomy_draft":
+            return self._create_autonomy_draft(arguments)
 
         method = getattr(self.platform, name, None)
         if method is None:
@@ -280,6 +301,62 @@ class ToolRegistry:
             "reason": reason,
             "expires_at": action["expires_at"],
             "requires_approval": True,
+        }
+
+    def _create_autonomy_draft(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """M1/S3 切片 7：聊天侧仅创建自治草稿。
+
+        安全边界：只调用 repository.create_run（落 draft），
+        聊天工具面不存在任何 start/approve/cancel 自治 Run 的能力。
+        """
+        from app.ai.autonomy.repository import (
+            AutonomyRepository,
+            AutonomyValidationError,
+        )
+        from app.core.config import AI_AUTONOMY_ENABLED, FLASK_SECRET_KEY
+        from app.core.db.database import db
+
+        if not AI_AUTONOMY_ENABLED:
+            raise ToolNotAllowed("autonomy feature is disabled")
+        goal = str(arguments.get("goal") or "").strip()
+        if not goal:
+            raise ToolValidationError("missing required fields: goal")
+        try:
+            host_id = int(arguments.get("host_id"))
+            system_user_id = int(arguments.get("system_user_id"))
+        except (TypeError, ValueError):
+            raise ToolValidationError(
+                "host_id and system_user_id must be integers"
+            ) from None
+        mode = str(arguments.get("mode") or "ask").strip() or "ask"
+        if mode not in ("ask", "ai_review", "auto"):
+            raise ToolValidationError(
+                "chat can only create ask/ai_review/auto drafts"
+            )
+        try:
+            run = AutonomyRepository(db.session, FLASK_SECRET_KEY).create_run(
+                self.owner,
+                self.role,
+                goal=goal,
+                host_id=host_id,
+                system_user_id=system_user_id,
+                mode=mode,
+                budget_payload=None,
+                profile_payload=None,
+            )
+        except AutonomyValidationError as exc:
+            raise ToolValidationError(str(exc)) from exc
+        except Exception as exc:
+            db.session.rollback()
+            raise ToolError("autonomy draft creation failed") from exc
+        return {
+            "autonomy_draft": {
+                "run_id": run["id"],
+                "goal": run["goal"],
+                "status": run["status"],
+                "mode": run["mode"],
+                "host_alias": run.get("host_alias") or "",
+            },
         }
 
     def _run_diagnostic(self, arguments: Dict[str, Any]) -> Dict[str, Any]:

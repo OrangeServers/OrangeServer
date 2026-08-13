@@ -363,18 +363,27 @@ def test_unexpected_error_becomes_500_without_details(api, monkeypatch):
 
 
 def test_disabling_flag_does_not_touch_existing_ai_features():
-    """既有 AI 聊天/诊断/批量审批不依赖自治 flag。"""
+    """既有 AI 聊天/诊断/批量审批不依赖自治 flag。
+
+    S3 切片 7 例外：聊天侧 create_autonomy_draft 草稿闸门按契约
+    受 flag 控制，但仅限该方法，其余聊天链路不受影响。
+    """
     from pathlib import Path
 
     backend = Path(__file__).resolve().parents[1]
     for relpath in (
         "app/api/ai_api.py",
         "app/assets/batch_service.py",
-        "app/ai/tools.py",
         "app/ai/runner.py",
     ):
         source = (backend / relpath).read_text(encoding="utf-8")
         assert "AI_AUTONOMY_ENABLED" not in source, relpath
+
+    tools_source = (backend / "app/ai/tools.py").read_text(encoding="utf-8")
+    draft_start = tools_source.index("def _create_autonomy_draft")
+    next_def = tools_source.index("\n    def ", draft_start + 1)
+    outside_draft = tools_source[:draft_start] + tools_source[next_def:]
+    assert "AI_AUTONOMY_ENABLED" not in outside_draft
 
 
 def test_existing_ai_routes_still_register_when_flag_module_loads():

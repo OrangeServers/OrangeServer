@@ -130,6 +130,11 @@
                 @open-evidence="openDiagnosticEvidence"
               />
 
+              <AutonomyDraftCard
+                v-else-if="item.kind === 'autonomy_draft'"
+                :draft="item.value"
+              />
+
               <article
                 v-else
                 class="approval-card"
@@ -473,6 +478,7 @@ import { store } from '@/store'
 import { currentLocale, t } from '@/i18n'
 import { providerBrandColor, providerIcon } from '@/assets/provider-logos'
 import DiagnosticRunCard from '@/components/ai/DiagnosticRunCard.vue'
+import AutonomyDraftCard from '@/components/ai/AutonomyDraftCard.vue'
 import OrangeMark from '@/components/OrangeMark.vue'
 import {
   cancelDiagnostic,
@@ -490,6 +496,7 @@ import type {
   AiActionHistory,
   AiApiResponse,
   AiApproval,
+  AiAutonomyDraft,
   AiChatMessage,
   AiConversation,
   AiConversationDetail,
@@ -512,6 +519,7 @@ type TimelineItem =
   | { kind: 'tool'; value: AiToolEvent }
   | { kind: 'diagnostic'; value: AiDiagnosticRun }
   | { kind: 'action'; value: AiActionHistory }
+  | { kind: 'autonomy_draft'; value: AiAutonomyDraft }
 
 const PROVIDER_NAMES: Record<string, string> = {
   openai: 'OpenAI',
@@ -539,6 +547,7 @@ const conversations = ref<AiConversation[]>([])
 const currentConversationId = ref('')
 const messages = ref<AiChatMessage[]>([])
 const toolEvents = ref<AiToolEvent[]>([])
+const autonomyDrafts = ref<AiAutonomyDraft[]>([])
 const resultScope = ref<AiResultScope | null>(null)
 const actionHistory = ref<AiActionHistory[]>([])
 const pendingApproval = ref<AiApproval | null>(null)
@@ -577,6 +586,7 @@ const timeline = computed<TimelineItem[]>(() => {
     ...toolEvents.value.map(value => ({ kind: 'tool' as const, value })),
     ...diagnosticRuns.value.map(value => ({ kind: 'diagnostic' as const, value })),
     ...actionHistory.value.map(value => ({ kind: 'action' as const, value })),
+    ...autonomyDrafts.value.map(value => ({ kind: 'autonomy_draft' as const, value })),
   ]
   return items.sort((a, b) => timelineTime(a) - timelineTime(b))
 })
@@ -885,6 +895,7 @@ function timelineTime(item: TimelineItem): number {
 function timelineItemKey(item: TimelineItem): string {
   if (item.kind === 'action') return `action-${item.value.action.action_id}`
   if (item.kind === 'diagnostic') return `diagnostic-${item.value.id}`
+  if (item.kind === 'autonomy_draft') return `draft-${item.value.id || item.value.run_id}`
   return `${item.kind}-${item.value.id}`
 }
 
@@ -1301,6 +1312,7 @@ async function openConversation(id: string, closeDrawer = true): Promise<void> {
     currentConversationId.value = detail.id || id
     messages.value = detail.messages || []
     toolEvents.value = restoreToolEvents(detail.tool_events || [])
+    autonomyDrafts.value = restoreAutonomyDrafts(detail.autonomy_drafts || [])
     applyDiagnosticState(detail)
     providerObservability.value = detail.provider_observability || null
     resultScope.value = null
@@ -1346,6 +1358,7 @@ function startNewConversation(): void {
   currentConversationId.value = ''
   messages.value = []
   toolEvents.value = []
+  autonomyDrafts.value = []
   resultScope.value = null
   actionHistory.value = []
   pendingApproval.value = null
@@ -1492,6 +1505,9 @@ async function handleSseEvent(event: AiSseEvent): Promise<void> {
     case 'tool.completed':
       upsertToolEvent(data, data.error ? 'error' : 'success')
       updateResultScope(data)
+      break
+    case 'autonomy.draft_created':
+      upsertAutonomyDraft(data)
       break
     case 'diagnostic.started':
     case 'diagnostic_started':
@@ -1644,6 +1660,50 @@ function restoreToolEvents(items: AiToolEvent[]): AiToolEvent[] {
   return restored
 }
 
+/** 切片 7：引用卡只做展示与跳转，聊天侧不提供启动/审批入口。 */
+function normalizeAutonomyDraft(data: Record<string, unknown>): AiAutonomyDraft | null {
+  const runId = String(data.run_id || '')
+  if (!runId) return null
+  return {
+    id: String(data.id || ''),
+    run_id: runId,
+    goal: String(data.goal || ''),
+    status: String(data.status || 'draft'),
+    mode: String(data.mode || ''),
+    host_alias: String(data.host_alias || ''),
+    created_at: typeof data.created_at === 'string' ? data.created_at : nowIso(),
+  }
+}
+
+function upsertAutonomyDraft(data: Record<string, unknown>): void {
+  const draft = normalizeAutonomyDraft(data)
+  if (!draft) return
+  const index = autonomyDrafts.value.findIndex(
+    item => item.run_id === draft.run_id,
+  )
+  if (index < 0) {
+    autonomyDrafts.value.push(draft)
+    return
+  }
+  autonomyDrafts.value[index] = {
+    ...autonomyDrafts.value[index],
+    ...draft,
+    created_at: autonomyDrafts.value[index].created_at || draft.created_at,
+  }
+}
+
+function restoreAutonomyDrafts(items: AiAutonomyDraft[]): AiAutonomyDraft[] {
+  const restored: AiAutonomyDraft[] = []
+  for (const item of items || []) {
+    const draft = normalizeAutonomyDraft(item as unknown as Record<string, unknown>)
+    if (!draft) continue
+    if (!restored.some(candidate => candidate.run_id === draft.run_id)) {
+      restored.push(draft)
+    }
+  }
+  return restored
+}
+
 function summarizeToolData(data: Record<string, unknown>): string {
   if (typeof data.summary === 'string') return data.summary
   if (typeof data.message === 'string') return data.message
@@ -1667,6 +1727,7 @@ const TOOL_LABEL_KEYS: Record<string, string> = {
   prepare_batch_command: 'ai.tool.labels.prepareBatchCommand',
   run_readonly_diagnostic: 'ai.tool.labels.runReadonlyDiagnostic',
   start_diagnostic: 'ai.tool.labels.runReadonlyDiagnostic',
+  create_autonomy_draft: 'ai.tool.labels.createAutonomyDraft',
 }
 
 function toolLabel(tool: string): string {
