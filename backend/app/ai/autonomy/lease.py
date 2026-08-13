@@ -6,12 +6,13 @@
   完全由条件 UPDATE 的租约认领保证，不依赖先 SELECT 再写。
 - 认领条件：Run 处于 queued，且租约空闲、已过期或属于本 Worker；
   认领原子地把状态推进到 running 并递增 revision。
-- 心跳与释放都复核 lease_owner + 当前 revision，过期 revision 的
-  旧 Worker 无法续租或释放他人持有的租约。
+- 心跳与释放只维护租约，不修改用于审批/状态的业务 revision；
+  lease_owner、不可复用 lease_token 与未过期租约共同隔离旧 Worker。
 - 启动扫描只返回候选（queued 待认领 / 活动态租约过期），恢复策略
   由执行器按写意图与 checkpoint 边界决定，本模块不重放任何动作。
 """
 import datetime
+import secrets
 
 import sqlalchemy as sa
 
@@ -88,7 +89,9 @@ class RunLeaseService:
     ):
         """原子认领 queued Run，或接管活动态中租约已过期的 Run。
 
-        成功返回 {'run_id', 'revision', 'lease_expires_at'}；
+        成功返回 {'run_id', 'revision', 'lease_token',
+        'lease_expires_at'}；lease_token 仅供当前 Worker 内部 fencing，
+        不进入 API、事件或日志。
         行不存在、状态不可认领、或租约被任何 Worker（含自身）有效
         持有时返回 None。queued 认领把状态推进到 running；接管过期
         租约进入 recovering，由恢复层按写意图与 checkpoint 边界
@@ -100,6 +103,7 @@ class RunLeaseService:
         now = now or _utcnow()
         expires_at = now + datetime.timedelta(seconds=int(lease_ttl_seconds))
         worker_id = str(worker_id)[:64]
+        lease_token = secrets.token_urlsafe(32)[:64]
 
         new_status = sa.case(
             (table.c.status == RunStatus.QUEUED.value,
@@ -131,6 +135,7 @@ class RunLeaseService:
             .values(
                 status=new_status,
                 lease_owner=worker_id,
+                lease_token=lease_token,
                 lease_expires_at=expires_at,
                 heartbeat_at=now,
                 revision=table.c.revision + 1,
@@ -143,11 +148,19 @@ class RunLeaseService:
         return {
             'run_id': run_id,
             'revision': int(row.revision),
+            'lease_token': lease_token,
             'lease_expires_at': row.lease_expires_at,
         }
 
-    def heartbeat(self, run_id, worker_id, expected_revision, lease_ttl_seconds, now=None):
-        """持有者续租。revision 过期或非持有者一律失败。"""
+    def heartbeat(
+        self, run_id, worker_id, lease_token, lease_ttl_seconds, now=None,
+    ):
+        """持有者续租，不触碰业务 revision。
+
+        已经过期的租约不能被原 Worker 复活；它必须让恢复扫描重新
+        认领。审批、取消等业务写导致 revision 变化时，仍由相同
+        lease_owner 安全续租，避免长命令被自己的状态更新误杀。
+        """
         table = self._run_table()
         now = now or _utcnow()
         expires_at = now + datetime.timedelta(seconds=int(lease_ttl_seconds))
@@ -155,11 +168,12 @@ class RunLeaseService:
             sa.update(table)
             .where(table.c.id == run_id)
             .where(table.c.lease_owner == str(worker_id)[:64])
-            .where(table.c.revision == int(expected_revision))
+            .where(table.c.lease_token == str(lease_token)[:64])
+            .where(table.c.lease_expires_at.isnot(None))
+            .where(table.c.lease_expires_at >= now)
             .values(
                 heartbeat_at=now,
                 lease_expires_at=expires_at,
-                revision=table.c.revision + 1,
             )
         )
         self._commit()
@@ -172,18 +186,21 @@ class RunLeaseService:
             'lease_expires_at': row.lease_expires_at,
         }
 
-    def release_lease(self, run_id, worker_id, expected_revision):
-        """持有者释放租约（Run 留在当前状态，等待下一次认领）。"""
+    def release_lease(self, run_id, worker_id, lease_token, now=None):
+        """当前持有者释放尚未过期的租约，不改变业务 revision。"""
         table = self._run_table()
+        now = now or _utcnow()
         result = self.session.execute(
             sa.update(table)
             .where(table.c.id == run_id)
             .where(table.c.lease_owner == str(worker_id)[:64])
-            .where(table.c.revision == int(expected_revision))
+            .where(table.c.lease_token == str(lease_token)[:64])
+            .where(table.c.lease_expires_at.isnot(None))
+            .where(table.c.lease_expires_at >= now)
             .values(
                 lease_owner=None,
+                lease_token=None,
                 lease_expires_at=None,
-                revision=table.c.revision + 1,
             )
         )
         self._commit()

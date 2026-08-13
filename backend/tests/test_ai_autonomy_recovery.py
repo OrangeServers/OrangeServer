@@ -17,6 +17,7 @@ import json
 import uuid
 
 import pytest
+from cryptography.fernet import Fernet
 from langgraph.checkpoint.memory import MemorySaver
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -29,6 +30,7 @@ from app.ai.autonomy.lease import RunLeaseService
 from app.ai.autonomy.repository import AutonomyRepository
 from app.core.db.database import (
     db,
+    t_ai_autonomous_artifact,
     t_ai_autonomous_event,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
@@ -75,8 +77,15 @@ class FakeHeartbeater:
 
 
 @pytest.fixture
-def env():
-    engine = create_engine("sqlite:///:memory:")
+def env(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "OGS_FERNET_KEYS", Fernet.generate_key().decode("ascii"),
+    )
+    db_path = (tmp_path / "autonomy-recovery.db").as_posix()
+    engine = create_engine(
+        "sqlite:///%s" % db_path,
+        connect_args={"check_same_thread": False},
+    )
     session_factory = sessionmaker(bind=engine)
     session = session_factory()
     db.metadata.create_all(
@@ -84,7 +93,8 @@ def env():
         tables=[t_group.__table__, t_host.__table__,
                 t_ai_autonomous_run.__table__,
                 t_ai_autonomous_step.__table__,
-                t_ai_autonomous_event.__table__],
+                t_ai_autonomous_event.__table__,
+                t_ai_autonomous_artifact.__table__],
     )
 
     repo = AutonomyRepository(
@@ -96,6 +106,12 @@ def env():
     host_seq = {"n": 0}
 
     def create_queued_run(**kwargs):
+        graph_version = kwargs.pop("graph_version", None)
+        legacy_mode = kwargs.get("mode") if kwargs.get("mode") in {
+            "read_only", "assisted", "lab_autonomous",
+        } else None
+        if legacy_mode is not None:
+            kwargs["mode"] = "ask"
         host_seq["n"] += 1
         n = host_seq["n"]
         host = t_host(
@@ -108,10 +124,17 @@ def env():
             goal="recover safely",
             host_id=int(host.id),
             system_user_id=21,
-            mode="assisted",
+            mode="ask",
         )
         payload.update(kwargs)
         run = repo.create_run("admin", "admin", **payload)
+        if graph_version is not None or legacy_mode is not None:
+            row = session.get(t_ai_autonomous_run, run["id"])
+            if graph_version is not None:
+                row.graph_version = graph_version
+            if legacy_mode is not None:
+                row.mode = legacy_mode
+            session.commit()
         return repo.start_run("admin", "admin", run["id"])
 
     planner_calls = {"n": 0}
@@ -135,6 +158,7 @@ def env():
             platform_factory=lambda owner, role: FakePlatform(owner, role),
             saver_factory=lambda: (saver, lambda: None),
             heartbeater_factory=FakeHeartbeater,
+            heartbeat_session_factory=session_factory,
             lease_ttl=TTL,
             worker_id="recovery-test-worker",
         )
@@ -337,12 +361,326 @@ def test_kill_during_write_lands_outcome_unknown_never_replays(env):
     ) is None
 
 
+def test_recovering_run_preflights_before_stale_paused_checkpoint(env):
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
+    saver = MemorySaver()
+    driver = env["make_driver"](saver=saver)
+    assert driver.drive(run["id"], env["claim"](run["id"])) == (
+        drive_mod.RESULT_PAUSED
+    )
+
+    # Redis still points at approval_pause, but MySQL records that the write
+    # crossed its intent boundary before the worker died.
+    step = env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], status="waiting_approval",
+    ).one()
+    step.status = "running"
+    env["session"].commit()
+    _append_write_intent(env, run["id"], step.id)
+    env["simulate_kill"](run["id"])
+
+    result = env["make_driver"](saver=saver).drive(
+        run["id"], env["claim"](run["id"]),
+    )
+
+    assert result == drive_mod.RESULT_NEEDS_ATTENTION
+    assert env["runner"].calls == []
+    assert _step_row(env, step.id).status == "outcome_unknown"
+    assert _run_row(env, run["id"]).status == "needs_attention"
+    assert "recovery_write_outcome_unknown" in _event_types(env, run["id"])
+
+
+def test_recovering_succeeded_step_fails_closed_without_replanning(env):
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
+    saver = MemorySaver()
+    initial_driver = env["make_driver"](saver=saver)
+    assert initial_driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+
+    # The action result reached MySQL, but the worker died before advancing
+    # its older approval_pause cursor.
+    step = env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], status="waiting_approval",
+    ).one()
+    step.status = "succeeded"
+    env["session"].commit()
+    env["simulate_kill"](run["id"])
+    planner_calls = []
+
+    def forbidden_replan(context):
+        planner_calls.append(context["run_id"])
+        raise AssertionError("succeeded action must not be replanned")
+
+    result = env["make_driver"](
+        saver=saver, planner=forbidden_replan,
+    ).drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_NEEDS_ATTENTION
+    assert planner_calls == []
+    assert env["runner"].calls == []
+    assert _step_row(env, step.id).status == "succeeded"
+    assert _run_row(env, run["id"]).status == "needs_attention"
+    assert "recovery_cursor_unresolved" in _event_types(env, run["id"])
+
+
+@pytest.mark.parametrize("status", [
+    "succeeded", "failed", "skipped", "cancelled", "outcome_unknown",
+])
+def test_checkpoint_loss_never_replans_authoritative_terminal_step(
+    env, status,
+):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_shell_step"](run["id"])
+    _step_row(env, step_id).status = status
+    env["session"].commit()
+    env["simulate_kill"](run["id"])
+    planner_calls = []
+
+    def forbidden_replan(context):
+        planner_calls.append(context["run_id"])
+        raise AssertionError("authoritative action state must not be replanned")
+
+    result = env["make_driver"](
+        saver=MemorySaver(), planner=forbidden_replan,
+    ).drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_NEEDS_ATTENTION
+    assert planner_calls == []
+    assert env["runner"].calls == []
+    assert _step_row(env, step_id).status == status
+    assert _run_row(env, run["id"]).status == "needs_attention"
+    assert "recovery_cursor_unresolved" in _event_types(env, run["id"])
+
+
+def test_checkpoint_loss_resumes_durable_proposal_at_policy(env):
+    run = env["create_queued_run"]()
+    step = env["repo"].propose_probe(
+        "admin", "admin", run["id"], "system.load",
+    )
+    env["simulate_kill"](run["id"])
+    planner_calls = []
+
+    def forbidden_replan(context):
+        planner_calls.append(context["run_id"])
+        raise AssertionError("durable proposal must resume at policy")
+
+    result = env["make_driver"](
+        saver=MemorySaver(), planner=forbidden_replan,
+    ).drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert planner_calls == []
+    assert len(env["runner"].calls) == 1
+    assert _step_row(env, step["id"]).status == "succeeded"
+    assert "recovery_boundary_rebuild" in _event_types(env, run["id"])
+
+
+def test_multiple_durable_proposals_fail_closed_without_partial_recovery(env):
+    run = env["create_queued_run"]()
+    step_ids = [
+        env["repo"].propose_probe(
+            "admin", "admin", run["id"], probe_id,
+        )["id"]
+        for probe_id in ("system.load", "system.memory")
+    ]
+    env["simulate_kill"](run["id"])
+    planner_calls = []
+
+    def forbidden_replan(context):
+        planner_calls.append(context["run_id"])
+        raise AssertionError("multi-proposal recovery must fail closed")
+
+    result = env["make_driver"](
+        saver=MemorySaver(), planner=forbidden_replan,
+    ).drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_NEEDS_ATTENTION
+    assert planner_calls == []
+    assert env["runner"].calls == []
+    assert [_step_row(env, step_id).status for step_id in step_ids] == [
+        "proposed", "proposed",
+    ]
+    assert _run_row(env, run["id"]).status == "needs_attention"
+    assert "recovery_cursor_unresolved" in _event_types(env, run["id"])
+
+
+@pytest.mark.parametrize("first_status", ["waiting_approval", "approved"])
+def test_mixed_unresolved_actions_fail_closed_before_any_boundary(
+    env, first_status,
+):
+    run = env["create_queued_run"]()
+    steps = [
+        env["repo"].propose_probe(
+            "admin", "admin", run["id"], probe_id,
+        )["id"]
+        for probe_id in ("system.load", "system.memory")
+    ]
+    _step_row(env, steps[0]).status = first_status
+    if first_status == "waiting_approval":
+        _run_row(env, run["id"]).status = "waiting_approval"
+    env["session"].commit()
+    env["simulate_kill"](run["id"])
+    planner_calls = []
+
+    def forbidden_replan(context):
+        planner_calls.append(context["run_id"])
+        raise AssertionError("mixed unresolved actions must fail closed")
+
+    result = env["make_driver"](
+        saver=MemorySaver(), planner=forbidden_replan,
+    ).drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_NEEDS_ATTENTION
+    assert planner_calls == []
+    assert env["runner"].calls == []
+    assert [_step_row(env, step_id).status for step_id in steps] == [
+        first_status, "proposed",
+    ]
+    assert _run_row(env, run["id"]).status == "needs_attention"
+    assert "recovery_cursor_unresolved" in _event_types(env, run["id"])
+
+
+@pytest.mark.parametrize(
+    "unresolved_status",
+    ["proposed", "waiting_approval", "approved", "running"],
+)
+def test_terminal_plus_unresolved_action_fails_closed_without_replay(
+    env, unresolved_status,
+):
+    run = env["create_queued_run"]()
+    step_ids = [
+        env["repo"].propose_probe(
+            "admin", "admin", run["id"], probe_id,
+        )["id"]
+        for probe_id in ("system.load", "system.memory")
+    ]
+    _step_row(env, step_ids[0]).status = "succeeded"
+    _step_row(env, step_ids[1]).status = unresolved_status
+    env["session"].commit()
+    env["simulate_kill"](run["id"])
+    planner_calls = []
+
+    def forbidden_replan(context):
+        planner_calls.append(context["run_id"])
+        raise AssertionError("mixed action history must fail closed")
+
+    result = env["make_driver"](
+        saver=MemorySaver(), planner=forbidden_replan,
+    ).drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_NEEDS_ATTENTION
+    assert planner_calls == []
+    assert env["runner"].calls == []
+    assert [_step_row(env, step_id).status for step_id in step_ids] == [
+        "succeeded", unresolved_status,
+    ]
+    assert _run_row(env, run["id"]).status == "needs_attention"
+    assert "recovery_cursor_unresolved" in _event_types(env, run["id"])
+
+
+def test_stale_pre_policy_checkpoint_rebuilds_waiting_approval(env):
+    run = env["create_queued_run"](
+        mode="assisted", graph_version="v1",
+    )
+    saver = MemorySaver()
+    driver = env["make_driver"](saver=saver)
+    compiled = drive_mod.build_graph(
+        "v1", driver._build_handlers(run["id"]),
+    ).compile(checkpointer=saver)
+    cfg = {
+        "configurable": {
+            "thread_id": drive_mod.THREAD_ID_PREFIX + run["id"],
+        },
+    }
+    # Redis reflects plan completion but not the following policy commit.
+    compiled.update_state(cfg, {
+        "run_id": run["id"],
+        "graph_version": "v1",
+        "owner": "admin",
+        "loops": 0,
+        "proposed_steps": 1,
+    }, as_node="plan")
+    step = env["repo"].propose_probe(
+        "admin", "admin", run["id"], "system.load",
+    )
+    step_row = _step_row(env, step["id"])
+    step_row.status = "waiting_approval"
+    run_row = _run_row(env, run["id"])
+    run_row.status = "waiting_approval"
+    env["session"].commit()
+    env["simulate_kill"](run["id"])
+
+    result = env["make_driver"](saver=saver).drive(
+        run["id"], env["claim"](run["id"]),
+    )
+
+    assert result == drive_mod.RESULT_PAUSED
+    assert env["runner"].calls == []
+    snapshot = saver.get_tuple(cfg)
+    assert snapshot is not None
+    graph_state = drive_mod.build_graph(
+        "v1", env["make_driver"](saver=saver)._build_handlers(run["id"]),
+    ).compile(checkpointer=saver).get_state(cfg)
+    assert "approval_pause" in graph_state.next
+    assert graph_state.values["pending_step_id"] == step["id"]
+
+    run_row = _run_row(env, run["id"])
+    env["repo"].decide(
+        "admin", "admin", run["id"], step["id"],
+        operation="approve", expected_revision=int(run_row.revision),
+    )
+    result = env["make_driver"](saver=saver).drive(
+        run["id"], env["claim"](run["id"]),
+    )
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    assert _step_row(env, step["id"]).status == "succeeded"
+
+
+@pytest.mark.parametrize("recovering", [False, True])
+def test_nonpaused_checkpoint_resumes_without_fresh_plan(env, recovering):
+    run = env["create_queued_run"]()
+    saver = MemorySaver()
+    planner_calls = []
+
+    def forbidden_replan(context):
+        planner_calls.append(context["run_id"])
+        raise AssertionError("healthy cursor must resume, not restart")
+
+    driver = env["make_driver"](saver=saver, planner=forbidden_replan)
+    compiled = drive_mod.build_graph(
+        "v2", driver._build_handlers(run["id"]),
+    ).compile(checkpointer=saver)
+    cfg = {
+        "configurable": {
+            "thread_id": drive_mod.THREAD_ID_PREFIX + run["id"],
+        },
+    }
+    compiled.update_state(cfg, {
+        "run_id": run["id"],
+        "graph_version": "v2",
+        "owner": "admin",
+        "loops": 7,
+        "proposed_steps": 0,
+    }, as_node="plan")
+    if recovering:
+        env["simulate_kill"](run["id"])
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert planner_calls == []
+    assert _run_row(env, run["id"]).status == "completed"
+
+
 # ---------------------------------------------------------------------------
 # checkpoint 丢失：只从 MySQL 已确认的安全边界重建
 # ---------------------------------------------------------------------------
 
 def test_checkpoint_lost_with_waiting_step_stays_paused(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     saver = MemorySaver()
     driver = env["make_driver"](saver=saver)
     claimed = env["claim"](run["id"])
@@ -366,7 +704,7 @@ def test_checkpoint_lost_with_waiting_step_stays_paused(env):
 
 
 def test_checkpoint_lost_with_approved_step_rebuilds_execute(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     saver = MemorySaver()
     driver = env["make_driver"](saver=saver)
     claimed = env["claim"](run["id"])
@@ -392,6 +730,44 @@ def test_checkpoint_lost_with_approved_step_rebuilds_execute(env):
     assert _run_row(env, run["id"]).status == "completed"
     # 绝不回到 plan 重新提案：规划器只在边界收尾时被再问一次。
     assert "recovery_boundary_rebuild" in _event_types(env, run["id"])
+
+
+def test_boundary_recovery_commit_and_checkpoint_are_claim_fenced(env):
+    run = env["create_queued_run"]()
+    env["add_approved_shell_step"](run["id"])
+    env["simulate_kill"](run["id"])
+    saver = MemorySaver()
+    driver = env["make_driver"](saver=saver)
+    claimed = env["claim"](run["id"])
+
+    original_commit = driver.repo._commit
+    observed = {"taken_over": False, "boundary_committed": False}
+
+    def commit_then_take_over_with_same_identity():
+        original_commit()
+        current = _run_row(env, run["id"])
+        if observed["taken_over"] or current.status != "running":
+            return
+        observed["boundary_committed"] = (
+            "recovery_boundary_rebuild" in _event_types(env, run["id"])
+        )
+        observed["taken_over"] = True
+        current.lease_token = "new-claim-token"
+        original_commit()
+
+    driver.repo._commit = commit_then_take_over_with_same_identity
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_LEASE_LOST
+    assert observed == {"taken_over": True, "boundary_committed": True}
+    assert env["runner"].calls == []
+    assert _run_row(env, run["id"]).lease_token == "new-claim-token"
+    assert saver.get_tuple({
+        "configurable": {
+            "thread_id": drive_mod.THREAD_ID_PREFIX + run["id"],
+        },
+    }) is None
 
 
 # ---------------------------------------------------------------------------

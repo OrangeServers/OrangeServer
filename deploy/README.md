@@ -15,6 +15,7 @@
 - **本目录文件**：
   - `docker-compose.yml` — 生产 4 服务编排（含 profiles）
   - `docker-compose.dev.yml` — 独立全容器开发模式（新 MySQL/Redis 卷、backend 源码重载、Vite HMR）
+  - `docker-compose.dev-autonomy.yml` — M1 自治开发覆盖层（专用 Redis 8 + Celery Worker）
   - `nginx/orange_server.conf` — 物理机 nginx（含 frontend/dist 静态 serve + 6 个 API 前缀反代）
   - `nginx/frontend_container.conf` — 容器版 nginx（upstream=backend:28000）
   - `nginx/ogs_proxy_common.conf` — 容器版 nginx 公共反代参数
@@ -44,6 +45,20 @@ make docker-dev-ps
 make docker-dev-reset
 make docker-dev-up
 ```
+
+M1 自治能力尚未发布且默认关闭。仅在隔离开发/验收环境中，将 `.env.dev` 的
+`OGS_AI_AUTONOMY_ENABLED` 显式改为 `true` 后运行：
+
+```bash
+make docker-dev-autonomy-up
+```
+
+该目标在普通开发栈上增加专用 Redis 8（AOF、持久卷、`noeviction`）和独立
+Celery Worker；backend 与 Worker 使用同一个由当前源码构建的本地镜像，业务 Redis 7
+保持不变。初始化脚本会生成独立的 `OGS_AI_AUTONOMY_REDIS_PASSWORD`；旧的
+`.env.dev` 若缺少该项，启动目标会拒绝继续并提示补齐。启动后用
+`make docker-dev-autonomy-ps` 查看 Worker 和 Redis 8。不要在普通用户部署中启用
+这个覆盖层。
 
 开发默认入口为 `http://127.0.0.1:8081`，后端调试端口为 `28001`。源码目录
 分别 bind mount 到 backend 与 Vite frontend；数据库、Redis、后端运行时数据和

@@ -39,6 +39,9 @@ class FakeRepo:
     def start_run(self, owner, role, run_id):
         return self._record("start_run", owner, role, run_id)
 
+    def request_cancel(self, owner, role, run_id):
+        return self._record("request_cancel", owner, role, run_id)
+
     def list_runs(self, owner):
         return self._record("list_runs", owner)
 
@@ -95,6 +98,9 @@ def test_routes_are_registered_with_expected_verbs():
     assert "GET" in rules["/ai/autonomous-runs"]
     assert "GET" in rules["/ai/autonomous-runs/<string:run_id>"]
     assert "POST" in rules["/ai/autonomous-runs/<string:run_id>/start"]
+    assert "POST" in rules[
+        "/ai/autonomous-runs/<string:run_id>/cancel"
+    ]
     assert "POST" in rules["/ai/autonomous-runs/<string:run_id>/steps"]
     assert "POST" in rules[
         "/ai/autonomous-runs/<string:run_id>/steps/<string:step_id>/decision"
@@ -108,14 +114,40 @@ def test_status_probe_reports_flag_without_being_blocked(
     api, monkeypatch,
 ):
     client, _state = api
+
+    def fake_readiness(*, enabled):
+        return {
+            "enabled": enabled,
+            "configured": enabled,
+            "checkpoint_ready": enabled,
+            "worker_ready": enabled,
+            "ready": enabled,
+            "reason": "ready" if enabled else "feature_disabled",
+        }
+
+    monkeypatch.setattr(views, "autonomy_readiness", fake_readiness)
     _enable(monkeypatch, False)
     response = client.get("/ai/autonomy/status")
     assert response.status_code == 200
-    assert response.get_json()["data"] == {"enabled": False}
+    assert response.get_json()["data"] == {
+        "enabled": False,
+        "configured": False,
+        "checkpoint_ready": False,
+        "worker_ready": False,
+        "ready": False,
+        "reason": "feature_disabled",
+    }
 
     _enable(monkeypatch, True)
     response = client.get("/ai/autonomy/status")
-    assert response.get_json()["data"] == {"enabled": True}
+    assert response.get_json()["data"] == {
+        "enabled": True,
+        "configured": True,
+        "checkpoint_ready": True,
+        "worker_ready": True,
+        "ready": True,
+        "reason": "ready",
+    }
 
 
 def test_every_mutating_endpoint_is_rejected_when_flag_disabled(
@@ -128,6 +160,7 @@ def test_every_mutating_endpoint_is_rejected_when_flag_disabled(
         ("get", "/ai/autonomous-runs", None),
         ("get", "/ai/autonomous-runs/r1", None),
         ("post", "/ai/autonomous-runs/r1/start", {}),
+        ("post", "/ai/autonomous-runs/r1/cancel", {}),
         ("post", "/ai/autonomous-runs/r1/steps", {}),
         ("post", "/ai/autonomous-runs/r1/steps/s1/decision", {}),
         ("post", "/ai/autonomy/hosts/1/environment", {}),
@@ -148,7 +181,7 @@ def test_non_admin_is_rejected_even_when_enabled(api, monkeypatch):
     response = client.post(
         "/ai/autonomous-runs",
         json={"goal": "g", "host_id": 1, "system_user_id": 2,
-              "mode": "assisted"},
+              "mode": "ask"},
     )
     assert response.status_code == 403
 
@@ -161,7 +194,7 @@ def test_create_run_passes_boundary_inputs_to_repository(api, monkeypatch):
         "goal": "diagnose latency",
         "host_id": 7,
         "system_user_id": 19,
-        "mode": "assisted",
+        "mode": "ask",
         "budget": {"max_actions": 3},
     })
     assert response.status_code == 200
@@ -173,9 +206,45 @@ def test_create_run_passes_boundary_inputs_to_repository(api, monkeypatch):
         "goal": "diagnose latency",
         "host_id": 7,
         "system_user_id": 19,
-        "mode": "assisted",
+        "mode": "ask",
         "budget_payload": {"max_actions": 3},
     }
+
+
+def test_cancel_only_records_request_and_dispatches(api, monkeypatch):
+    client, state = api
+    _enable(monkeypatch, True)
+    state["repo"] = FakeRepo(result={
+        "id": "run-1", "status": "running", "cancel_requested": True,
+    })
+    dispatched = []
+    monkeypatch.setattr(views, "_dispatch_drive", dispatched.append)
+
+    response = client.post("/ai/autonomous-runs/run-1/cancel", json={})
+
+    assert response.status_code == 200
+    assert state["repo"].calls == [
+        ("request_cancel", ("admin", "admin", "run-1"), {}),
+    ]
+    assert dispatched == ["run-1"]
+    assert response.get_json()["data"]["status"] == "running"
+    assert response.get_json()["data"]["cancel_requested"] is True
+
+
+def test_cancel_terminalized_before_execution_does_not_dispatch(api, monkeypatch):
+    client, state = api
+    _enable(monkeypatch, True)
+    state["repo"] = FakeRepo(result={
+        "id": "run-1", "status": "cancelled", "cancel_requested": True,
+    })
+    dispatched = []
+    monkeypatch.setattr(views, "_dispatch_drive", dispatched.append)
+
+    response = client.post("/ai/autonomous-runs/run-1/cancel", json={})
+
+    assert response.status_code == 200
+    assert dispatched == []
+    assert response.get_json()["data"]["status"] == "cancelled"
 
 
 def test_decision_input_is_exactly_operation_and_expected_revision(
@@ -242,7 +311,7 @@ def test_autonomy_errors_map_to_documented_status_codes(
     response = client.post(
         "/ai/autonomous-runs",
         json={"goal": "g", "host_id": 1, "system_user_id": 2,
-              "mode": "assisted"},
+              "mode": "ask"},
     )
     assert response.status_code == status
     assert exc.args[0] in response.get_json()["msg"]
@@ -255,7 +324,7 @@ def test_unexpected_error_becomes_500_without_details(api, monkeypatch):
     response = client.post(
         "/ai/autonomous-runs",
         json={"goal": "g", "host_id": 1, "system_user_id": 2,
-              "mode": "assisted"},
+              "mode": "ask"},
     )
     assert response.status_code == 500
     assert "db exploded" not in response.get_json()["msg"]

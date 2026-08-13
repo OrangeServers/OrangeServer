@@ -7,6 +7,7 @@ fail-closed（outcome_unknown + needs_attention，绝不重放）、只读
 runner 用替身注入，不触网。
 """
 import json
+import datetime
 import re
 import uuid
 
@@ -14,6 +15,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+import app.ai.autonomy.executor as executor_module
 from app.ai.autonomy.actions import (
     StructuredAction,
     build_action_digest,
@@ -22,6 +24,7 @@ from app.ai.autonomy.actions import (
 from app.ai.autonomy.executor import (
     AutonomyExecutor,
     RunnerResult,
+    default_runner,
 )
 from app.ai.autonomy.repository import (
     AutonomyConflict,
@@ -29,14 +32,23 @@ from app.ai.autonomy.repository import (
     AutonomyRepository,
     AutonomyValidationError,
 )
+from app.ai.autonomy.ssh_runner import (
+    SSHExecutionResult,
+    TERMINATION_AUTHORIZATION_REVOKED,
+    TERMINATION_CANCELLED,
+    TERMINATION_LEASE_LOST,
+    TERMINATION_STOP_UNCONFIRMED,
+)
 from app.core.db.database import (
     db,
+    t_acc_user,
     t_ai_autonomous_artifact,
     t_ai_autonomous_event,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
     t_group,
     t_host,
+    t_sys_user,
 )
 
 SECRET_KEY = "unit-test-secret-key-for-autonomy-executor"
@@ -59,7 +71,7 @@ class FakeRunner:
     """记录调用现场的可编程远程执行替身。"""
 
     def __init__(self, result=None):
-        self.result = result or RunnerResult(exit_code=0, output="ok")
+        self.result = result or RunnerResult(exit_code=0)
         self.calls = []
         self.on_call = None
 
@@ -70,18 +82,38 @@ class FakeRunner:
         return self.result
 
 
+class ProbingRunner(FakeRunner):
+    def __call__(self, command, **kwargs):
+        snapshot = self.on_call() if self.on_call else None
+        self.calls.append({"command": command, "kwargs": kwargs,
+                           "at_call": snapshot})
+        self.probe_result = kwargs["control_probe"]()
+        return self.result
+
+
 @pytest.fixture()
 def env():
     engine = create_engine("sqlite:///:memory:")
     db.metadata.create_all(
         engine,
         tables=[t_group.__table__, t_host.__table__,
+                t_acc_user.__table__, t_sys_user.__table__,
                 t_ai_autonomous_run.__table__,
                 t_ai_autonomous_step.__table__,
                 t_ai_autonomous_event.__table__,
                 t_ai_autonomous_artifact.__table__],
     )
-    session = sessionmaker(bind=engine)()
+    control_session_factory = sessionmaker(bind=engine)
+    session = control_session_factory()
+    session.add(t_acc_user(
+        alias="Administrator", name="admin", password="fake-hash",
+        usrole="admin", mail="admin@example.com", group="admins",
+    ))
+    session.add(t_sys_user(
+        id=19, alias="readonly", host_user="tester",
+        agreement="ssh",
+    ))
+    session.commit()
     platform_state = {"asset_ok": True, "credential_ok": True}
     repo = AutonomyRepository(
         session, SECRET_KEY,
@@ -112,7 +144,7 @@ def env():
             goal="diagnose latency",
             host_id=int(host.id),
             system_user_id=19,
-            mode="assisted",
+            mode="ask",
         )
         payload.update(kwargs)
         run = repo.create_run("admin", "admin", **payload)
@@ -132,7 +164,10 @@ def env():
             run_id, "shell", {"command": command},
         )
 
-    def add_approved_action_step(run_id, kind, parameters):
+    def add_approved_action_step(
+        run_id, kind, parameters, *, working_directory='',
+        timeout_seconds=30,
+    ):
         run = session.query(t_ai_autonomous_run).filter_by(id=run_id).one()
         step_id = uuid.uuid4().hex
         action = StructuredAction(
@@ -140,7 +175,8 @@ def env():
             target_id=int(run.host_id),
             system_user_id=int(run.system_user_id),
             parameters=parameters,
-            timeout_seconds=30,
+            working_directory=working_directory,
+            timeout_seconds=timeout_seconds,
             step_id=step_id,
         )
         # (run_id, seq) 唯一：直插 Step 时取下一个空闲 seq。
@@ -166,6 +202,7 @@ def env():
         "executor": executor,
         "runner": runner,
         "platform_state": platform_state,
+        "control_session_factory": control_session_factory,
         "create_queued_run": create_queued_run,
         "approve_probe_step": approve_probe_step,
         "add_approved_shell_step": add_approved_shell_step,
@@ -198,9 +235,11 @@ def _events(env, run_id):
 # 成功路径与副作用前复核
 # ---------------------------------------------------------------------------
 
-def test_execute_approved_probe_success(env):
+def test_execute_approved_probe_success(env, monkeypatch):
+    _stub_basesec(monkeypatch)
     run = env["create_queued_run"]()
     step_id = env["approve_probe_step"](run["id"])
+    env["runner"].result = RunnerResult(exit_code=0, output="ok")
     before_revision = run["revision"]
 
     result = env["executor"].execute_step(
@@ -209,7 +248,12 @@ def test_execute_approved_probe_success(env):
     row = _step_row(env, step_id)
     assert result["step_status"] == "succeeded"
     assert row.status == "succeeded"
-    assert "ok" in row.note
+    assert "ok" not in row.note
+    assert "exit_code=0" in row.note
+    artifact = env["session"].query(t_ai_autonomous_artifact).filter_by(
+        run_id=run["id"], step_id=step_id, kind="step_stdout",
+    ).one()
+    assert artifact.content_ciphertext == "enc:ok"
     # Run 由 queued 推进到 running，revision 递增。
     assert result["run_status"] == "running"
     assert result["revision"] > before_revision
@@ -233,9 +277,28 @@ def test_bounded_file_read_probe_runs_server_template(env):
     )
     assert result["step_status"] == "succeeded"
     call = env["runner"].calls[0]
-    assert call["command"] == "head -n 200 -- /var/log/app.log"
+    assert "realpath -e" in call["command"]
+    assert 'head -n "$lines" <&3' in call["command"]
+    assert "/var/log/app.log" in call["command"]
     types = [e.event_type for e in _events(env, run["id"])]
     assert "write_intent" not in types
+
+
+def test_network_probe_rechecks_authoritative_target_before_runner(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_action_step"](
+        run["id"], "probe", {
+            "probe_id": "verify.port_open",
+            "host": "198.51.100.8",
+            "port": "443",
+        },
+    )
+
+    with pytest.raises(AutonomyValidationError, match="run target"):
+        env["executor"].execute_step(
+            "admin", "admin", run["id"], step_id,
+        )
+    assert env["runner"].calls == []
 
 
 def test_approved_shell_on_permanent_deny_list_never_reaches_runner(env):
@@ -409,7 +472,8 @@ def test_write_uncertain_lands_outcome_unknown_and_never_replays(env):
     assert len(env["runner"].calls) == 1
 
 
-def test_write_confirmed_failure_is_not_unknown(env):
+def test_write_confirmed_failure_is_not_unknown(env, monkeypatch):
+    _stub_basesec(monkeypatch)
     run = env["create_queued_run"]()
     step_id = env["add_approved_shell_step"](run["id"])
     env["runner"].result = RunnerResult(exit_code=1, output="denied")
@@ -440,6 +504,446 @@ def test_read_transport_error_is_retryable_not_unknown(env):
     assert "step_outcome_unknown" not in types
 
 
+def test_executor_wires_dedicated_runner_boundaries_and_timeout_override(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_action_step"](
+        run["id"], "shell", {"command": "pwd"},
+        working_directory="/opt/app dir/it's",
+        timeout_seconds=30,
+    )
+
+    env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+        timeout_seconds=3.25,
+    )
+
+    kwargs = env["runner"].calls[0]["kwargs"]
+    assert kwargs["host"] == "203.0.113.71"
+    assert kwargs["port"] == 22
+    assert kwargs["system_user_id"] == 19
+    assert kwargs["working_directory"] == "/opt/app dir/it's"
+    assert kwargs["timeout_seconds"] == 3.25
+    assert kwargs["max_output_bytes"] > 0
+    assert callable(kwargs["control_probe"])
+
+
+def test_runtime_probe_observes_cancel_and_permission_revocation(env):
+    cancelled_run = env["create_queued_run"]()
+    cancelled_step = env["approve_probe_step"](cancelled_run["id"])
+    cancel_runner = ProbingRunner()
+    env["executor"].runner = cancel_runner
+    cancel_runner.on_call = lambda: (
+        setattr(_run_row(env, cancelled_run["id"]), "cancel_requested", True),
+        env["session"].commit(),
+    )
+    env["executor"].execute_step(
+        "admin", "admin", cancelled_run["id"], cancelled_step,
+        control_session_factory=env["control_session_factory"],
+    )
+    assert cancel_runner.probe_result == TERMINATION_CANCELLED
+
+    permission_run = env["create_queued_run"]()
+    permission_step = env["approve_probe_step"](permission_run["id"])
+    permission_runner = ProbingRunner()
+    env["executor"].runner = permission_runner
+    permission_runner.on_call = lambda: None
+    env["executor"].execute_step(
+        "admin", "admin", permission_run["id"], permission_step,
+        control_session_factory=env["control_session_factory"],
+    )
+    assert permission_runner.probe_result is None
+    permission_probe = permission_runner.calls[-1]["kwargs"]["control_probe"]
+    user = env["session"].query(t_acc_user).filter_by(name="admin").one()
+    user.usrole = "user"
+    env["session"].commit()
+    assert permission_probe() == TERMINATION_AUTHORIZATION_REVOKED
+
+
+def test_runtime_probe_observes_lease_loss_and_action_tamper(env):
+    run = env["create_queued_run"]()
+    step_id = env["approve_probe_step"](run["id"])
+    run_row = _run_row(env, run["id"])
+    run_row.lease_owner = "worker-a"
+    run_row.lease_token = "claim-a"
+    run_row.lease_expires_at = datetime.datetime.utcnow() + (
+        datetime.timedelta(minutes=1)
+    )
+    env["session"].commit()
+    lease_runner = ProbingRunner()
+    env["executor"].runner = lease_runner
+    env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+        control_session_factory=env["control_session_factory"],
+        lease_owner="worker-a", lease_token="claim-a",
+    )
+    assert lease_runner.probe_result is None
+    lease_probe = lease_runner.calls[-1]["kwargs"]["control_probe"]
+    run_row = _run_row(env, run["id"])
+    run_row.lease_token = "claim-b"
+    env["session"].commit()
+    assert lease_probe() == TERMINATION_LEASE_LOST
+
+    tamper_run = env["create_queued_run"]()
+    tamper_step = env["approve_probe_step"](tamper_run["id"])
+    tamper_runner = ProbingRunner()
+    env["executor"].runner = tamper_runner
+    env["executor"].execute_step(
+        "admin", "admin", tamper_run["id"], tamper_step,
+        control_session_factory=env["control_session_factory"],
+    )
+    assert tamper_runner.probe_result is None
+    tamper_probe = tamper_runner.calls[-1]["kwargs"]["control_probe"]
+    step_row = _step_row(env, tamper_step)
+    step_row.action_digest = "0" * 64
+    env["session"].commit()
+    assert tamper_probe() == TERMINATION_AUTHORIZATION_REVOKED
+
+
+def test_default_runner_maps_exact_ssh_result_and_writes_audit(monkeypatch):
+    remote_calls = []
+    audit_calls = []
+
+    def fake_run(command, **kwargs):
+        remote_calls.append({"command": command, "kwargs": kwargs})
+        return SSHExecutionResult(
+            started=True,
+            stop_confirmed=True,
+            termination="exited",
+            exit_code=37,
+            stdout="out",
+            stderr="err",
+            stdout_bytes_seen=3,
+            stderr_bytes_seen=3,
+        )
+
+    monkeypatch.setattr(executor_module, "run_ssh_command", fake_run)
+
+    result = default_runner(
+        "sh -c 'exit 37'",
+        host_id=7,
+        system_user_id=19,
+        host_alias="web-01",
+        audit_name="admin",
+        system_user_alias="readonly",
+        timeout_seconds=4.5,
+        step_id="a" * 32,
+        host="203.0.113.71",
+        port=22,
+        working_directory="/opt/app",
+        max_output_bytes=7,
+        control_probe=lambda: None,
+        audit_callback=lambda *args, **kwargs: audit_calls.append(
+            (args, kwargs)
+        ),
+        action_kind="shell",
+        action_digest="d" * 64,
+    )
+
+    assert result.exit_code == 37
+    assert result.output == "out"
+    assert result.stderr == "err"
+    assert result.started is True
+    assert result.stop_confirmed is True
+    assert remote_calls[0]["kwargs"]["system_user_id"] == 19
+    assert remote_calls[0]["kwargs"]["working_directory"] == "/opt/app"
+    assert remote_calls[0]["kwargs"]["max_output_bytes"] == 7
+    assert audit_calls[0][0][0] == "admin"
+    assert audit_calls[0][0][2] == "action=shell"
+    assert audit_calls[0][0][3] == "web-01"
+    assert audit_calls[0][0][4] == "失败"
+    assert "digest=dddddddddddd" in audit_calls[0][0][5]
+    assert "exit_code=37" in audit_calls[0][0][5]
+    assert "sh -c" not in audit_calls[0][0][2]
+
+
+def test_started_write_with_confirmed_stop_is_still_outcome_unknown(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_shell_step"](run["id"])
+    env["runner"].result = RunnerResult(
+        exit_code=None,
+        started=True,
+        stop_confirmed=True,
+        termination=TERMINATION_CANCELLED,
+    )
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+
+    assert result["step_status"] == "outcome_unknown"
+    assert result["uncertain"] is True
+    assert result["termination"] == TERMINATION_CANCELLED
+    assert _step_row(env, step_id).status == "outcome_unknown"
+    assert _run_row(env, run["id"]).status == "needs_attention"
+    assert "step_outcome_unknown" in [
+        event.event_type for event in _events(env, run["id"])
+    ]
+
+
+def test_confirmed_remote_cancel_of_read_only_step_is_cancelled(env):
+    run = env["create_queued_run"]()
+    step_id = env["approve_probe_step"](run["id"])
+    env["runner"].result = RunnerResult(
+        exit_code=None,
+        started=True,
+        stop_confirmed=True,
+        termination=TERMINATION_CANCELLED,
+    )
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+
+    assert result["step_status"] == "cancelled"
+    assert result["uncertain"] is False
+    assert _step_row(env, step_id).status == "cancelled"
+
+
+def test_unconfirmed_cancel_of_write_remains_outcome_unknown(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_shell_step"](run["id"])
+    env["runner"].result = RunnerResult(
+        exit_code=None,
+        transport_error=TERMINATION_STOP_UNCONFIRMED,
+        started=True,
+        stop_confirmed=False,
+        termination=TERMINATION_STOP_UNCONFIRMED,
+    )
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+
+    assert result["termination"] == TERMINATION_STOP_UNCONFIRMED
+    assert result["uncertain"] is True
+    assert _step_row(env, step_id).status == "outcome_unknown"
+    assert _run_row(env, run["id"]).status == "needs_attention"
+
+
+def test_confirmed_lease_loss_leaves_running_step_for_new_owner_recovery(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_shell_step"](run["id"])
+    env["runner"].result = RunnerResult(
+        exit_code=None,
+        started=True,
+        stop_confirmed=True,
+        termination=TERMINATION_LEASE_LOST,
+    )
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+
+    assert result["termination"] == TERMINATION_LEASE_LOST
+    assert result["step_status"] == "running"
+    assert _step_row(env, step_id).status == "running"
+    assert "write_intent" in [
+        event.event_type for event in _events(env, run["id"])
+    ]
+
+
+def test_unconfirmed_lease_loss_never_writes_old_worker_result(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_shell_step"](run["id"])
+    env["runner"].result = RunnerResult(
+        exit_code=None,
+        started=True,
+        stop_confirmed=False,
+        termination=TERMINATION_STOP_UNCONFIRMED,
+        control_reason=TERMINATION_LEASE_LOST,
+    )
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+
+    assert result["termination"] == TERMINATION_LEASE_LOST
+    assert _step_row(env, step_id).status == "running"
+    assert _run_row(env, run["id"]).status == "running"
+
+
+def test_outcome_commit_is_fenced_by_current_lease_owner(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_shell_step"](run["id"])
+    run_row = _run_row(env, run["id"])
+    run_row.lease_owner = "worker-a"
+    run_row.lease_token = "claim-a"
+    run_row.lease_expires_at = datetime.datetime.utcnow() + (
+        datetime.timedelta(minutes=5)
+    )
+    env["session"].commit()
+
+    def transfer_lease_after_remote_result():
+        other = env["control_session_factory"]()
+        try:
+            current = other.get(t_ai_autonomous_run, run["id"])
+            current.lease_owner = "worker-b"
+            current.lease_token = "claim-b"
+            current.revision += 1
+            other.commit()
+        finally:
+            other.close()
+
+    env["runner"].on_call = transfer_lease_after_remote_result
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+        control_session_factory=env["control_session_factory"],
+        lease_owner="worker-a", lease_token="claim-a",
+    )
+
+    assert result["termination"] == TERMINATION_LEASE_LOST
+    assert _step_row(env, step_id).status == "running"
+    assert _run_row(env, run["id"]).lease_owner == "worker-b"
+    event_types = [event.event_type for event in _events(env, run["id"])]
+    assert "step_execution_started" in event_types
+    assert "write_intent" in event_types
+    assert "step_executed" not in event_types
+
+
+def test_outcome_commit_is_fenced_by_lease_token_for_same_owner(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_shell_step"](run["id"])
+    run_row = _run_row(env, run["id"])
+    run_row.lease_owner = "worker-a"
+    run_row.lease_token = "claim-a"
+    run_row.lease_expires_at = datetime.datetime.utcnow() + (
+        datetime.timedelta(minutes=5)
+    )
+    env["session"].commit()
+
+    def reclaim_with_same_identity_after_remote_result():
+        other = env["control_session_factory"]()
+        try:
+            current = other.get(t_ai_autonomous_run, run["id"])
+            current.lease_token = "claim-b"
+            current.revision += 1
+            other.commit()
+        finally:
+            other.close()
+
+    env["runner"].on_call = reclaim_with_same_identity_after_remote_result
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+        control_session_factory=env["control_session_factory"],
+        lease_owner="worker-a", lease_token="claim-a",
+    )
+
+    assert result["termination"] == TERMINATION_LEASE_LOST
+    assert _step_row(env, step_id).status == "running"
+    assert _run_row(env, run["id"]).lease_token == "claim-b"
+    event_types = [event.event_type for event in _events(env, run["id"])]
+    assert "step_executed" not in event_types
+
+
+def test_stale_claim_cannot_persist_execution_intent_or_start_runner(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_shell_step"](run["id"])
+    run_row = _run_row(env, run["id"])
+    run_row.lease_owner = "worker-a"
+    run_row.lease_token = "new-claim"
+    run_row.lease_expires_at = datetime.datetime.utcnow() + (
+        datetime.timedelta(minutes=5)
+    )
+    env["session"].commit()
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+        control_session_factory=env["control_session_factory"],
+        lease_owner="worker-a", lease_token="stale-claim",
+    )
+
+    assert result["termination"] == TERMINATION_LEASE_LOST
+    assert env["runner"].calls == []
+    assert _step_row(env, step_id).status == "approved"
+    event_types = [event.event_type for event in _events(env, run["id"])]
+    assert "step_execution_started" not in event_types
+    assert "write_intent" not in event_types
+
+
+def test_unconfirmed_stop_of_read_requires_attention(env):
+    run = env["create_queued_run"]()
+    step_id = env["approve_probe_step"](run["id"])
+    env["runner"].result = RunnerResult(
+        exit_code=None,
+        started=True,
+        stop_confirmed=False,
+        termination=TERMINATION_STOP_UNCONFIRMED,
+        control_reason=TERMINATION_CANCELLED,
+    )
+
+    env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+
+    assert _step_row(env, step_id).status == "failed"
+    assert _run_row(env, run["id"]).status == "needs_attention"
+
+
+def test_authorization_revoked_during_execution_fails_run(env):
+    run = env["create_queued_run"]()
+    step_id = env["approve_probe_step"](run["id"])
+    env["runner"].result = RunnerResult(
+        exit_code=None,
+        started=True,
+        stop_confirmed=True,
+        termination=TERMINATION_AUTHORIZATION_REVOKED,
+        control_reason=TERMINATION_AUTHORIZATION_REVOKED,
+    )
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+
+    assert result["termination"] == TERMINATION_AUTHORIZATION_REVOKED
+    assert _step_row(env, step_id).status == "failed"
+    assert _run_row(env, run["id"]).status == "failed"
+
+
+def test_authorization_revoked_after_write_started_requires_attention(env):
+    run = env["create_queued_run"]()
+    step_id = env["add_approved_shell_step"](run["id"])
+    env["runner"].result = RunnerResult(
+        exit_code=None,
+        started=True,
+        stop_confirmed=True,
+        termination=TERMINATION_AUTHORIZATION_REVOKED,
+        control_reason=TERMINATION_AUTHORIZATION_REVOKED,
+    )
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+
+    assert result["uncertain"] is True
+    assert _step_row(env, step_id).status == "outcome_unknown"
+    assert _run_row(env, run["id"]).status == "needs_attention"
+
+
+def test_exhausted_duration_and_relative_cwd_fail_before_write_intent(env):
+    duration_run = env["create_queued_run"]()
+    duration_step = env["add_approved_shell_step"](duration_run["id"])
+    with pytest.raises(AutonomyConflict, match="duration budget exhausted"):
+        env["executor"].execute_step(
+            "admin", "admin", duration_run["id"], duration_step,
+            timeout_seconds=0,
+        )
+    assert _step_row(env, duration_step).status == "approved"
+
+    cwd_run = env["create_queued_run"]()
+    cwd_step = env["add_approved_action_step"](
+        cwd_run["id"], "shell", {"command": "pwd"},
+        working_directory="relative/path",
+    )
+    with pytest.raises(AutonomyValidationError, match="absolute POSIX path"):
+        env["executor"].execute_step(
+            "admin", "admin", cwd_run["id"], cwd_step,
+        )
+    assert _step_row(env, cwd_step).status == "approved"
+    assert env["runner"].calls == []
+
+
 # ---------------------------------------------------------------------------
 # 预算与输出上限
 # ---------------------------------------------------------------------------
@@ -465,7 +969,8 @@ def test_action_budget_exhausted_stops_execution(env):
     assert _step_row(env, step_two).status == "approved"
 
 
-def test_step_note_capped_by_budget(env):
+def test_step_note_capped_by_budget(env, monkeypatch):
+    _stub_basesec(monkeypatch)
     run = env["create_queued_run"]()
     step_id = env["approve_probe_step"](run["id"])
     env["runner"].result = RunnerResult(
@@ -473,6 +978,66 @@ def test_step_note_capped_by_budget(env):
     )
     env["executor"].execute_step("admin", "admin", run["id"], step_id)
     assert len(_step_row(env, step_id).note) <= 255
+
+
+def test_remote_output_is_redacted_encrypted_artifact_not_step_note(
+    env, monkeypatch,
+):
+    _stub_basesec(monkeypatch)
+    run = env["create_queued_run"]()
+    step_id = env["approve_probe_step"](run["id"])
+    env["runner"].result = RunnerResult(
+        exit_code=0,
+        output="\x1b[31mapi_key=synthetic-secret\x1b[0m\nload 0.1",
+        stderr="Authorization: Bearer synthetic-token",
+        stdout_truncated=True,
+    )
+
+    env["executor"].execute_step("admin", "admin", run["id"], step_id)
+
+    step = _step_row(env, step_id)
+    assert "synthetic-secret" not in step.note
+    assert "synthetic-token" not in step.note
+    assert "load 0.1" not in step.note
+    assert "exit_code=0" in step.note
+    artifacts = env["session"].query(t_ai_autonomous_artifact).filter_by(
+        run_id=run["id"], step_id=step_id,
+    ).order_by(t_ai_autonomous_artifact.kind).all()
+    assert [artifact.kind for artifact in artifacts] == [
+        "step_stderr", "step_stdout",
+    ]
+    stored = "\n".join(artifact.content_ciphertext for artifact in artifacts)
+    assert "synthetic-secret" not in stored
+    assert "synthetic-token" not in stored
+    assert "[REDACTED]" in stored
+    assert "load 0.1" in stored
+    assert all(
+        artifact.content_ciphertext.startswith("enc:")
+        for artifact in artifacts
+    )
+
+
+def test_execution_start_event_is_durable_before_runner_call(env):
+    run = env["create_queued_run"]()
+    step_id = env["approve_probe_step"](run["id"])
+
+    def snapshot_events():
+        other = env["control_session_factory"]()
+        try:
+            return [
+                event.event_type
+                for event in other.query(t_ai_autonomous_event).filter_by(
+                    run_id=run["id"],
+                ).order_by(t_ai_autonomous_event.sequence).all()
+            ]
+        finally:
+            other.close()
+
+    env["runner"].on_call = snapshot_events
+
+    env["executor"].execute_step("admin", "admin", run["id"], step_id)
+
+    assert "step_execution_started" in env["runner"].calls[0]["at_call"]
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +1061,14 @@ def test_file_patch_success_writes_intent_and_backup_artifact(
         "path": "/etc/app.conf",
         "content": "workers=4\n",
     })
+    env["runner"].result = RunnerResult(
+        exit_code=0,
+        output=(
+            "--- /etc/app.conf.before\n"
+            "+++ /etc/app.conf.after\n"
+            "@@ -1 +1 @@\n-workers=2\n+workers=4\n"
+        ),
+    )
 
     result = env["executor"].execute_step(
         "admin", "admin", run["id"], step_id,
@@ -514,18 +1087,24 @@ def test_file_patch_success_writes_intent_and_backup_artifact(
     types = [e.event_type for e in _events(env, run["id"])]
     assert types.index("write_intent") < types.index("step_executed")
 
-    # 备份引用落 artifact：确定性路径，执行期复算一致。
+    # 可审 unified diff 与备份引用都落加密 artifact；备份路径确定性
+    # 派生，执行期复算一致。
     artifacts = env["session"].query(t_ai_autonomous_artifact).filter_by(
         run_id=run["id"],
     ).all()
-    assert len(artifacts) == 1
-    artifact = artifacts[0]
-    assert artifact.kind == "backup_ref"
-    assert artifact.step_id == step_id
+    assert {artifact.kind for artifact in artifacts} == {
+        "backup_ref", "patch_diff",
+    }
+    by_kind = {artifact.kind: artifact for artifact in artifacts}
+    artifact = by_kind["backup_ref"]
+    assert all(item.step_id == step_id for item in artifacts)
     expected = patch_backup_path("/etc/app.conf", run["id"], step_id)
     assert artifact.content_ciphertext == "enc:%s" % expected
     assert re.search(r"\.ogs-bak-[0-9a-f]{12}$", expected)
     assert "/etc/.ogs-autonomy-backup/app.conf.ogs-bak-" in expected
+    assert by_kind["patch_diff"].content_ciphertext.startswith(
+        "enc:--- /etc/app.conf.before\n+++ /etc/app.conf.after"
+    )
 
 
 def test_file_patch_uncertain_outcome_creates_no_artifact(
@@ -554,9 +1133,75 @@ def test_file_patch_uncertain_outcome_creates_no_artifact(
     assert artifacts == 0
 
 
-def test_file_restore_executes_managed_backup_only(env):
+def test_file_patch_cannot_report_success_without_full_backup_reference(
+    env, monkeypatch,
+):
+    _stub_basesec(monkeypatch)
+    run = env["create_queued_run"](budget_payload={
+        "step_output_bytes": 4,
+        "run_artifact_bytes": 4,
+    })
+    step_id = env["add_approved_action_step"](run["id"], "file_patch", {
+        "path": "/etc/app.conf",
+        "content": "workers=4\n",
+    })
+    env["runner"].result = RunnerResult(
+        exit_code=0,
+        output="--- before\n+++ after\n-old\n+new\n",
+    )
+
+    with pytest.raises(AutonomyConflict, match="artifact capacity"):
+        env["executor"].execute_step(
+            "admin", "admin", run["id"], step_id,
+        )
+
+    # write_intent remains the authoritative safe boundary; no success or
+    # truncated backup reference may be committed.
+    env["session"].expire_all()
+    assert _step_row(env, step_id).status == "running"
+    assert "write_intent" in [e.event_type for e in _events(env, run["id"])]
+    assert "step_executed" not in [
+        e.event_type for e in _events(env, run["id"])
+    ]
+    assert env["session"].query(t_ai_autonomous_artifact).filter_by(
+        run_id=run["id"],
+    ).count() == 0
+
+
+def test_file_patch_persists_empty_diff_as_explicit_artifact(env, monkeypatch):
+    _stub_basesec(monkeypatch)
     run = env["create_queued_run"]()
-    backup = patch_backup_path("/etc/app.conf", run["id"], "a" * 32)
+    step_id = env["add_approved_action_step"](run["id"], "file_patch", {
+        "path": "/etc/app.conf",
+        "content": "unchanged=true\n",
+    })
+    env["runner"].result = RunnerResult(exit_code=0, output="")
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+
+    assert result["step_status"] == "succeeded"
+    artifacts = env["session"].query(t_ai_autonomous_artifact).filter_by(
+        run_id=run["id"], step_id=step_id,
+    ).all()
+    by_kind = {artifact.kind: artifact for artifact in artifacts}
+    assert set(by_kind) == {"backup_ref", "patch_diff"}
+    assert by_kind["patch_diff"].content_ciphertext == "enc:[EMPTY ARTIFACT]"
+    assert by_kind["patch_diff"].size_bytes == 0
+    assert by_kind["patch_diff"].truncated is False
+
+
+def test_file_restore_executes_managed_backup_only(env, monkeypatch):
+    _stub_basesec(monkeypatch)
+    run = env["create_queued_run"]()
+    patch_step_id = env["add_approved_action_step"](
+        run["id"], "file_patch", {
+            "path": "/etc/app.conf", "content": "workers=4\n",
+        },
+    )
+    env["executor"].execute_step("admin", "admin", run["id"], patch_step_id)
+    backup = patch_backup_path("/etc/app.conf", run["id"], patch_step_id)
     step_id = env["add_approved_action_step"](run["id"], "file_restore", {
         "path": "/etc/app.conf",
         "backup_path": backup,
@@ -566,9 +1211,10 @@ def test_file_restore_executes_managed_backup_only(env):
         "admin", "admin", run["id"], step_id,
     )
     assert result["step_status"] == "succeeded"
-    command = env["runner"].calls[0]["command"]
-    assert command.startswith("cp -p -- ")
-    assert backup in command
+    command = env["runner"].calls[1]["command"]
+    assert "realpath -e" in command
+    assert backup.rsplit("/", 1)[0] in command
+    assert backup.rsplit("/", 1)[1] in command
 
     # 受管目录之外的“备份”在构造层拒绝，不产生任何远程副作用。
     rogue_id = env["add_approved_action_step"](run["id"], "file_restore", {
@@ -579,5 +1225,24 @@ def test_file_restore_executes_managed_backup_only(env):
         env["executor"].execute_step(
             "admin", "admin", run["id"], rogue_id,
         )
-    assert len(env["runner"].calls) == 1
+    assert len(env["runner"].calls) == 2
     assert _step_row(env, rogue_id).status == "approved"
+
+
+def test_file_restore_rejects_unowned_or_cross_run_backup(env):
+    run = env["create_queued_run"]()
+    unrelated_step_id = "a" * 32
+    backup = patch_backup_path(
+        "/etc/app.conf", run["id"], unrelated_step_id,
+    )
+    restore_step = env["add_approved_action_step"](
+        run["id"], "file_restore", {
+            "path": "/etc/app.conf", "backup_path": backup,
+        },
+    )
+
+    with pytest.raises(AutonomyValidationError, match="successful file patch"):
+        env["executor"].execute_step(
+            "admin", "admin", run["id"], restore_step,
+        )
+    assert env["runner"].calls == []

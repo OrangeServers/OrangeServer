@@ -46,15 +46,27 @@ LangGraph 只负责流程游标，MySQL 继续保存权威业务状态。
 Observation 与隔离执行环境分开。OrangeServer 只借鉴动作提案、风险确认、执行预算和
 可恢复验证，不引入其完整 Runtime，也不把通用 Shell 直接交给模型。
 
+### OpenCode、Continue 与 mini-SWE-agent
+
+[OpenCode permissions](https://opencode.ai/docs/permissions) 和
+[Continue tool permissions](https://docs.continue.dev/cli/tool-permissions) 都先用确定性
+规则把工具调用归为允许、询问或拒绝，再由用户选择是否扩大当前会话的授权；
+[mini-SWE-agent](https://mini-swe-agent.com/latest/advanced/environments/) 则把确认模式与
+本地、容器等执行环境分开。OrangeServer 借鉴的是这套最小分层：服务端固定
+`allow | ask | deny`、用户选择权限档案、执行器保持独立安全边界。不会复制它们面向
+本机代码工作区的路径规则，也不会引入通用策略语言。
+
 ## 当前边界与未来自治
 
-当前只读诊断仍不接受 Shell；当前修复动作仍需人工确认。规划中的“实验室自治”也不是
-绕过这条边界，而是新增服务端固定的模式、资产环境、结构化动作、策略判断、预算、
-checkpoint 和独立验证。
+当前只读诊断仍不接受 Shell；当前修复动作仍需人工确认。规划中的“自动”权限档案也
+不是绕过这条边界，而是新增服务端固定的资产环境、结构化动作、策略判断、预算、
+checkpoint 和独立验证。白名单只读探针判为 `allow` 后可以连续调查；`ask` 才进入
+LangGraph interrupt，`deny` 永远不能由模型、Guardian 或人工提升。
 
 未来可以支持任意 Shell 提案，但它始终需要绑定目标、凭据、参数和步骤的精确审批。
-结构化普通变更只能在管理员标记的 `lab` 资产上自动执行；生产环境和高影响动作不会
-因为模型声称“安全”而跳过审批。
+S3 允许对不可变计划作一次授权，计划内的调查、变更和验证连续执行；动作、参数、
+顺序、目标、凭据或策略版本发生变化时授权立即失效。可选 Guardian 只替代 `ask` 的
+边界判断且只能收紧权限，不参与每个白名单探针，也不成为授权源。
 
 ## 明确不照搬的部分
 

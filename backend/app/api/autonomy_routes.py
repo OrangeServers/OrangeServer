@@ -40,6 +40,11 @@ def register_autonomy_routes(app: Any) -> None:
         _secure(views.start_run, *admins), methods=["POST"],
     )
     app.add_url_rule(
+        "/ai/autonomous-runs/<string:run_id>/cancel",
+        "ai_autonomy_run_cancel",
+        _secure(views.cancel_run, *admins), methods=["POST"],
+    )
+    app.add_url_rule(
         "/ai/autonomous-runs/<string:run_id>/steps", "ai_autonomy_propose_step",
         _secure(views.propose_step, *admins), methods=["POST"],
     )

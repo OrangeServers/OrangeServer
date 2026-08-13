@@ -163,9 +163,17 @@ CREATE TABLE `t_ai_autonomous_run` (
   `latest_event_seq` int NOT NULL DEFAULT 0,
   `cancel_requested` tinyint(1) NOT NULL DEFAULT 0,
   `lease_owner` varchar(64) DEFAULT NULL,
+  `lease_token` varchar(64) DEFAULT NULL,
   `lease_expires_at` datetime DEFAULT NULL,
   `heartbeat_at` datetime DEFAULT NULL,
   `graph_version` varchar(32) NOT NULL DEFAULT 'v1',
+  `active_host_id` int GENERATED ALWAYS AS (
+    CASE WHEN `status` IN (
+      _utf8mb4'completed',_utf8mb4'failed',
+      _utf8mb4'cancelled',_utf8mb4'expired'
+    )
+      THEN NULL ELSE `host_id` END
+  ) STORED,
   `started_at` datetime DEFAULT NULL,
   `completed_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -176,7 +184,8 @@ CREATE TABLE `t_ai_autonomous_run` (
   KEY `idx_ai_auto_run_status` (`status`),
   KEY `idx_ai_auto_run_created_at` (`created_at`),
   KEY `idx_ai_auto_run_updated_at` (`updated_at`),
-  KEY `idx_ai_auto_run_lease_expires` (`lease_expires_at`)
+  KEY `idx_ai_auto_run_lease_expires` (`lease_expires_at`),
+  UNIQUE KEY `uq_ai_auto_run_active_host` (`active_host_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE `t_ai_autonomous_step` (

@@ -21,6 +21,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict
+from urllib.parse import urlsplit
 
 
 # 动作 schema 版本。digest 与快照都绑定该版本；升级动作结构时必须
@@ -88,7 +89,7 @@ _PROBES: Dict[str, Dict[str, Any]] = {
         'title': '端口连通性验证',
         'command': 'nc -z -w 5 {host} {port}',
         'params': {
-            'host': re.compile(r'^[A-Za-z0-9.-]{1,253}$'),
+            'host': re.compile(r'^[A-Za-z0-9.:-]{1,253}$'),
             'port': re.compile(r'^[1-9][0-9]{0,4}$'),
         },
         'check': lambda params: _check_port_range(params),
@@ -102,7 +103,7 @@ _PROBES: Dict[str, Dict[str, Any]] = {
         'params': {
             # 只允许 scheme://host[:port]/path；查询串、凭据与元字符
             # 在白名单字符集之外，直接拒绝。
-            'url': re.compile(r'^https?://[A-Za-z0-9._:/-]{1,500}$'),
+            'url': re.compile(r'^https?://[A-Za-z0-9._:/\[\]-]{1,500}$'),
         },
     },
     'verify.process_running': {
@@ -158,8 +159,8 @@ PATCH_CONTENT_MAX_BYTES = 8192
 def _check_bounded_path(params: Dict[str, str], roots) -> None:
     """有界读取路径复核：逐段拒绝 `..`，限定根目录，敏感路径拒绝。
 
-    符号链接逃逸不在 v1 承诺范围内；白名单根目录已经把攻击面收到
-    最小，剩余风险由审批与审计兜底。
+    这里完成纯参数校验；执行命令还会在远端做 canonical/no-follow
+    校验并通过已验证的文件描述符读取，拒绝符号链接逃逸。
     """
     # 延迟导入：policy 依赖本模块的 StructuredAction。
     from app.ai.autonomy.policy import is_sensitive_path
@@ -184,6 +185,55 @@ def _check_port_range(params: Dict[str, str]) -> None:
     port = int(params['port'])
     if port < 1 or port > 65535:
         raise ActionValidationError('port must be within 1..65535')
+
+
+_REMOTE_LOOPBACK_HOSTS = frozenset({'localhost', '127.0.0.1', '::1'})
+
+
+def _check_network_probe_target(
+    probe_id: str,
+    params: Dict[str, str],
+    target_host: str,
+) -> None:
+    """Bind network verification to the authoritative Run target.
+
+    The command executes on the target over SSH, so its own loopback is also
+    in scope.  Arbitrary model-supplied hosts are never resolved or accepted.
+    """
+    authoritative = str(target_host or '').strip().strip('[]').lower()
+    if not authoritative:
+        raise ActionValidationError(
+            'network verification requires the current run target'
+        )
+
+    if probe_id == 'verify.port_open':
+        requested = str(params.get('host') or '').strip().strip('[]').lower()
+    else:
+        try:
+            parsed = urlsplit(str(params.get('url') or ''))
+            requested = str(parsed.hostname or '').strip().lower()
+            # Force urlsplit to validate a numeric port when one is present.
+            parsed.port
+        except ValueError:
+            raise ActionValidationError(
+                'HTTP verification URL is malformed'
+            ) from None
+        if (
+            parsed.scheme not in ('http', 'https')
+            or not requested
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ActionValidationError(
+                'HTTP verification URL is malformed'
+            )
+
+    if requested not in _REMOTE_LOOPBACK_HOSTS and requested != authoritative:
+        raise ActionValidationError(
+            'network verification host must match the current run target'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +356,59 @@ def _shell_single_quote(text: str) -> str:
     return "'" + str(text).replace("'", "'\\''") + "'"
 
 
+def _matching_root(path: str, roots) -> str:
+    matches = [
+        root for root in roots
+        if path == root or path.startswith(root + '/')
+    ]
+    if not matches:
+        raise ActionValidationError('path is outside the allowed roots')
+    return max(matches, key=len)
+
+
+def _build_bounded_read_command(
+    path: str,
+    lines: str,
+    roots,
+    reader: str,
+) -> str:
+    """Read via verified descriptors on the remote Linux host."""
+    root = _matching_root(path, roots)
+    script = '\n'.join((
+        'set -eu',
+        'path=$1',
+        'root=$2',
+        'lines=$3',
+        'parent=${path%/*}',
+        'name=${path##*/}',
+        '[ -n "$parent" ] || parent=/',
+        'canonical_root=$(realpath -e -- "$root")',
+        '[ "$canonical_root" = "$root" ] || exit 64',
+        'canonical_parent=$(realpath -e -- "$parent")',
+        '[ "$canonical_parent" = "$parent" ] || exit 64',
+        'case "$canonical_parent" in',
+        '  "$root"|"$root"/*) ;;',
+        '  *) exit 64 ;;',
+        'esac',
+        'canonical_path=$(realpath -e -- "$path")',
+        '[ "$canonical_path" = "$path" ] || exit 64',
+        '[ -f "$path" ] && [ ! -L "$path" ] || exit 64',
+        'exec 4<"$parent"',
+        'opened_parent=$(readlink -f -- "/proc/self/fd/4")',
+        '[ "$opened_parent" = "$parent" ] || exit 64',
+        'exec 3<"/proc/self/fd/4/$name"',
+        'opened=$(readlink -f -- "/proc/self/fd/3")',
+        '[ "$opened" = "$path" ] || exit 64',
+        '%s -n "$lines" <&3' % reader,
+    ))
+    return 'sh -c %s ogs-bounded-read %s %s %s' % (
+        _shell_single_quote(script),
+        _shell_single_quote(path),
+        _shell_single_quote(root),
+        _shell_single_quote(lines),
+    )
+
+
 def patch_backup_path(path: str, run_id: str, step_id: str) -> str:
     """确定性备份路径：同目录受管备份目录 + 原名 + 派生 token。
 
@@ -324,9 +427,9 @@ def patch_backup_path(path: str, run_id: str, step_id: str) -> str:
 def build_file_patch_command(
     path: str, content: str, backup_path: str,
 ) -> str:
-    """构造补丁命令：建备份目录 + 整文件备份 + 写入新内容。
+    """构造补丁命令：备份、生成 unified diff、原子写入新内容。
 
-    三段以 && 串联：备份失败绝不写入。本构造器不走通用模板白名单
+    备份或 diff 失败都绝不替换目标。本构造器不走通用模板白名单
     （内容天然含元字符），安全性由路径白名单 + 单引号转义 + 永久
     拒绝清单承担。
     """
@@ -340,13 +443,64 @@ def build_file_patch_command(
         )
     if not text:
         raise ActionValidationError('patch content is empty')
-    backup_dir = backup_path.rsplit('/', 1)[0]
-    command = 'mkdir -p -- %s && cp -p -- %s %s && printf %%s %s > %s' % (
+    backup_dir, backup_name = _check_managed_backup_path(path, backup_path)
+    root = _matching_root(path, _PATCH_ROOTS)
+    script = '\n'.join((
+        'set -eu',
+        'path=$1',
+        'root=$2',
+        'backup_dir=$3',
+        'backup_name=$4',
+        'content=$5',
+        'parent=${path%/*}',
+        'name=${path##*/}',
+        '[ -n "$parent" ] || parent=/',
+        'canonical_root=$(realpath -e -- "$root")',
+        '[ "$canonical_root" = "$root" ] || exit 64',
+        'canonical_parent=$(realpath -e -- "$parent")',
+        '[ "$canonical_parent" = "$parent" ] || exit 64',
+        'case "$canonical_parent" in',
+        '  "$root"|"$root"/*) ;;',
+        '  *) exit 64 ;;',
+        'esac',
+        'canonical_path=$(realpath -e -- "$path")',
+        '[ "$canonical_path" = "$path" ] || exit 64',
+        '[ -f "$path" ] && [ ! -L "$path" ] || exit 64',
+        'exec 4<"$parent"',
+        'opened_parent=$(readlink -f -- "/proc/self/fd/4")',
+        '[ "$opened_parent" = "$parent" ] || exit 64',
+        'exec 3<"/proc/self/fd/4/$name"',
+        'opened=$(readlink -f -- "/proc/self/fd/3")',
+        '[ "$opened" = "$path" ] || exit 64',
+        '[ ! -L "/proc/self/fd/4/%s" ] || exit 64' % PATCH_BACKUP_DIR,
+        'mkdir -p -- "/proc/self/fd/4/%s"' % PATCH_BACKUP_DIR,
+        'canonical_backup=$(realpath -e -- "/proc/self/fd/4/%s")'
+        % PATCH_BACKUP_DIR,
+        '[ "$canonical_backup" = "$backup_dir" ] || exit 64',
+        'exec 5<"/proc/self/fd/4/%s"' % PATCH_BACKUP_DIR,
+        'opened_backup=$(readlink -f -- "/proc/self/fd/5")',
+        '[ "$opened_backup" = "$backup_dir" ] || exit 64',
+        'backup_tmp=$(mktemp -- "/proc/self/fd/5/.ogs-backup.XXXXXX")',
+        'target_tmp=$(mktemp -- "/proc/self/fd/4/.ogs-patch.XXXXXX")',
+        "trap 'rm -f -- \"$backup_tmp\" \"$target_tmp\"' EXIT HUP INT TERM",
+        'cp -p -- "/proc/self/fd/3" "$backup_tmp"',
+        'mv -fT -- "$backup_tmp" "/proc/self/fd/5/$backup_name"',
+        'cp -p -- "/proc/self/fd/3" "$target_tmp"',
+        'printf %s "$content" >"$target_tmp"',
+        'diff_rc=0',
+        'diff -u --label "$path.before" --label "$path.after" '
+        '"/proc/self/fd/3" "$target_tmp" || diff_rc=$?',
+        '[ "$diff_rc" -le 1 ] || exit 65',
+        'mv -fT -- "$target_tmp" "/proc/self/fd/4/$name"',
+        'trap - EXIT HUP INT TERM',
+    ))
+    command = 'sh -c %s ogs-file-patch %s %s %s %s %s' % (
+        _shell_single_quote(script),
+        _shell_single_quote(path),
+        _shell_single_quote(root),
         _shell_single_quote(backup_dir),
-        _shell_single_quote(path),
-        _shell_single_quote(backup_path),
+        _shell_single_quote(backup_name),
         _shell_single_quote(text),
-        _shell_single_quote(path),
     )
     deny_reason = permanent_deny_reason(command)
     if deny_reason is not None:
@@ -361,8 +515,67 @@ def build_file_restore_command(path: str, backup_path: str) -> str:
     from app.ai.autonomy.policy import permanent_deny_reason
 
     _check_patch_path(path)
+    backup_dir, backup_name = _check_managed_backup_path(path, backup_path)
+    root = _matching_root(path, _PATCH_ROOTS)
+    script = '\n'.join((
+        'set -eu',
+        'path=$1',
+        'root=$2',
+        'backup_dir=$3',
+        'backup_name=$4',
+        'parent=${path%/*}',
+        'name=${path##*/}',
+        '[ -n "$parent" ] || parent=/',
+        'canonical_root=$(realpath -e -- "$root")',
+        '[ "$canonical_root" = "$root" ] || exit 64',
+        'canonical_parent=$(realpath -e -- "$parent")',
+        '[ "$canonical_parent" = "$parent" ] || exit 64',
+        'case "$canonical_parent" in',
+        '  "$root"|"$root"/*) ;;',
+        '  *) exit 64 ;;',
+        'esac',
+        'canonical_path=$(realpath -e -- "$path")',
+        '[ "$canonical_path" = "$path" ] || exit 64',
+        '[ -f "$path" ] && [ ! -L "$path" ] || exit 64',
+        'exec 4<"$parent"',
+        'opened_parent=$(readlink -f -- "/proc/self/fd/4")',
+        '[ "$opened_parent" = "$parent" ] || exit 64',
+        'exec 3<"/proc/self/fd/4/$name"',
+        'opened=$(readlink -f -- "/proc/self/fd/3")',
+        '[ "$opened" = "$path" ] || exit 64',
+        '[ -d "/proc/self/fd/4/%s" ]' % PATCH_BACKUP_DIR,
+        '[ ! -L "/proc/self/fd/4/%s" ]' % PATCH_BACKUP_DIR,
+        'exec 5<"/proc/self/fd/4/%s"' % PATCH_BACKUP_DIR,
+        'opened_backup=$(readlink -f -- "/proc/self/fd/5")',
+        '[ "$opened_backup" = "$backup_dir" ] || exit 64',
+        'exec 6<"/proc/self/fd/5/$backup_name"',
+        'opened_backup_file=$(readlink -f -- "/proc/self/fd/6")',
+        '[ "$opened_backup_file" = "$backup_dir/$backup_name" ] || exit 64',
+        'target_tmp=$(mktemp -- "/proc/self/fd/4/.ogs-restore.XXXXXX")',
+        "trap 'rm -f -- \"$target_tmp\"' EXIT HUP INT TERM",
+        'cp -p -- "/proc/self/fd/6" "$target_tmp"',
+        'mv -fT -- "$target_tmp" "/proc/self/fd/4/$name"',
+        'trap - EXIT HUP INT TERM',
+    ))
+    command = 'sh -c %s ogs-file-restore %s %s %s %s' % (
+        _shell_single_quote(script),
+        _shell_single_quote(path),
+        _shell_single_quote(root),
+        _shell_single_quote(backup_dir),
+        _shell_single_quote(backup_name),
+    )
+    deny_reason = permanent_deny_reason(command)
+    if deny_reason is not None:
+        raise ActionValidationError(
+            'constructed command is permanently denied: %s' % (deny_reason,)
+        )
+    return command
+
+
+def _check_managed_backup_path(path: str, backup_path: str):
     expected_dir = '%s/%s' % (path.rsplit('/', 1)[0], PATCH_BACKUP_DIR)
-    if not backup_path.startswith(expected_dir + '/'):
+    backup_dir = backup_path.rsplit('/', 1)[0]
+    if backup_dir != expected_dir:
         raise ActionValidationError(
             'backup must live in the managed backup directory'
         )
@@ -371,16 +584,7 @@ def build_file_restore_command(path: str, backup_path: str) -> str:
         raise ActionValidationError(
             'backup name does not match the managed suffix whitelist'
         )
-    command = 'cp -p -- %s %s' % (
-        _shell_single_quote(backup_path),
-        _shell_single_quote(path),
-    )
-    deny_reason = permanent_deny_reason(command)
-    if deny_reason is not None:
-        raise ActionValidationError(
-            'constructed command is permanently denied: %s' % (deny_reason,)
-        )
-    return command
+    return backup_dir, name
 
 
 def _check_patch_path(path: str) -> None:
@@ -500,7 +704,12 @@ def validate_probe(probe_id: str, params: Dict[str, Any]) -> Dict[str, str]:
     return normalized
 
 
-def build_probe_command(probe_id: str, params: Dict[str, Any]) -> str:
+def build_probe_command(
+    probe_id: str,
+    params: Dict[str, Any],
+    *,
+    target_host: str = '',
+) -> str:
     """由服务端模板构造最终命令。
 
     模板与参数都来自服务端白名单；构造结果再做一次元字符自检，
@@ -509,6 +718,16 @@ def build_probe_command(probe_id: str, params: Dict[str, Any]) -> str:
     """
     spec = probe_spec(probe_id)
     normalized = validate_probe(probe_id, params)
+    if probe_id in ('verify.port_open', 'verify.http_status'):
+        _check_network_probe_target(probe_id, normalized, target_host)
+    if probe_id in ('file.read_bounded', 'log.tail'):
+        return _build_bounded_read_command(
+            normalized['path'],
+            normalized['lines'],
+            _FILE_READ_ROOTS if probe_id == 'file.read_bounded'
+            else _LOG_TAIL_ROOTS,
+            'head' if probe_id == 'file.read_bounded' else 'tail',
+        )
     template = spec['command']
     if isinstance(template, dict):
         # 与写模板同构的 selector 分发（如包查询按管理器选命令）。
@@ -543,7 +762,9 @@ def build_action_digest(action: StructuredAction, secret_key: str) -> str:
         action.to_canonical_dict(), sort_keys=True,
         separators=(',', ':'), ensure_ascii=True,
     ).encode('utf-8')
-    return hmac.new(_digest_key(secret_key), payload, hashlib.sha256).hexdigest()
+    return hmac.new(
+        _digest_key(secret_key), payload, hashlib.sha256,
+    ).hexdigest()
 
 
 def verify_action_digest(
@@ -558,6 +779,8 @@ def verify_action_digest(
 def action_from_dict(data: Dict[str, Any]) -> StructuredAction:
     """从落库快照重建动作（审批复核用）。缺字段即视为篡改。"""
     try:
+        if int(data['action_version']) != ACTION_VERSION:
+            raise ActionValidationError('unsupported action snapshot version')
         return StructuredAction(
             kind=str(data['kind']),
             target_id=int(data['target_id']),

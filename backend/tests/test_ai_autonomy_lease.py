@@ -72,7 +72,7 @@ def lease_env():
             goal="diagnose latency",
             host_id=int(host.id),
             system_user_id=19,
-            mode="assisted",
+            mode="ask",
         )
         payload.update(kwargs)
         run = repo.create_run("admin", "admin", **payload)
@@ -80,6 +80,7 @@ def lease_env():
 
     env = {
         "session": session,
+        "repo": repo,
         "lease": RunLeaseService(session),
         "create_queued_run": create_queued_run,
     }
@@ -103,10 +104,15 @@ def test_claim_moves_queued_run_to_running_with_lease(lease_env):
     row = _row(lease_env["session"], run["id"])
     assert row.status == "running"
     assert row.lease_owner == "worker-a"
+    assert row.lease_token == claimed["lease_token"]
+    assert len(claimed["lease_token"]) >= 32
     assert row.lease_expires_at is not None
     assert row.heartbeat_at is not None
     assert claimed["revision"] == int(row.revision)
     assert claimed["revision"] == run["revision"] + 1
+    assert "lease_token" not in lease_env["repo"].get_run(
+        "admin", run["id"],
+    )
 
 
 def test_duplicate_delivery_never_runs_run_in_parallel(lease_env):
@@ -172,6 +178,31 @@ def test_expired_lease_can_be_reclaimed_by_another_worker(lease_env):
     assert row.status == "recovering"
 
 
+def test_expired_lease_reclaim_fences_stale_same_identity(lease_env):
+    """每次 claim 都产生新 token；进程 identity 复用也不能越过接管。"""
+    run = lease_env["create_queued_run"]()
+    now = datetime.datetime.utcnow()
+    first = lease_env["lease"].claim_run(
+        run["id"], "worker-a", TTL, now=now,
+    )
+    late = now + datetime.timedelta(seconds=TTL + 1)
+    second = lease_env["lease"].claim_run(
+        run["id"], "worker-a", TTL, now=late,
+    )
+
+    assert first["lease_token"] != second["lease_token"]
+    assert lease_env["lease"].heartbeat(
+        run["id"], "worker-a", first["lease_token"], TTL,
+        now=late + datetime.timedelta(seconds=1),
+    ) is None
+    assert lease_env["lease"].release_lease(
+        run["id"], "worker-a", first["lease_token"],
+        now=late + datetime.timedelta(seconds=1),
+    ) is None
+    row = _row(lease_env["session"], run["id"])
+    assert row.lease_token == second["lease_token"]
+
+
 def test_expired_waiting_approval_lease_can_be_reclaimed(lease_env):
     """waiting_approval 的租约过期后同样可被接管。"""
     session = lease_env["session"]
@@ -200,55 +231,70 @@ def test_claim_rejects_non_queued_or_unknown_run(lease_env):
 
 
 # ---------------------------------------------------------------------------
-# 心跳 / 释放：revision 守卫挡住陈旧 Worker
+# 心跳 / 释放：lease owner 隔离，不与业务 revision 相互干扰
 # ---------------------------------------------------------------------------
 
-def test_heartbeat_refreshes_lease_and_bumps_revision(lease_env):
+def test_heartbeat_refreshes_lease_without_bumping_business_revision(lease_env):
     run = lease_env["create_queued_run"]()
     claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
     renewed = lease_env["lease"].heartbeat(
-        run["id"], "worker-a", claimed["revision"], TTL,
+        run["id"], "worker-a", claimed["lease_token"], TTL,
+    )
+    assert renewed is not None
+    assert renewed["revision"] == claimed["revision"]
+
+
+def test_heartbeat_survives_unrelated_business_revision_change(lease_env):
+    """审批/取消等业务 revision 变化不能误杀仍持有租约的 Worker。"""
+    run = lease_env["create_queued_run"]()
+    claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
+    row = _row(lease_env["session"], run["id"])
+    row.revision += 1
+    row.cancel_requested = True
+    lease_env["session"].commit()
+    renewed = lease_env["lease"].heartbeat(
+        run["id"], "worker-a", claimed["lease_token"], TTL,
     )
     assert renewed is not None
     assert renewed["revision"] == claimed["revision"] + 1
-
-
-def test_heartbeat_with_stale_revision_is_rejected(lease_env):
-    """持有旧 revision 的陈旧 Worker 无法续租。"""
-    run = lease_env["create_queued_run"]()
-    claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
-    lease_env["lease"].heartbeat(
-        run["id"], "worker-a", claimed["revision"], TTL,
-    )
-    stale = lease_env["lease"].heartbeat(
-        run["id"], "worker-a", claimed["revision"], TTL,
-    )
-    assert stale is None
 
 
 def test_heartbeat_by_non_owner_is_rejected(lease_env):
     run = lease_env["create_queued_run"]()
     claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
     assert lease_env["lease"].heartbeat(
-        run["id"], "worker-b", claimed["revision"], TTL,
+        run["id"], "worker-b", claimed["lease_token"], TTL,
     ) is None
 
 
-def test_release_clears_lease_only_for_owner_with_current_revision(lease_env):
+def test_expired_owner_cannot_revive_or_release_lease(lease_env):
+    run = lease_env["create_queued_run"]()
+    now = datetime.datetime.utcnow()
+    claimed = lease_env["lease"].claim_run(
+        run["id"], "worker-a", TTL, now=now,
+    )
+    expired = now + datetime.timedelta(seconds=TTL + 1)
+    assert lease_env["lease"].heartbeat(
+        run["id"], "worker-a", claimed["lease_token"], TTL, now=expired,
+    ) is None
+    assert lease_env["lease"].release_lease(
+        run["id"], "worker-a", claimed["lease_token"], now=expired,
+    ) is None
+
+
+def test_release_clears_lease_only_for_current_owner(lease_env):
     run = lease_env["create_queued_run"]()
     claimed = lease_env["lease"].claim_run(run["id"], "worker-a", TTL)
     assert lease_env["lease"].release_lease(
-        run["id"], "worker-b", claimed["revision"],
-    ) is None
-    assert lease_env["lease"].release_lease(
-        run["id"], "worker-a", claimed["revision"] - 1,
+        run["id"], "worker-b", claimed["lease_token"],
     ) is None
     released = lease_env["lease"].release_lease(
-        run["id"], "worker-a", claimed["revision"],
+        run["id"], "worker-a", claimed["lease_token"],
     )
     assert released is not None
     row = _row(lease_env["session"], run["id"])
     assert row.lease_owner is None
+    assert row.lease_token is None
     assert row.lease_expires_at is None
 
 

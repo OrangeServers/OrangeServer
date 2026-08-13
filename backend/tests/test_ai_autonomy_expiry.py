@@ -77,7 +77,7 @@ def expiry_env(monkeypatch):
             goal="diagnose latency",
             host_id=int(host.id),
             system_user_id=19,
-            mode="assisted",
+            mode="ask",
         )
         payload.update(kwargs)
         return repo.create_run("admin", "admin", **payload)
@@ -141,7 +141,11 @@ def test_expired_draft_cannot_start_and_falls_to_expired(expiry_env):
     session = expiry_env["session"]
     repo = expiry_env["repo"]
     run = expiry_env["create_draft"]()
-    _rewind(session, session.get(t_ai_autonomous_run, run["id"]))
+    row = session.get(t_ai_autonomous_run, run["id"])
+    row.lease_owner = "stale-worker"
+    row.lease_token = "stale-claim"
+    row.lease_expires_at = datetime.datetime.utcnow()
+    _rewind(session, row)
 
     with pytest.raises(AutonomyConflict):
         repo.start_run("admin", "admin", run["id"])
@@ -149,6 +153,9 @@ def test_expired_draft_cannot_start_and_falls_to_expired(expiry_env):
     row = session.get(t_ai_autonomous_run, run["id"])
     assert row.status == "expired"
     assert row.completed_at is not None
+    assert row.lease_owner is None
+    assert row.lease_token is None
+    assert row.lease_expires_at is None
 
     events = session.query(t_ai_autonomous_event).filter_by(
         run_id=run["id"],
@@ -181,6 +188,11 @@ def test_expired_approval_is_rejected_on_decide(expiry_env):
     repo.start_run("admin", "admin", run["id"])
     step_id = expiry_env["force_waiting_approval"](run["id"])
     step = session.query(t_ai_autonomous_step).filter_by(id=step_id).one()
+    run_row = session.get(t_ai_autonomous_run, run["id"])
+    run_row.lease_owner = "stale-worker"
+    run_row.lease_token = "stale-claim"
+    run_row.lease_expires_at = datetime.datetime.utcnow()
+    session.commit()
     _rewind(session, step)
 
     with pytest.raises(AutonomyConflict):
@@ -195,6 +207,9 @@ def test_expired_approval_is_rejected_on_decide(expiry_env):
 
     run_row = session.get(t_ai_autonomous_run, run["id"])
     assert run_row.status == "expired"
+    assert run_row.lease_owner is None
+    assert run_row.lease_token is None
+    assert run_row.lease_expires_at is None
     events = session.query(t_ai_autonomous_event).filter_by(
         run_id=run["id"], event_type="run_expired",
     ).all()

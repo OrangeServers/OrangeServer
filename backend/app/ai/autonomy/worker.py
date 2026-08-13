@@ -14,33 +14,69 @@
 - Worker 就绪时扫描 queued / 租约过期的 Run 并重新投递，覆盖
   进程重启与 Celery 丢消息两类场景。
 """
+import datetime
 import logging
+import math
 import os
 import socket
 
 from celery import Celery
 from celery.signals import worker_ready
 
+from app.ai.autonomy.readiness import autonomy_redis_url
 from app.core import config
 
 logger = logging.getLogger('autonomy_worker')
 
 DRIVE_RUN_TASK = 'ogs.autonomy.drive_run'
+RECOVERY_SCAN_INTERVAL_SECONDS = 30
 
 RESULT_CLAIMED = 'claimed'
 RESULT_SKIPPED = 'skipped'
 RESULT_EXECUTOR_UNAVAILABLE = 'executor_unavailable'
 
 _celery_app = None
+_periodic_recovery_app = None
+
+
+class LeaseRetryRequired(Exception):
+    """A live lease blocks this delivery; Celery must retry after expiry."""
+
+    def __init__(self, run_id, retry_after_seconds):
+        self.run_id = str(run_id)
+        self.retry_after_seconds = max(1, int(retry_after_seconds))
+        # Preserve constructor args so the signal survives Celery prefork
+        # exception serialization.
+        super().__init__(self.run_id, self.retry_after_seconds)
+
+    def __str__(self):
+        return 'run %s lease is still active; retry in %d seconds' % (
+            self.run_id, self.retry_after_seconds,
+        )
+
+
+def _lease_retry_delay(expires_at, now=None):
+    """Return a non-zero delay just beyond the observed lease boundary."""
+    now = now or datetime.datetime.utcnow()
+    remaining = (expires_at - now).total_seconds()
+    return max(1, int(math.ceil(remaining)) + 1)
+
+
+def _has_live_claimable_lease(state, now=None):
+    """Whether a delivery is blocked only by an unexpired active lease."""
+    if state is None or state.get('lease_expires_at') is None:
+        return False
+    now = now or datetime.datetime.utcnow()
+    if state['lease_expires_at'] < now:
+        return False
+    return state.get('status') in {
+        'queued', 'running', 'waiting_approval', 'recovering',
+    }
 
 
 def autonomy_broker_url() -> str:
     """自治专用 broker：专用 Redis 8 的 DB 1。"""
-    password = config.AI_AUTONOMY_REDIS_PASSWORD
-    auth = ':%s@' % password if password else ''
-    return 'redis://%s%s:%d/1' % (
-        auth, config.AI_AUTONOMY_REDIS_HOST, config.AI_AUTONOMY_REDIS_PORT,
-    )
+    return autonomy_redis_url(1)
 
 
 def worker_identity() -> str:
@@ -71,12 +107,13 @@ def get_celery_app():
 
 def reset_celery_app():
     """测试辅助：丢弃全局单例，迫使按当前配置重建。"""
-    global _celery_app
+    global _celery_app, _periodic_recovery_app
     _celery_app = None
+    _periodic_recovery_app = None
 
 
 def _register_tasks(app):
-    @app.task(name=DRIVE_RUN_TASK, bind=True)
+    @app.task(name=DRIVE_RUN_TASK, bind=True, max_retries=None)
     def drive_run(self, run_id):
         # Celery 任务不在 Flask 请求上下文里：db.session 必须先推
         # 应用上下文（与 cron/后台线程的既有模式一致）。
@@ -84,10 +121,15 @@ def _register_tasks(app):
         from app.core.db.database import db
 
         with flask_app.app_context():
-            return drive_run_once(
-                db.session, run_id,
-                executor=build_default_executor(db.session),
-            )
+            try:
+                return drive_run_once(
+                    db.session, run_id,
+                    executor=build_default_executor(db.session),
+                )
+            except LeaseRetryRequired as exc:
+                raise self.retry(
+                    exc=exc, countdown=exc.retry_after_seconds,
+                )
 
 
 def build_default_executor(session):
@@ -136,34 +178,29 @@ def drive_run_once(session, run_id, *, executor=None, worker_id=None,
 
     executor 为 None 表示执行器尚未接线：认领后立即释放租约并返回
     executor_unavailable，不产生任何远程副作用。
-    返回 RESULT_* 之一；认领失败（重复投递/他人持有/不可认领）
-    返回 RESULT_SKIPPED，任务按成功确认，避免无意义重投风暴。
+    返回 RESULT_* 之一；仍被有效租约占用时抛 LeaseRetryRequired，
+    注册的 Celery 任务会在租约边界后延迟重投；状态已不可认领时
+    返回 RESULT_SKIPPED 并成功确认。
     """
     from app.ai.autonomy.lease import RunLeaseService
-    from app.ai.autonomy.state import RunStatus
 
     lease = RunLeaseService(session)
     identity = worker_id or worker_identity()
     ttl = lease_ttl or config.AI_AUTONOMY_LEASE_TTL_SECONDS
-    # 执行中的重复投递：本 Worker 已持有 running 租约，原任务仍在
-    # 推进，直接确认跳过，绝不二次执行。
-    current = lease.get_lease_state(run_id)
-    if (
-        current is not None
-        and current['lease_owner'] == identity
-        and current['status'] == RunStatus.RUNNING.value
-    ):
-        logger.info(
-            'drive_run skipped: duplicate delivery of running run %s',
-            run_id,
-        )
-        return RESULT_SKIPPED
     claimed = lease.claim_run(run_id, identity, ttl)
     if claimed is None:
+        current = lease.get_lease_state(run_id)
+        if _has_live_claimable_lease(current):
+            retry_after = _lease_retry_delay(current['lease_expires_at'])
+            logger.info(
+                'drive_run delayed: run %s lease held by %s for %ss',
+                run_id, current.get('lease_owner'), retry_after,
+            )
+            raise LeaseRetryRequired(run_id, retry_after)
         logger.info('drive_run skipped: run %s not claimable', run_id)
         return RESULT_SKIPPED
     if executor is None:
-        lease.release_lease(run_id, identity, claimed['revision'])
+        lease.release_lease(run_id, identity, claimed['lease_token'])
         logger.warning(
             'drive_run released run %s: executor not wired', run_id,
         )
@@ -195,10 +232,26 @@ def dispatch_recoverable(session, celery_app=None):
 
 
 @worker_ready.connect
-def _on_worker_ready(**kwargs):
-    """Celery worker 就绪后补投漏掉/中断的 Run（仅功能启用时）。"""
-    if get_celery_app() is None:
+def _on_worker_ready(sender=None, **kwargs):
+    """就绪后立即补投，并用 Celery 自带 timer 持续扫漏投 Run。"""
+    global _periodic_recovery_app
+    app = get_celery_app()
+    if app is None:
         return
+
+    _run_recovery_scan()
+    timer = getattr(sender, 'timer', None)
+    if timer is not None:
+        if _periodic_recovery_app is app:
+            return
+        timer.call_repeatedly(
+            RECOVERY_SCAN_INTERVAL_SECONDS, _run_recovery_scan,
+        )
+        _periodic_recovery_app = app
+
+
+def _run_recovery_scan():
+    """One fail-safe recovery pass, suitable for Celery's worker timer."""
     from app.app_factory import app as flask_app
     from app.core.db.database import db
 
@@ -206,4 +259,4 @@ def _on_worker_ready(**kwargs):
         with flask_app.app_context():
             dispatch_recoverable(db.session)
     except Exception:
-        logger.exception('autonomy startup scan failed')
+        logger.exception('autonomy recovery scan failed')

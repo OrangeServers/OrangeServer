@@ -35,6 +35,10 @@ OGS_MYSQL_DBNAME=orange
 OGS_MYSQL_USER=app_user
 OGS_MYSQL_PASSWORD=$(random_hex 24)
 OGS_REDIS_PASSWORD=$(random_hex 24)
+# M1 自治功能默认关闭；密码仍预先随机生成，启用时不允许空密码回退。
+# 仅用 docker-dev-autonomy-up 做隔离验收时启用。
+OGS_AI_AUTONOMY_ENABLED=false
+OGS_AI_AUTONOMY_REDIS_PASSWORD=$(random_hex 24)
 # 留空以进入 /setup；向导会生成并写入 dev-backend-data/runtime.env。
 OGS_FLASK_SECRET_KEY=
 OGS_FERNET_KEYS=

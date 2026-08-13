@@ -5,6 +5,7 @@
 与配置断言，不连接真实 broker（投递用替身记录）。
 """
 import datetime
+import pickle
 
 import pytest
 from sqlalchemy import create_engine
@@ -77,7 +78,7 @@ def worker_env(monkeypatch):
             goal="diagnose latency",
             host_id=int(host.id),
             system_user_id=19,
-            mode="assisted",
+            mode="ask",
         )
         payload.update(kwargs)
         run = repo.create_run("admin", "admin", **payload)
@@ -125,6 +126,7 @@ def test_celery_app_uses_dedicated_broker_db1(worker_env):
     assert app.conf.worker_prefetch_multiplier == 1
     assert app.conf.result_backend is None
     assert worker.DRIVE_RUN_TASK in app.tasks
+    assert app.tasks[worker.DRIVE_RUN_TASK].max_retries is None
     # 单例：重复获取是同一实例。
     assert worker.get_celery_app() is app
 
@@ -134,8 +136,28 @@ def test_broker_url_without_password(worker_env, monkeypatch):
     assert worker.autonomy_broker_url() == "redis://192.0.2.10:6390/1"
 
 
+def test_broker_url_percent_encodes_reserved_password_characters(
+    worker_env, monkeypatch,
+):
+    monkeypatch.setattr(
+        config, "AI_AUTONOMY_REDIS_PASSWORD", "fake@pass:/#% ?",
+    )
+    assert worker.autonomy_broker_url() == (
+        "redis://:fake%40pass%3A%2F%23%25%20%3F@192.0.2.10:6390/1"
+    )
+
+
 def test_worker_identity_fits_lease_owner_column():
     assert 0 < len(worker.worker_identity()) <= 64
+
+
+def test_lease_retry_signal_survives_prefork_serialization():
+    original = worker.LeaseRetryRequired("run-x", 17)
+
+    restored = pickle.loads(pickle.dumps(original))
+
+    assert restored.run_id == "run-x"
+    assert restored.retry_after_seconds == 17
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +178,8 @@ def test_drive_run_claims_and_executes_once(worker_env):
     assert calls[0][0] == run["id"]
 
 
-def test_duplicate_delivery_never_executes_twice(worker_env):
-    """同一 Worker 的重复投递：执行中直接跳过，执行器只被调用一次。"""
+def test_duplicate_delivery_waits_without_executing_twice(worker_env):
+    """同 identity 的重复投递也延迟到租约边界，绝不二次执行。"""
     run = worker_env["create_queued_run"]()
     calls = []
 
@@ -168,16 +190,16 @@ def test_duplicate_delivery_never_executes_twice(worker_env):
         worker_env["session"], run["id"],
         executor=executor, worker_id="worker-a",
     )
-    second = worker.drive_run_once(
-        worker_env["session"], run["id"],
-        executor=executor, worker_id="worker-a",
-    )
+    with pytest.raises(worker.LeaseRetryRequired):
+        worker.drive_run_once(
+            worker_env["session"], run["id"],
+            executor=executor, worker_id="worker-a",
+        )
     assert first == worker.RESULT_CLAIMED
-    assert second == worker.RESULT_SKIPPED
     assert calls == [run["id"]]
 
 
-def test_delivery_to_other_workers_run_is_skipped(worker_env):
+def test_delivery_to_other_workers_live_run_is_retried(worker_env):
     run = worker_env["create_queued_run"]()
     calls = []
     worker.drive_run_once(
@@ -185,13 +207,78 @@ def test_delivery_to_other_workers_run_is_skipped(worker_env):
         executor=lambda run_id, claim: calls.append(run_id),
         worker_id="worker-a",
     )
+    with pytest.raises(worker.LeaseRetryRequired):
+        worker.drive_run_once(
+            worker_env["session"], run["id"],
+            executor=lambda run_id, claim: calls.append(run_id),
+            worker_id="worker-b",
+        )
+    assert calls == [run["id"]]
+
+
+def test_redelivery_retries_until_old_lease_expires_then_recovers(worker_env):
+    """Worker 丢失后的 redelivery 不能 ACK 掉唯一的恢复机会。"""
+    run = worker_env["create_queued_run"]()
+    calls = []
+
+    worker.drive_run_once(
+        worker_env["session"], run["id"],
+        executor=lambda run_id, claim: calls.append((run_id, claim)),
+        worker_id="worker-a", lease_ttl=60,
+    )
+
+    with pytest.raises(worker.LeaseRetryRequired) as caught:
+        worker.drive_run_once(
+            worker_env["session"], run["id"],
+            executor=lambda run_id, claim: calls.append((run_id, claim)),
+            worker_id="worker-b", lease_ttl=60,
+        )
+    assert caught.value.retry_after_seconds >= 1
+    assert len(calls) == 1
+    assert calls[0][0] == run["id"]
+
+    row = worker_env["session"].get(t_ai_autonomous_run, run["id"])
+    row.lease_expires_at = (
+        datetime.datetime.utcnow() - datetime.timedelta(seconds=1)
+    )
+    worker_env["session"].commit()
+
+    recovered = worker.drive_run_once(
+        worker_env["session"], run["id"],
+        executor=lambda run_id, claim: calls.append((run_id, claim)),
+        worker_id="worker-b", lease_ttl=60,
+    )
+    assert recovered == worker.RESULT_CLAIMED
+    assert [run_id for run_id, _claim in calls] == [run["id"], run["id"]]
+    worker_env["session"].expire_all()
+    row = worker_env["session"].get(t_ai_autonomous_run, run["id"])
+    assert row.status == "recovering"
+    assert row.lease_owner == "worker-b"
+
+
+def test_same_identity_expired_lease_is_reclaimed(worker_env):
+    """PID/hostname 被复用也不能让已过期租约永久跳过恢复。"""
+    run = worker_env["create_queued_run"]()
+    calls = []
+    worker.drive_run_once(
+        worker_env["session"], run["id"],
+        executor=lambda run_id, claim: calls.append(run_id),
+        worker_id="worker-a", lease_ttl=60,
+    )
+    row = worker_env["session"].get(t_ai_autonomous_run, run["id"])
+    row.lease_expires_at = (
+        datetime.datetime.utcnow() - datetime.timedelta(seconds=1)
+    )
+    worker_env["session"].commit()
+
     result = worker.drive_run_once(
         worker_env["session"], run["id"],
         executor=lambda run_id, claim: calls.append(run_id),
-        worker_id="worker-b",
+        worker_id="worker-a", lease_ttl=60,
     )
-    assert result == worker.RESULT_SKIPPED
-    assert calls == [run["id"]]
+
+    assert result == worker.RESULT_CLAIMED
+    assert calls == [run["id"], run["id"]]
 
 
 def test_drive_run_without_executor_fails_closed(worker_env):
@@ -274,6 +361,58 @@ def test_drive_run_task_runs_inside_flask_app_context(
     assert captured["inside_context"] is True
 
 
+def test_drive_run_task_uses_delayed_celery_retry_for_live_lease(
+    worker_env, monkeypatch,
+):
+    """租约未到期时必须延迟重投，不能 ACK，也不能立即忙循环。"""
+    import app.app_factory as app_factory
+    import app.core.db.database as database_mod
+
+    class _Ctx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    class _FakeFlaskApp:
+        def app_context(self):
+            return _Ctx()
+
+    class _FakeDb:
+        session = object()
+
+    monkeypatch.setattr(app_factory, "app", _FakeFlaskApp())
+    monkeypatch.setattr(database_mod, "db", _FakeDb())
+    monkeypatch.setattr(
+        worker, "build_default_executor", lambda session: object(),
+    )
+    monkeypatch.setattr(
+        worker,
+        "drive_run_once",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            worker.LeaseRetryRequired("run-x", 17)
+        ),
+    )
+
+    task = worker.get_celery_app().tasks[worker.DRIVE_RUN_TASK]
+    captured = {}
+
+    class _RetrySignal(Exception):
+        pass
+
+    def fake_retry(*, exc, countdown):
+        captured.update(exc=exc, countdown=countdown)
+        raise _RetrySignal()
+
+    monkeypatch.setattr(task, "retry", fake_retry)
+    with pytest.raises(_RetrySignal):
+        task.run("run-x")
+
+    assert isinstance(captured["exc"], worker.LeaseRetryRequired)
+    assert captured["countdown"] == 17
+
+
 def test_worker_ready_scan_runs_inside_flask_app_context(
     worker_env, monkeypatch,
 ):
@@ -317,6 +456,92 @@ def test_worker_ready_scan_runs_inside_flask_app_context(
     assert captured["inside_context"] is True
 
 
+def test_worker_ready_installs_periodic_recovery_after_publish_failure(
+    worker_env, monkeypatch,
+):
+    """初次 publish 失败后，Celery worker timer 必须持续扫描补投。"""
+    import app.app_factory as app_factory
+    import app.core.db.database as database_mod
+
+    class _Ctx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    class _FakeFlaskApp:
+        def app_context(self):
+            return _Ctx()
+
+    class _FakeDb:
+        session = object()
+
+    class _Timer:
+        def __init__(self):
+            self.callback = None
+            self.interval = None
+
+        def call_repeatedly(self, interval, callback):
+            self.interval = interval
+            self.callback = callback
+
+    class _Sender:
+        timer = _Timer()
+
+    attempts = []
+
+    def flaky_dispatch(session, celery_app=None):
+        attempts.append(session)
+        if len(attempts) == 1:
+            raise OSError("broker publish failed")
+        return []
+
+    monkeypatch.setattr(app_factory, "app", _FakeFlaskApp())
+    monkeypatch.setattr(database_mod, "db", _FakeDb())
+    monkeypatch.setattr(worker, "dispatch_recoverable", flaky_dispatch)
+
+    sender = _Sender()
+    worker._on_worker_ready(sender=sender)
+    assert len(attempts) == 1
+    assert sender.timer.interval == worker.RECOVERY_SCAN_INTERVAL_SECONDS
+    assert callable(sender.timer.callback)
+
+    sender.timer.callback()
+    assert len(attempts) == 2
+
+
+def test_worker_ready_registers_one_timer_per_worker_lifecycle(
+    worker_env, monkeypatch,
+):
+    scans = []
+
+    class _Timer:
+        def __init__(self):
+            self.registrations = []
+
+        def call_repeatedly(self, interval, callback):
+            self.registrations.append((interval, callback))
+
+    class _Sender:
+        def __init__(self):
+            self.timer = _Timer()
+
+    monkeypatch.setattr(
+        worker, "_run_recovery_scan", lambda: scans.append("scan"),
+    )
+    first = _Sender()
+    second = _Sender()
+
+    worker._on_worker_ready(sender=first)
+    worker._on_worker_ready(sender=first)
+    worker._on_worker_ready(sender=second)
+
+    assert scans == ["scan", "scan", "scan"]
+    assert len(first.timer.registrations) == 1
+    assert second.timer.registrations == []
+
+
 # ---------------------------------------------------------------------------
 # 启动扫描投递
 # ---------------------------------------------------------------------------
@@ -343,7 +568,7 @@ def test_dispatch_recoverable_sweeps_expired_before_dispatch(worker_env):
     # 先建超期 draft 再建活动 Run：同 host 活动 Run 互斥。
     draft = worker_env["repo"].create_run(
         "admin", "admin", goal="stale draft",
-        host_id=int(host.id), system_user_id=19, mode="assisted",
+        host_id=int(host.id), system_user_id=19, mode="ask",
     )
     row = session.get(t_ai_autonomous_run, draft["id"])
     row.updated_at = (

@@ -100,7 +100,7 @@ v1 仅管理员可用，一次 Run 固定一个目标资产、一个系统用户
 | 模块 | 唯一职责 |
 |---|---|
 | MySQL | Run、Step、审批、Event、Artifact 引用和最终结果的业务事实 |
-| LangGraph | `计划 → 策略 → 审批暂停 → 执行 → 观察 → 验证 → 决策` 的流程游标 |
+| LangGraph | `计划 → 策略 → 按需审批暂停 → 执行 → 观察 → 验证 → 决策` 的流程游标 |
 | 专用 Redis 8 | LangGraph checkpoint 和 Celery broker，不保存业务最终结果 |
 | Celery Worker | 按 `run_id` 推进有界步骤，不承担流程状态或结果存储 |
 | 自治执行器 | 复用现有权限、凭据、SSH host-key 校验和审计，作为唯一远程副作用入口 |
@@ -135,20 +135,35 @@ Verification 表。
 
 实现必须满足：
 
-- 活动 Run 使用数据库租约和唯一约束防止并行执行；
+- 活动 Run 使用数据库唯一约束和 `owner + 一次性 token + 到期时间` 租约 fencing
+  防止并行执行及旧 Worker 回写；
 - Run 持久化 `revision`、`graph_version`、预算、心跳、取消请求和最新 Event 序号；
 - Event 在 Run 内单调递增，GET 快照始终比 SSE 增量权威；
 - Artifact 清控制字符、脱敏、限长后使用现有 Fernet 体系加密；
 - Artifact 默认保留 7 天，Run、Step 和 Event 默认保留 90 天；
 - Graph State 只保存 ID、阶段、计数和短摘要，不放凭据、完整命令、原始日志或完整 Prompt。
 
-### 模式和动作
+### 权限档案和动作
 
-| 模式 | 自动执行范围 |
+M1 采用成熟 Agent Harness 常见的确定性 `allow | ask | deny` 决策，不让模型直接决定
+自己是否有权执行：
+
+- `allow`：动作已落在服务端固定档案内，沿 LangGraph 连续执行；
+- `ask`：进入现有 interrupt 暂停，由所选权限档案路由给人或后续 Guardian；
+- `deny`：服务端硬拒绝，人和 Guardian 都不能把它提升为允许。
+
+用户选择的是权限档案，而不是为每条命令重新选择策略：
+
+| 权限档案 | `ask` 的处理方式 |
 |---|---|
-| `read_only` | 只读调查和验证 |
-| `assisted` | 只读自动；所有变更等待精确审批 |
-| `lab_autonomous` | 仅 `lab` 资产可选；结构化普通变更自动，高影响动作仍审批 |
+| 每次询问（`ask`） | 交给人；服务端白名单内的只读探针仍连续执行 |
+| AI 审查（`ai_review`） | S3 仅把可审查边界交给独立 Guardian；不可审查、高风险或 Guardian 不可用时转人工 |
+| 自动（`auto`） | 仅 `lab` 资产可选；固定档案内的 `allow` 连续执行，剩余 `ask` 仍转人工 |
+| 自定义（`custom`） | S3 由管理员组合固定动作类别和目标范围；不提供表达式或脚本策略语言 |
+
+旧实验数据中的 `read_only | assisted | lab_autonomous` 只用于恢复已落库的 `v1` Run；
+新 Run 使用上述四个值和条件路由的 `v2` 图。权限档案只改变 `ask` 的去向，不能扩大
+当前用户、资产、凭据、环境、预算和服务端永久拒绝规则。
 
 v1 动作保持克制：
 
@@ -159,7 +174,7 @@ v1 动作保持克制：
 - 端口、HTTP、进程、日志和服务状态验证；
 - 任意 Shell 可以提交，但始终等待绑定完整动作摘要的人工审批。
 
-以下动作即使在 `lab_autonomous` 中也必须审批：新增软件源、下载并执行、账号或 SSH
+以下动作即使在“自动”档中也必须审批：新增软件源、下载并执行、账号或 SSH
 配置、网络或防火墙、内核、Docker daemon、重启关机以及范围无法确定的修改。
 
 以下动作在 v1 永久拒绝：磁盘分区或格式化、根目录或宽范围删除、主动读取密钥、
@@ -169,10 +184,18 @@ v1 动作保持克制：
 版本；任一字段变化都会使审批失效。每个动作执行前重新检查当前用户、资产权限、
 凭据授权、资产环境和 digest。
 
+S2 只修正 `allow` 被驱动层错误改成逐条审批的问题，仍以精确 Step 人工审批处理
+`ask`。S3 在 Planner 产出完整变更计划后增加一次计划授权：计划摘要绑定有序动作
+digest、目标、凭据引用、策略版本、预算和有效期；计划内动作可连续执行，任一动作、
+参数、顺序、目标、凭据或策略变化都使授权失效并重新进入 `ask`。Guardian 只审这种
+稳定的计划边界，可复用当前配置的 Provider 但使用独立会话；普通调查不调用 Guardian，
+模型调用失败、超时、格式错误或不确定时一律转人工。
+
 ### 恢复、取消和回退
 
-Celery 任务只携带 `run_id`，按至少一次投递设计。Worker 通过数据库 revision 和租约
-幂等认领 Run，并在启动时扫描 queued、请求恢复和租约过期的 Run：
+Celery 任务只携带 `run_id`，按至少一次投递设计。Worker 通过数据库 revision 和带
+一次性 token 的租约幂等认领 Run，并在启动时及运行期间周期扫描 queued、请求恢复和
+租约过期的 Run：
 
 - 只读动作可以自动重试；
 - 已确认尚未执行的结构化动作可以继续；
@@ -221,8 +244,8 @@ decision 请求只提交 `{operation, expected_revision}`，且 operation 必须
 | WP | 内容 | 完成门 |
 |---|---|---|
 | S1 安全与审批 | 领域表、资产环境、结构化动作、服务端只读探针、权限复核、不可变动作快照和 revision/digest 审批 | 全新安装/升级 schema 一致；伪装写入、越权、篡改、旧 revision 和重复审批失败 |
-| S2 执行与恢复 | 专用 Redis、Celery、LangGraph、数据库租约、checkpoint fail-closed、可取消 SSH、写意图和未知结果 | 真实 MySQL/Redis/Worker 下通过重复投递、强杀、取消和 checkpoint 丢失测试 |
-| S3 证据与产品闭环 | 脱敏 Evidence、独立 Verification、三态 Outcome、REST/SSE、工作台和聊天引用 | 隔离测试机完成调查、变更、重启、独立验证闭环；完整本地测试和视觉验收通过 |
+| S2 执行与恢复 | 专用 Redis、Celery、LangGraph `allow/ask/deny` 路由、数据库租约、checkpoint fail-closed、可取消 SSH、写意图和未知结果 | 真实 MySQL/Redis/Worker 下通过重复投递、强杀、取消和 checkpoint 丢失测试 |
+| S3 规划、证据与产品闭环 | Planner、一次计划授权、可选 Guardian、脱敏 Evidence、独立 Verification、三态 Outcome、REST/SSE、工作台和聊天引用 | 隔离测试机完成调查、变更、重启、独立验证闭环；完整本地测试和视觉验收通过 |
 
 依赖顺序：
 
@@ -240,7 +263,7 @@ MySQL/LangGraph/Redis/Celery 的职责、审批规则或恢复语义；需要改
 
 ## M1 最终验收
 
-每个 WP 运行相关后端或前端测试；WP8 在本地运行完整后端测试、前端类型检查、生产
+每个阶段运行相关后端或前端测试；S3 在本地运行完整后端测试、前端类型检查、生产
 构建、新增的最小 Vitest 和 Compose 集成测试，不依赖远端 CI 额度。
 
 最终必须覆盖：

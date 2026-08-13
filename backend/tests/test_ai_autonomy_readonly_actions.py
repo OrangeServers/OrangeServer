@@ -30,13 +30,24 @@ from app.ai.autonomy.policy import (
 # ---------------------------------------------------------------------------
 
 def test_bounded_read_probes_build_server_templates():
-    assert build_probe_command(
+    read_command = build_probe_command(
         "file.read_bounded",
         {"lines": "50", "path": "/etc/nginx/nginx.conf"},
-    ) == "head -n 50 -- /etc/nginx/nginx.conf"
-    assert build_probe_command(
+    )
+    tail_command = build_probe_command(
         "log.tail", {"lines": "100", "path": "/var/log/syslog"},
-    ) == "tail -n 100 -- /var/log/syslog"
+    )
+
+    for command, reader in (
+        (read_command, 'head -n "$lines" <&3'),
+        (tail_command, 'tail -n "$lines" <&3'),
+    ):
+        assert "realpath -e" in command
+        assert 'exec 3<"/proc/self/fd/4/$name"' in command
+        assert 'readlink -f -- "/proc/self/fd/3"' in command
+        assert reader in command
+    assert "head -n 50 -- /etc/nginx/nginx.conf" not in read_command
+    assert "tail -n 100 -- /var/log/syslog" not in tail_command
 
 
 @pytest.mark.parametrize("probe_id,path", [
@@ -70,9 +81,11 @@ def test_bounded_read_line_cap_is_enforced(lines):
 def test_verify_probes_build_server_templates():
     assert build_probe_command(
         "verify.port_open", {"host": "127.0.0.1", "port": "8080"},
+        target_host="192.0.2.40",
     ) == "nc -z -w 5 127.0.0.1 8080"
     assert build_probe_command(
         "verify.http_status", {"url": "http://localhost:8080/health"},
+        target_host="192.0.2.40",
     ) == (
         "curl --silent --show-error --output /dev/null"
         " --write-out %{http_code} --max-time 10"
@@ -85,6 +98,34 @@ def test_verify_probes_build_server_templates():
         "verify.journal_pattern",
         {"unit": "nginx", "lines": "200", "pattern": "error"},
     ) == "journalctl -u nginx -n 200 --no-pager -g error"
+
+
+def test_network_verify_probe_is_bound_to_run_target_or_remote_loopback():
+    target = "192.0.2.40"
+
+    assert build_probe_command(
+        "verify.port_open",
+        {"host": target, "port": "443"},
+        target_host=target,
+    ) == "nc -z -w 5 192.0.2.40 443"
+    assert build_probe_command(
+        "verify.http_status",
+        {"url": "http://localhost:8080/health"},
+        target_host=target,
+    ).endswith(" http://localhost:8080/health")
+
+    with pytest.raises(ActionValidationError, match="run target"):
+        build_probe_command(
+            "verify.port_open",
+            {"host": "198.51.100.8", "port": "443"},
+            target_host=target,
+        )
+    with pytest.raises(ActionValidationError, match="run target"):
+        build_probe_command(
+            "verify.http_status",
+            {"url": "https://metadata.example.com/latest"},
+            target_host=target,
+        )
 
 
 @pytest.mark.parametrize("probe_id,params", [
@@ -212,9 +253,11 @@ def test_constructed_probe_commands_stay_off_the_deny_list():
         ),
         build_probe_command(
             "verify.port_open", {"host": "db.internal", "port": "3306"},
+            target_host="db.internal",
         ),
         build_probe_command(
             "verify.http_status", {"url": "http://127.0.0.1:8080/health"},
+            target_host="192.0.2.40",
         ),
         build_probe_command(
             "verify.process_running", {"process": "nginx"},

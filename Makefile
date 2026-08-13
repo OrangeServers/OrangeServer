@@ -22,7 +22,7 @@
 #   部署机只挂载 frontend/dist/，不再跑 npm build
 # =============================================================================
 
-.PHONY: help install dev dev-backend dev-frontend build build-frontend build-backend test lint health docker-up docker-up-image docker-up-host docker-down docker-ps docker-logs docker-health setup-token docker-check docs-check docker-dev-init docker-dev-up docker-dev-down docker-dev-reset docker-dev-ps docker-dev-logs clean
+.PHONY: help install dev dev-backend dev-frontend build build-frontend build-backend test lint health docker-up docker-up-image docker-up-host docker-down docker-ps docker-logs docker-health setup-token docker-check docs-check docker-dev-init docker-dev-up docker-dev-autonomy-up docker-dev-autonomy-down docker-dev-autonomy-ps docker-dev-autonomy-logs docker-dev-down docker-dev-reset docker-dev-ps docker-dev-logs clean
 
 # 路径 (REV49: 用 abspath 解析 Makefile 所在目录, 不依赖 pwd/cwd)
 ROOT     := $(abspath $(dir $(firstword $(MAKEFILE_LIST))))
@@ -37,6 +37,8 @@ COMPOSE  := docker compose --env-file "$(ROOT)/.env" -f "$(DEPLOY)/docker-compos
 # 镜像入口只信任受权限保护的根 .env，避免调用者已 export 的旧 tag 静默覆盖。
 IMAGE_COMPOSE := env -u OGS_BACKEND_IMAGE -u OGS_BACKEND_TAG $(COMPOSE)
 DEV_COMPOSE := env -u COMPOSE_PROJECT_NAME -u OGS_DEV_BACKEND_IMAGE -u OGS_DEV_BACKEND_TAG docker compose --env-file "$(ROOT)/.env.dev" -f "$(DEPLOY)/docker-compose.dev.yml"
+# 自治开关和密码只信任权限受限的 .env.dev，避免调用者 export 的旧值覆盖。
+DEV_AUTONOMY_COMPOSE := env -u OGS_AI_AUTONOMY_ENABLED -u OGS_AI_AUTONOMY_REDIS_PASSWORD $(DEV_COMPOSE) -f "$(DEPLOY)/docker-compose.dev-autonomy.yml"
 
 help: ## 显示帮助
 	@echo "OrangeServer 一站式构建入口"
@@ -127,6 +129,29 @@ docker-dev-init: ## 首次生成全容器开发环境配置 (.env.dev)
 docker-dev-up: docker-dev-init ## 启动独立全容器开发环境 (源码映射 + Vite HMR)
 	$(DEV_COMPOSE) up -d --wait --wait-timeout 180
 	@echo "[OK] 开发环境已启动: http://127.0.0.1:$$(sed -n 's/^OGS_DEV_HTTP_PORT=//p' "$(ROOT)/.env.dev")"
+
+docker-dev-autonomy-up: docker-dev-init ## 启动 M1 自治开发栈 (显式 feature flag + Redis 8 + Worker)
+	@flag="$$(sed -n 's/^OGS_AI_AUTONOMY_ENABLED=//p' "$(ROOT)/.env.dev" | tail -1 | tr '[:upper:]' '[:lower:]')"; \
+	password="$$(sed -n 's/^OGS_AI_AUTONOMY_REDIS_PASSWORD=//p' "$(ROOT)/.env.dev" | tail -1)"; \
+	if ! printf '%s\n' "$$flag" | grep -Eq '^(1|true|yes|on)$$'; then \
+		echo "[FAIL] 请先在 .env.dev 显式设置 OGS_AI_AUTONOMY_ENABLED=true"; \
+		exit 1; \
+	fi; \
+	if [ -z "$$password" ]; then \
+		echo "[FAIL] 请先在 .env.dev 设置非空 OGS_AI_AUTONOMY_REDIS_PASSWORD"; \
+		exit 1; \
+	fi
+	$(DEV_AUTONOMY_COMPOSE) up -d --build --wait --wait-timeout 240
+	@echo "[OK] M1 自治开发栈已启动；使用 make docker-dev-autonomy-ps 检查 Worker 和 Redis 8"
+
+docker-dev-autonomy-down: docker-dev-init ## 停止 M1 自治开发栈并保留隔离数据卷
+	$(DEV_AUTONOMY_COMPOSE) down
+
+docker-dev-autonomy-ps: docker-dev-init ## 查看 M1 自治开发栈状态
+	$(DEV_AUTONOMY_COMPOSE) ps
+
+docker-dev-autonomy-logs: docker-dev-init ## 跟踪 M1 自治 Worker/Redis 8 日志
+	$(DEV_AUTONOMY_COMPOSE) logs --tail=200 -f autonomy-worker autonomy-redis
 
 docker-dev-down: docker-dev-init ## 停止开发环境，保留数据库和依赖卷
 	$(DEV_COMPOSE) down

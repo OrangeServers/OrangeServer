@@ -18,8 +18,10 @@ import re
 import uuid
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
+
 from app.ai.autonomy.actions import (
-    ACTION_VERSION,
     ActionValidationError,
     StructuredAction,
     action_from_dict,
@@ -31,21 +33,22 @@ from app.ai.autonomy.actions import (
     verify_action_digest,
 )
 from app.ai.autonomy.policy import (
-    ApprovalDecision,
     Budget,
+    PolicyDecision,
     classify_action,
     parse_budget,
     validate_mode_for_environment,
 )
+from app.ai.autonomy.graph import DEFAULT_GRAPH_VERSION
 from app.ai.autonomy.state import (
     ACTIVE_RUN_STATUSES,
+    CANONICAL_RUN_MODES,
     AiEnvironment,
-    AutonomyStateError,
     DecisionOperation,
-    RunMode,
     RunStatus,
     StepKind,
     StepStatus,
+    TERMINAL_RUN_STATUSES,
     assert_run_transition,
     assert_step_transition,
 )
@@ -72,12 +75,39 @@ class AutonomyValidationError(AutonomyError):
 
 
 _CONTROL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
-_SECRET_KEY_MARKERS = ('password', 'secret', 'token', 'credential', 'private_key')
+_SECRET_KEY_MARKERS = (
+    'password', 'secret', 'token', 'credential', 'private_key',
+)
+_ACTIVE_HOST_UNIQUE_KEY = 'uq_ai_auto_run_active_host'
+_SQLITE_ACTIVE_HOST_UNIQUE_ERROR = (
+    'UNIQUE constraint failed: t_ai_autonomous_run.active_host_id'
+)
+
+
+def _is_active_host_unique_violation(exc: IntegrityError) -> bool:
+    """只识别活动 Run 的唯一键冲突；其他完整性错误保持原样。"""
+    message = str(getattr(exc, 'orig', None) or exc)
+    return (
+        _ACTIVE_HOST_UNIQUE_KEY in message
+        or _SQLITE_ACTIVE_HOST_UNIQUE_ERROR in message
+    )
 
 
 def sanitize_text(value: str) -> str:
     """清洗控制字符（保留换行/制表），防 ANSI 注入。"""
     return _CONTROL_CHARS_RE.sub('', str(value or ''))
+
+
+def _truncate_utf8(text: str, max_bytes: int):
+    """按 UTF-8 字节安全截断，绝不返回半个多字节字符。"""
+    encoded = text.encode('utf-8', errors='replace')
+    normalized = encoded.decode('utf-8')
+    limit = max(0, int(max_bytes))
+    if len(encoded) <= limit:
+        return normalized, len(encoded), False
+    clipped = encoded[:limit].decode('utf-8', errors='ignore')
+    size_bytes = len(clipped.encode('utf-8'))
+    return clipped, size_bytes, True
 
 
 def sanitize_payload(payload: Any) -> Any:
@@ -114,6 +144,9 @@ def _expire_run_row(session, run, reason: str) -> None:
     assert_run_transition(run.status, RunStatus.EXPIRED.value)
     run.status = RunStatus.EXPIRED.value
     run.completed_at = run.completed_at or _utcnow()
+    run.lease_owner = None
+    run.lease_token = None
+    run.lease_expires_at = None
     run.revision = int(run.revision or 0) + 1
     seq = int(run.latest_event_seq or 0) + 1
     from app.core.db.database import t_ai_autonomous_event
@@ -140,7 +173,9 @@ def sweep_expired_runs(session, ttl_seconds=None, now=None) -> Dict[str, int]:
     )
 
     now = now or _utcnow()
-    cutoff = now - datetime.timedelta(seconds=_approval_ttl_seconds(ttl_seconds))
+    cutoff = now - datetime.timedelta(
+        seconds=_approval_ttl_seconds(ttl_seconds),
+    )
     expired = 0
 
     drafts = session.query(t_ai_autonomous_run).filter(
@@ -269,6 +304,7 @@ class AutonomyRepository:
             'status': row.status,
             'outcome': row.outcome,
             'revision': int(row.revision or 0),
+            'graph_version': row.graph_version,
             'budget': json.loads(row.budget_json or '{}'),
             'latest_event_seq': int(row.latest_event_seq or 0),
             'cancel_requested': bool(row.cancel_requested),
@@ -310,7 +346,7 @@ class AutonomyRepository:
         goal = sanitize_text(goal).strip()
         if not goal or len(goal) > 512:
             raise AutonomyValidationError('goal must be 1..512 characters')
-        if mode not in {m.value for m in RunMode}:
+        if mode not in {m.value for m in CANONICAL_RUN_MODES}:
             raise AutonomyValidationError('unknown mode: %r' % (mode,))
         try:
             budget = parse_budget(budget_payload)
@@ -321,9 +357,13 @@ class AutonomyRepository:
             host_id = int(host_id)
             system_user_id = int(system_user_id)
         except (TypeError, ValueError):
-            raise AutonomyValidationError('host_id/system_user_id must be integers') from None
+            raise AutonomyValidationError(
+                'host_id/system_user_id must be integers'
+            ) from None
         if host_id <= 0 or system_user_id <= 0:
-            raise AutonomyValidationError('host_id/system_user_id must be positive')
+            raise AutonomyValidationError(
+                'host_id/system_user_id must be positive'
+            )
 
         platform = self._platform(owner, role)
         if not platform.validate_asset_ids([host_id]):
@@ -357,6 +397,7 @@ class AutonomyRepository:
             system_user_id=system_user_id,
             system_user_alias=str(credential.get('alias') or ''),
             mode=mode,
+            graph_version=DEFAULT_GRAPH_VERSION,
             status=RunStatus.DRAFT.value,
             revision=0,
             budget_json=json.dumps(budget.to_dict(), sort_keys=True),
@@ -366,7 +407,18 @@ class AutonomyRepository:
         # run 与首个事件同事务落库：ORM 无 relationship 时 flush 不保证
         # 父子插入顺序，真实 MySQL 的外键会拒绝先插的事件行，必须先
         # flush 出 run 主键。
-        self.session.flush()
+        try:
+            self.session.flush()
+        except IntegrityError as exc:
+            # flush 失败后 Session 必须先 rollback 才能继续使用。只把
+            # 精确的单活唯一键冲突转换为领域 409；FK/NOT NULL 等其他
+            # 完整性错误继续上抛，不能被误报成“已有活动 Run”。
+            self.session.rollback()
+            if _is_active_host_unique_violation(exc):
+                raise AutonomyConflict(
+                    'an active autonomous run already exists for this host'
+                ) from None
+            raise
         self.append_event(run, 'run_created', {
             'mode': mode, 'host_id': host_id,
             'system_user_id': system_user_id,
@@ -391,6 +443,78 @@ class AutonomyRepository:
         run.started_at = run.started_at or _utcnow()
         self._bump(run)
         self.append_event(run, 'run_started', {'revision': run.revision})
+        self._commit()
+        return self._run_to_dict(run)
+
+    def request_cancel(
+        self, owner: str, role: str, run_id: str,
+    ) -> Dict[str, Any]:
+        """Atomically cancel idle states; request stop for in-flight work.
+
+        Cancellation is an owner/admin control-plane operation.  It must stay
+        available after target or credential access is revoked.  The locked
+        Run row serializes queued cancellation against Worker lease claims.
+        """
+        from app.core.db.database import (
+            t_ai_autonomous_run, t_ai_autonomous_step,
+        )
+
+        if role != 'admin':
+            raise AutonomyPermissionError('admin role required')
+        run = self.session.query(t_ai_autonomous_run).filter_by(
+            id=run_id, owner=owner,
+        ).with_for_update().first()
+        if run is None:
+            raise AutonomyNotFound('autonomous run not found')
+        if run.status in {s.value for s in TERMINAL_RUN_STATUSES}:
+            return self._run_to_dict(run)
+
+        cancel_without_remote_stop = run.status in {
+            RunStatus.DRAFT.value,
+            RunStatus.QUEUED.value,
+            RunStatus.WAITING_APPROVAL.value,
+        }
+        newly_requested = not bool(run.cancel_requested)
+        run.cancel_requested = True
+
+        if cancel_without_remote_stop:
+            pending_steps = self.session.query(
+                t_ai_autonomous_step,
+            ).filter(
+                t_ai_autonomous_step.run_id == run.id,
+                t_ai_autonomous_step.status.in_([
+                    StepStatus.PROPOSED.value,
+                    StepStatus.WAITING_APPROVAL.value,
+                    StepStatus.APPROVED.value,
+                ]),
+            ).with_for_update().all()
+            for step in pending_steps:
+                assert_step_transition(
+                    step.status, StepStatus.CANCELLED.value,
+                )
+                step.status = StepStatus.CANCELLED.value
+                step.note = 'cancelled before execution'
+
+            assert_run_transition(run.status, RunStatus.CANCELLED.value)
+            run.status = RunStatus.CANCELLED.value
+            run.completed_at = run.completed_at or _utcnow()
+            run.lease_owner = None
+            run.lease_token = None
+            run.lease_expires_at = None
+
+        if not newly_requested and not cancel_without_remote_stop:
+            return self._run_to_dict(run)
+
+        self._bump(run)
+        if newly_requested:
+            self.append_event(run, 'run_cancel_requested', {
+                'revision': int(run.revision),
+            })
+        if cancel_without_remote_stop:
+            self.append_event(run, 'run_cancelled', {
+                'revision': int(run.revision),
+                'reason': 'cancelled_before_execution',
+            })
         self._commit()
         return self._run_to_dict(run)
 
@@ -432,7 +556,10 @@ class AutonomyRepository:
         ).first()
         if waiting is None:
             return []
-        return [DecisionOperation.APPROVE.value, DecisionOperation.REJECT.value]
+        return [
+            DecisionOperation.APPROVE.value,
+            DecisionOperation.REJECT.value,
+        ]
 
     def snapshot(self, owner: str, run_id: str) -> Dict[str, Any]:
         run = self.get_run(owner, run_id)
@@ -477,8 +604,16 @@ class AutonomyRepository:
         if action_count >= budget.max_actions:
             raise AutonomyConflict('action budget exhausted')
 
+        host = self._get_host_row(run.host_id)
         # 预构造命令：命令本身不落快照（S1 无执行），仅用于构造期校验。
-        build_probe_command(probe_id, normalized)
+        # 网络验证由当前 Run 的权威 Host 地址限域，不能被模型参数
+        # 扩成任意目标探测。
+        try:
+            build_probe_command(
+                probe_id, normalized, target_host=str(host.host_ip),
+            )
+        except ActionValidationError as exc:
+            raise AutonomyValidationError(str(exc)) from exc
 
         step_id = uuid.uuid4().hex
         parameters = dict(normalized, probe_id=str(probe_id))
@@ -490,17 +625,18 @@ class AutonomyRepository:
             timeout_seconds=min(budget.command_timeout_seconds, 600),
             step_id=step_id,
         )
-        host = self._get_host_row(run.host_id)
-        decision, reason = classify_action(run.mode, action, host.ai_environment)
+        decision, reason = classify_action(
+            run.mode, action, host.ai_environment,
+        )
 
         seq = self.session.query(t_ai_autonomous_step).filter_by(
             run_id=run_id,
         ).count() + 1
         summary = redacted_summary(action)
 
-        if decision == ApprovalDecision.DENIED:
+        if decision == PolicyDecision.DENY:
             initial_status = StepStatus.FAILED.value
-        elif decision == ApprovalDecision.APPROVAL_REQUIRED:
+        elif decision == PolicyDecision.ASK:
             initial_status = StepStatus.WAITING_APPROVAL.value
         else:
             # 自动通过的探针留给执行器（S2）；S1 不执行任何远程命令。
@@ -517,7 +653,7 @@ class AutonomyRepository:
                 action.to_canonical_dict(), sort_keys=True, ensure_ascii=True,
             ),
             action_digest=build_action_digest(action, self.secret_key),
-            note='' if decision != ApprovalDecision.DENIED else reason[:255],
+            note='' if decision != PolicyDecision.DENY else reason[:255],
         )
         self.session.add(step)
         self._bump(run)
@@ -525,9 +661,11 @@ class AutonomyRepository:
             'step_id': step_id, 'seq': seq, 'probe_id': str(probe_id),
             'decision': decision.value, 'reason': reason,
         })
-        if decision == ApprovalDecision.APPROVAL_REQUIRED:
+        if decision == PolicyDecision.ASK:
             if run.status != RunStatus.WAITING_APPROVAL.value:
-                assert_run_transition(run.status, RunStatus.WAITING_APPROVAL.value)
+                assert_run_transition(
+                    run.status, RunStatus.WAITING_APPROVAL.value,
+                )
                 run.status = RunStatus.WAITING_APPROVAL.value
                 self._bump(run)
         self._commit()
@@ -578,7 +716,9 @@ class AutonomyRepository:
         try:
             expected = int(expected_revision)
         except (TypeError, ValueError):
-            raise AutonomyConflict('expected_revision is missing or invalid') from None
+            raise AutonomyConflict(
+                'expected_revision is missing or invalid'
+            ) from None
         if expected != int(run.revision or 0):
             raise AutonomyConflict('stale revision')
         if step.status != StepStatus.WAITING_APPROVAL.value:
@@ -589,7 +729,9 @@ class AutonomyRepository:
             action = action_from_dict(json.loads(step.action_json or '{}'))
         except (ActionValidationError, ValueError):
             raise AutonomyConflict('action snapshot is corrupted') from None
-        if not verify_action_digest(action, step.action_digest, self.secret_key):
+        if not verify_action_digest(
+            action, step.action_digest, self.secret_key,
+        ):
             raise AutonomyConflict('action digest mismatch')
 
         # 决策边界重新校验当前权限、凭据授权与资产环境。
@@ -620,7 +762,9 @@ class AutonomyRepository:
     # 资产环境（仅管理员入口在路由层强制）
     # ------------------------------------------------------------------
 
-    def set_host_environment(self, host_id: int, environment: str) -> Dict[str, Any]:
+    def set_host_environment(
+        self, host_id: int, environment: str,
+    ) -> Dict[str, Any]:
         if environment not in {e.value for e in AiEnvironment}:
             raise AutonomyValidationError('unknown ai_environment value')
         host = self._get_host_row(int(host_id))
@@ -648,30 +792,72 @@ class AutonomyRepository:
         content: str,
         step_id: Optional[str] = None,
         retention_days: int = 7,
+        force_truncated: bool = False,
+        require_full_content: bool = False,
+        commit: bool = True,
     ) -> Dict[str, Any]:
-        from app.core.db.database import t_ai_autonomous_artifact
+        from app.core.db.database import (
+            t_ai_autonomous_artifact, t_ai_autonomous_run,
+        )
         from app.tools.basesec import encrypt_secret
 
         run = self._get_run_row(owner, run_id)
+        # 生产 MySQL 通过 Run 行锁串行化同一 Run 的 Artifact 预算核算，
+        # 避免两个并发步骤都读到相同 remaining 后合计越过硬上限。
+        self.session.query(t_ai_autonomous_run.id).filter_by(
+            id=run.id,
+        ).with_for_update().one()
         budget = Budget(**json.loads(run.budget_json or '{}'))
         text = sanitize_text(content)
-        truncated = len(text.encode('utf-8', errors='replace')) > budget.step_output_bytes
-        if truncated:
-            text = text[:budget.step_output_bytes]
+        used_bytes = self.session.query(
+            func.coalesce(func.sum(t_ai_autonomous_artifact.size_bytes), 0),
+        ).filter_by(run_id=run_id).scalar()
+        remaining_bytes = max(
+            0, int(budget.run_artifact_bytes) - int(used_bytes or 0),
+        )
+        content_limit = min(int(budget.step_output_bytes), remaining_bytes)
+        text, size_bytes, truncated = _truncate_utf8(text, content_limit)
+        truncated = bool(truncated or force_truncated)
+        if require_full_content and truncated:
+            # Machine-required evidence (for example a rollback reference)
+            # must never silently become an omission marker.  The caller can
+            # then fail closed instead of reporting a write as safely
+            # recoverable without the complete reference.
+            raise AutonomyConflict(
+                'required artifact capacity is unavailable'
+            )
+        # encrypt_secret intentionally rejects empty plaintext.  A zero-byte
+        # Artifact is still useful as durable evidence that output was
+        # omitted by the hard Run budget, so encrypt an explicit marker while
+        # keeping size_bytes authoritative for budget accounting.
+        storage_text = text
+        if not storage_text:
+            storage_text = (
+                '[CONTENT OMITTED: ARTIFACT BUDGET EXHAUSTED]'
+                if truncated else '[EMPTY ARTIFACT]'
+            )
         artifact = t_ai_autonomous_artifact(
             id=uuid.uuid4().hex,
             run_id=run_id,
             step_id=step_id,
             kind=str(kind)[:32],
             title=sanitize_text(title)[:128],
-            content_ciphertext=encrypt_secret(text),
-            size_bytes=len(text.encode('utf-8', errors='replace')),
+            content_ciphertext=encrypt_secret(storage_text),
+            size_bytes=size_bytes,
             truncated=truncated,
             expires_at=_utcnow() + datetime.timedelta(days=retention_days),
         )
         self.session.add(artifact)
         self.append_event(run, 'artifact_created', {
             'artifact_id': artifact.id, 'kind': artifact.kind,
+            'size_bytes': size_bytes, 'truncated': truncated,
         })
-        self._commit()
-        return {'id': artifact.id, 'run_id': run_id, 'kind': artifact.kind}
+        if commit:
+            self._commit()
+        return {
+            'id': artifact.id,
+            'run_id': run_id,
+            'kind': artifact.kind,
+            'size_bytes': size_bytes,
+            'truncated': truncated,
+        }
