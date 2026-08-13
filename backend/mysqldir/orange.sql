@@ -142,6 +142,7 @@ CREATE TABLE `t_ai_diagnostic_report` (
 -- Table structure for M1/S1 AI autonomy (REV53, disabled by default)
 --
 
+DROP TABLE IF EXISTS `t_ai_autonomous_evidence`;
 DROP TABLE IF EXISTS `t_ai_autonomous_artifact`;
 DROP TABLE IF EXISTS `t_ai_autonomous_event`;
 DROP TABLE IF EXISTS `t_ai_autonomous_step`;
@@ -240,6 +241,26 @@ CREATE TABLE `t_ai_autonomous_artifact` (
   KEY `idx_ai_auto_artifact_run` (`run_id`),
   KEY `idx_ai_auto_artifact_expiry` (`expires_at`),
   CONSTRAINT `fk_ai_auto_artifact_run` FOREIGN KEY (`run_id`)
+    REFERENCES `t_ai_autonomous_run` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+--
+-- Table structure for table `t_ai_autonomous_evidence`
+--
+
+DROP TABLE IF EXISTS `t_ai_autonomous_evidence`;
+CREATE TABLE `t_ai_autonomous_evidence` (
+  `id` varchar(32) NOT NULL,
+  `run_id` varchar(32) NOT NULL,
+  `step_id` varchar(32) DEFAULT NULL,
+  `kind` varchar(32) NOT NULL,
+  `summary` varchar(500) NOT NULL,
+  `artifact_ids_json` text NOT NULL,
+  `trusted` tinyint(1) NOT NULL DEFAULT 0,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_ai_auto_evidence_run` (`run_id`),
+  CONSTRAINT `fk_ai_auto_evidence_run` FOREIGN KEY (`run_id`)
     REFERENCES `t_ai_autonomous_run` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

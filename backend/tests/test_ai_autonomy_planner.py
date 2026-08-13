@@ -13,6 +13,7 @@ from app.ai.autonomy.planner import (
     FINISH_TOOL_NAME,
     PLAN_TOOL_NAME,
     PROPOSAL_TOOL_NAME,
+    VERIFICATION_TOOL_NAME,
     PlannerProposalError,
     ToolCallingPlanner,
     proposal_tool_schemas,
@@ -81,6 +82,26 @@ class FakeRepo:
             raise self.error
         return {"id": "step-%d" % len(self.calls)}
 
+    def propose_verification(
+        self, owner, role, run_id, probe_id, params=None,
+    ):
+        self.calls.append(
+            {"owner": owner, "role": role, "run_id": run_id,
+             "probe_id": probe_id, "params": params},
+        )
+        if self.error is not None:
+            raise self.error
+        return {"id": "step-%d" % len(self.calls)}
+
+    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+        self.calls.append(
+            {"owner": owner, "role": role, "run_id": run_id,
+             "outcome": outcome, "evidence_ids": evidence_ids},
+        )
+        if self.error is not None:
+            raise self.error
+        return {"outcome": outcome, "already_concluded": False}
+
 
 def make_context(repo, **budget_overrides):
     budget = {"remaining_loops": 5, "remaining_actions": 5}
@@ -125,7 +146,8 @@ def test_single_probe_proposal_goes_through_the_fenced_repo():
         tool["function"]["name"] for tool in request["tools"]
     }
     assert tool_names == {
-        PROPOSAL_TOOL_NAME, PLAN_TOOL_NAME, FINISH_TOOL_NAME,
+        PROPOSAL_TOOL_NAME, PLAN_TOOL_NAME, VERIFICATION_TOOL_NAME,
+        FINISH_TOOL_NAME,
     }
     plan_tool = next(
         tool for tool in request["tools"]
@@ -425,6 +447,121 @@ def test_inactive_run_conflict_still_maps_to_run_not_active():
         "steps can only be proposed while the run is active",
     ))
     adapter = FakeAdapter(results=[FakeChatResult([plan_call()])])
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+
+    assert excinfo.value.reason == "run_not_active"
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 4：验证提案工具 + finish 附带终局结论
+# ---------------------------------------------------------------------------
+
+def verification_call(probe_id="system.load", params=None):
+    return FakeToolCall(
+        VERIFICATION_TOOL_NAME,
+        {"probe_id": probe_id, "params": params or {}},
+    )
+
+
+def finish_conclusion_call(outcome="resolved", evidence_ids=("ev-1",)):
+    return FakeToolCall(FINISH_TOOL_NAME, {
+        "outcome": outcome, "evidence_ids": list(evidence_ids),
+    })
+
+
+def test_verification_proposal_goes_through_the_fenced_repo():
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[FakeChatResult([verification_call()])])
+
+    proposed = make_planner(adapter)(make_context(repo))
+
+    assert proposed == ["step-1"]
+    assert repo.calls == [{
+        "owner": "admin", "role": "admin", "run_id": "run-1",
+        "probe_id": "system.load", "params": {},
+    }]
+
+
+def test_verification_without_prior_write_maps_to_unsupported():
+    repo = FakeRepo(error=AutonomyValidationError(
+        "verification requires a prior succeeded write action",
+    ))
+    adapter = FakeAdapter(results=[FakeChatResult([verification_call()])])
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+
+    assert excinfo.value.reason == "unsupported_proposal"
+
+
+def test_verification_schema_pins_the_probe_registry_enum():
+    from app.ai.autonomy.actions import list_probe_ids
+
+    schemas = proposal_tool_schemas()
+    tool = next(
+        item for item in schemas
+        if item["function"]["name"] == VERIFICATION_TOOL_NAME
+    )
+    enum = tool["function"]["parameters"]["properties"]["probe_id"]["enum"]
+    assert enum == list_probe_ids()
+
+
+def test_finish_with_conclusion_calls_conclude_run():
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[FakeChatResult([
+        finish_conclusion_call("resolved", ("ev-1", "ev-2")),
+    ])])
+
+    assert make_planner(adapter)(make_context(repo)) == []
+    assert repo.calls == [{
+        "owner": "admin", "role": "admin", "run_id": "run-1",
+        "outcome": "resolved", "evidence_ids": ["ev-1", "ev-2"],
+    }]
+
+
+@pytest.mark.parametrize("arguments", [
+    {"outcome": "success", "evidence_ids": ["ev-1"]},
+    {"outcome": "resolved", "evidence_ids": []},
+    {"outcome": "resolved", "evidence_ids": "ev-1"},
+    {"outcome": "resolved"},
+    {"evidence_ids": ["ev-1"]},
+])
+def test_malformed_conclusions_fail_closed_without_repo_calls(arguments):
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[FakeChatResult([
+        FakeToolCall(FINISH_TOOL_NAME, arguments),
+    ])])
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+
+    assert excinfo.value.reason == "malformed_proposal"
+    assert repo.calls == []
+
+
+def test_conclude_validation_error_maps_to_malformed_proposal():
+    repo = FakeRepo(error=AutonomyValidationError(
+        "conclusion may only cite same-run evidence",
+    ))
+    adapter = FakeAdapter(results=[FakeChatResult([
+        finish_conclusion_call("resolved", ("foreign-ev",)),
+    ])])
+
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+
+    assert excinfo.value.reason == "malformed_proposal"
+
+
+def test_conclude_conflict_maps_to_run_not_active():
+    repo = FakeRepo(error=AutonomyConflict(
+        "outcome can only be concluded while the run is active",
+    ))
+    adapter = FakeAdapter(results=[FakeChatResult([
+        finish_conclusion_call("inconclusive", ("ev-1",)),
+    ])])
 
     with pytest.raises(PlannerProposalError) as excinfo:
         make_planner(adapter)(make_context(repo))

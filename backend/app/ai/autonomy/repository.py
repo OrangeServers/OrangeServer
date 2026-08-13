@@ -25,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from app.ai.autonomy.actions import (
     ActionValidationError,
     StructuredAction,
+    WRITE_KINDS,
     action_from_dict,
     build_action_digest,
     build_probe_command,
@@ -58,6 +59,7 @@ from app.ai.autonomy.state import (
     AiEnvironment,
     DecisionOperation,
     RunMode,
+    RunOutcome,
     RunStatus,
     StepKind,
     StepStatus,
@@ -100,6 +102,14 @@ CUSTOM_ACTION_CATEGORIES = frozenset({
     'file_read', 'file_patch', 'file_restore', 'package_install',
     'shell', 'systemd',
 })
+
+# M1/S3 切片 4：Evidence 是不可信观察的有界索引。类别固定；摘要
+# 限长 500；结论至多引用 16 条同一 Run 的 Evidence。
+EVIDENCE_KINDS = frozenset({
+    'action_observation', 'verification_observation',
+})
+EVIDENCE_SUMMARY_CHARS = 500
+MAX_EVIDENCE_CITATIONS = 16
 
 
 def parse_custom_profile(payload):
@@ -749,6 +759,118 @@ class AutonomyRepository:
         return self._step_to_dict(step)
 
     # ------------------------------------------------------------------
+    # 验证提案：副作用后的全新只读观察（S3 切片 4）
+    # ------------------------------------------------------------------
+
+    def propose_verification(
+        self,
+        owner: str,
+        role: str,
+        run_id: str,
+        probe_id: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """提议一个 verification Step：只读探针，且必须已有写副作用。
+
+        动作成功不等于目标达成：验证必须是副作用之后的全新只读
+        观察。还没有任何写动作成功过就提议验证属于模型幻觉，
+        fail-closed 拒绝。
+        """
+        from app.core.db.database import t_ai_autonomous_step
+
+        run = self._get_run_row(owner, run_id)
+        if run.status not in {
+            RunStatus.QUEUED.value, RunStatus.RUNNING.value,
+            RunStatus.WAITING_APPROVAL.value,
+        }:
+            raise AutonomyConflict(
+                'steps can only be proposed while the run is active'
+            )
+        if not self._has_succeeded_write(run_id):
+            raise AutonomyValidationError(
+                'verification requires a prior succeeded write action'
+            )
+        if str(probe_id or '') not in list_probe_ids():
+            raise AutonomyValidationError('unknown probe: %r' % (probe_id,))
+        try:
+            normalized = validate_probe(probe_id, params or {})
+        except ActionValidationError as exc:
+            raise AutonomyValidationError(str(exc)) from exc
+
+        self._revalidate_boundaries(owner, role, run)
+        budget = Budget(**json.loads(run.budget_json or '{}'))
+        host = self._get_host_row(run.host_id)
+        try:
+            build_probe_command(
+                probe_id, normalized, target_host=str(host.host_ip),
+            )
+        except ActionValidationError as exc:
+            raise AutonomyValidationError(str(exc)) from exc
+
+        step_id = uuid.uuid4().hex
+        parameters = dict(normalized, probe_id=str(probe_id))
+        action = StructuredAction(
+            kind='probe',
+            target_id=int(run.host_id),
+            system_user_id=int(run.system_user_id),
+            parameters=parameters,
+            timeout_seconds=min(budget.command_timeout_seconds, 600),
+            step_id=step_id,
+        )
+        # 探针在策略下永远 ALLOW；这里仍复核一遍，绝不信任假定。
+        decision, reason = classify_action(
+            run.mode, action, host.ai_environment,
+        )
+        if decision != PolicyDecision.ALLOW:
+            raise AutonomyValidationError(
+                'verification probe unexpectedly not allowed'
+            )
+
+        seq = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id,
+        ).count() + 1
+        step = t_ai_autonomous_step(
+            id=step_id,
+            run_id=run_id,
+            kind=StepKind.VERIFICATION.value,
+            status=StepStatus.PROPOSED.value,
+            seq=seq,
+            summary=redacted_summary(action),
+            action_json=json.dumps(
+                action.to_canonical_dict(), sort_keys=True, ensure_ascii=True,
+            ),
+            action_digest=build_action_digest(action, self.secret_key),
+            note='',
+        )
+        self.session.add(step)
+        self._bump(run)
+        self.append_event(run, 'step_proposed', {
+            'step_id': step_id, 'seq': seq, 'probe_id': str(probe_id),
+            'step_kind': StepKind.VERIFICATION.value,
+            'decision': decision.value, 'reason': reason,
+        })
+        self._commit()
+        return self._step_to_dict(step)
+
+    def _has_succeeded_write(self, run_id: str) -> bool:
+        """本 Run 是否已有写动作成功落库（验证的前置条件）。"""
+        from app.core.db.database import t_ai_autonomous_step
+
+        rows = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id,
+            kind=StepKind.ACTION.value,
+            status=StepStatus.SUCCEEDED.value,
+        ).all()
+        for row in rows:
+            try:
+                action = action_from_dict(json.loads(row.action_json or ''))
+            except (ActionValidationError, TypeError, ValueError):
+                continue
+            if str(action.kind) in WRITE_KINDS:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
     # 权限档案：custom 类别在提案时强制（S3 切片 3）
     # ------------------------------------------------------------------
 
@@ -1160,4 +1282,170 @@ class AutonomyRepository:
             'kind': artifact.kind,
             'size_bytes': size_bytes,
             'truncated': truncated,
+        }
+
+    # ------------------------------------------------------------------
+    # Evidence 与三态 Outcome（S3 切片 4）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _evidence_to_dict(row) -> Dict[str, Any]:
+        try:
+            artifact_ids = json.loads(row.artifact_ids_json or '[]')
+        except (TypeError, ValueError):
+            artifact_ids = []
+        return {
+            'id': row.id,
+            'run_id': row.run_id,
+            'step_id': row.step_id,
+            'kind': row.kind,
+            'summary': row.summary,
+            'artifact_ids': list(artifact_ids),
+            # M1 的 Evidence 永远不可信：只作索引，不作结论凭据。
+            'trusted': bool(row.trusted),
+            'created_at': getattr(row, 'created_at', None),
+        }
+
+    def record_evidence(
+        self,
+        owner: str,
+        run_id: str,
+        *,
+        kind: str,
+        summary: str,
+        step_id: Optional[str] = None,
+        artifact_ids: Optional[List[str]] = None,
+        commit: bool = True,
+    ) -> Dict[str, Any]:
+        """把一次执行观察归一化成有界脱敏的 Evidence 引用。
+
+        大输出本体留在加密 Artifact；Evidence 只是索引，永远标记
+        不可信。引用的 Artifact 必须属于同一 Run。
+        """
+        from app.core.db.database import (
+            t_ai_autonomous_artifact, t_ai_autonomous_evidence,
+        )
+
+        self._get_run_row(owner, run_id)
+        if str(kind) not in EVIDENCE_KINDS:
+            raise AutonomyValidationError('unknown evidence kind: %r' % (kind,))
+        text = sanitize_text(summary or '')[:EVIDENCE_SUMMARY_CHARS]
+        ids: List[str] = []
+        for artifact_id in (artifact_ids or []):
+            artifact_id = str(artifact_id or '')
+            if artifact_id and artifact_id not in ids:
+                ids.append(artifact_id)
+        if ids:
+            found = self.session.query(t_ai_autonomous_artifact.id).filter(
+                t_ai_autonomous_artifact.run_id == run_id,
+                t_ai_autonomous_artifact.id.in_(ids),
+            ).count()
+            if found != len(ids):
+                raise AutonomyValidationError(
+                    'evidence may only reference same-run artifacts'
+                )
+        evidence = t_ai_autonomous_evidence(
+            id=uuid.uuid4().hex,
+            run_id=run_id,
+            step_id=step_id,
+            kind=str(kind),
+            summary=text,
+            artifact_ids_json=json.dumps(ids),
+            trusted=False,
+        )
+        self.session.add(evidence)
+        if commit:
+            self._commit()
+        return self._evidence_to_dict(evidence)
+
+    def list_evidence(self, owner: str, run_id: str) -> List[Dict[str, Any]]:
+        from app.core.db.database import t_ai_autonomous_evidence
+
+        self._get_run_row(owner, run_id)
+        rows = self.session.query(t_ai_autonomous_evidence).filter_by(
+            run_id=run_id,
+        ).order_by(t_ai_autonomous_evidence.created_at.asc()).all()
+        return [self._evidence_to_dict(row) for row in rows]
+
+    def conclude_run(
+        self,
+        owner: str,
+        role: str,
+        run_id: str,
+        outcome: str,
+        evidence_ids: List[str],
+    ) -> Dict[str, Any]:
+        """落库唯一终局 Outcome：必须引用同一 Run 的 Evidence。
+
+        fail-closed 降级：存在结果不确定的写动作时绝不 resolved；
+        resolved 必须引用至少一条验证观察。缺失证据的结论只能
+        inconclusive，绝不虚构成功。首个结论获胜，后续不改写。
+        """
+        from app.core.db.database import (
+            t_ai_autonomous_evidence, t_ai_autonomous_step,
+        )
+
+        run = self._get_run_row(owner, run_id)
+        if str(run.outcome or ''):
+            # 终局 Outcome 恰好一个：重复结论不改写也不报错。
+            return {'outcome': run.outcome, 'already_concluded': True}
+        if run.status not in {
+            RunStatus.QUEUED.value, RunStatus.RUNNING.value,
+            RunStatus.WAITING_APPROVAL.value,
+        }:
+            raise AutonomyConflict(
+                'outcome can only be concluded while the run is active'
+            )
+        if str(outcome) not in {o.value for o in RunOutcome}:
+            raise AutonomyValidationError('unknown outcome: %r' % (outcome,))
+        ids: List[str] = []
+        for evidence_id in (evidence_ids or []):
+            evidence_id = str(evidence_id or '').strip()
+            if evidence_id and evidence_id not in ids:
+                ids.append(evidence_id)
+        if not ids:
+            raise AutonomyValidationError(
+                'conclusion requires same-run evidence citations'
+            )
+        if len(ids) > MAX_EVIDENCE_CITATIONS:
+            raise AutonomyValidationError('too many evidence citations')
+        rows = self.session.query(t_ai_autonomous_evidence).filter(
+            t_ai_autonomous_evidence.run_id == run_id,
+            t_ai_autonomous_evidence.id.in_(ids),
+        ).all()
+        if len(rows) != len(ids):
+            raise AutonomyValidationError(
+                'conclusion may only cite same-run evidence'
+            )
+
+        requested = str(outcome)
+        forced = ''
+        uncertain = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id, status=StepStatus.OUTCOME_UNKNOWN.value,
+        ).count()
+        if uncertain:
+            # S2 语义保留：写结果未确认绝不自动收口成 resolved。
+            outcome = RunOutcome.INCONCLUSIVE.value
+            forced = 'uncertain_write'
+        elif requested == RunOutcome.RESOLVED.value and not any(
+            row.kind == 'verification_observation' for row in rows
+        ):
+            # 动作成功不是目标达成的证明：缺验证观察不能 resolved。
+            outcome = RunOutcome.INCONCLUSIVE.value
+            forced = 'verification_missing'
+
+        run.outcome = outcome
+        self._bump(run)
+        self.append_event(run, 'run_concluded', {
+            'outcome': outcome,
+            'requested': requested,
+            'forced': forced,
+            'evidence_ids': ids,
+        })
+        self._commit()
+        return {
+            'outcome': outcome,
+            'requested': requested,
+            'forced': forced,
+            'already_concluded': False,
         }

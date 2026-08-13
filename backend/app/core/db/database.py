@@ -703,6 +703,32 @@ class t_ai_autonomous_artifact(db.Model):
     expires_at = db.Column(db.DateTime, nullable=False, index=True)
 
 
+class t_ai_autonomous_evidence(db.Model):
+    """M1/S3 切片 4：执行观察归一化后的有界脱敏 Evidence 引用。
+
+    Evidence 永远标记不可信（trusted 恒为 0）：它只是不可信远程
+    输出的有界索引，大输出本体仍在加密 Artifact 里；结论只能引用
+    同一 Run 的 Evidence ID。owner 隔离经 run_id 归属复核。
+    """
+
+    __tablename__ = 't_ai_autonomous_evidence'
+    id = db.Column(db.String(32), primary_key=True)
+    run_id = db.Column(
+        db.String(32),
+        db.ForeignKey('t_ai_autonomous_run.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    step_id = db.Column(db.String(32), nullable=True)
+    kind = db.Column(db.String(32), nullable=False)
+    summary = db.Column(db.String(500), nullable=False)
+    artifact_ids_json = db.Column(db.Text, nullable=False, default='[]')
+    trusted = db.Column(
+        db.BOOLEAN, nullable=False, default=False, server_default='0',
+    )
+    created_at = db.Column(db.DateTime, nullable=False, default=_utcnow)
+
+
 class t_settings(db.Model):
     __tablename__ = 't_settings'
     id = db.Column(db.INTEGER, primary_key=True, autoincrement=True)

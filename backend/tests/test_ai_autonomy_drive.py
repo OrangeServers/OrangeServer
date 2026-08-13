@@ -27,6 +27,7 @@ from app.core.db.database import (
     db,
     t_ai_autonomous_artifact,
     t_ai_autonomous_event,
+    t_ai_autonomous_evidence,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
     t_group,
@@ -246,7 +247,8 @@ def env(monkeypatch, tmp_path):
                 t_ai_autonomous_run.__table__,
                 t_ai_autonomous_step.__table__,
                 t_ai_autonomous_event.__table__,
-                t_ai_autonomous_artifact.__table__],
+                t_ai_autonomous_artifact.__table__,
+                t_ai_autonomous_evidence.__table__],
     )
 
     platform_state = {"asset_ok": True}
@@ -1526,3 +1528,145 @@ def test_interrupted_guardian_review_recovers_to_human(env):
     payload = json.loads(decisions[0].payload_json)
     assert payload["decision"] == "escalate"
     assert payload["reason"] == "review_interrupted"
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 4：Evidence 归一 / 全新 Verification / 三态 Outcome
+# ---------------------------------------------------------------------------
+
+def _evidence_rows(env, run_id):
+    return env["session"].query(t_ai_autonomous_evidence).filter_by(
+        run_id=run_id,
+    ).order_by(t_ai_autonomous_evidence.created_at.asc()).all()
+
+
+def test_full_loop_concludes_resolved_with_fresh_verification(env):
+    """Fake Provider 全回路：调查→计划→审批→执行→验证→结论。"""
+    calls = {"n": 0}
+
+    def planner(context):
+        calls["n"] += 1
+        repo = context["repo"]
+        if calls["n"] == 1:
+            step = repo.propose_plan(
+                context["owner"], context["role"], context["run_id"],
+                "restart nginx",
+                [{"kind": "systemd", "params": {
+                    "operation": "restart", "unit": "nginx",
+                }}],
+            )
+            return [step["id"]]
+        if calls["n"] == 2:
+            # 写副作用之后的全新只读观察，不是复用旧输出。
+            step = repo.propose_verification(
+                context["owner"], context["role"],
+                context["run_id"], "system.load",
+            )
+            return [step["id"]]
+        evidence = env["repo"].list_evidence(
+            context["owner"], context["run_id"],
+        )
+        repo.conclude_run(
+            context["owner"], context["role"], context["run_id"],
+            "resolved", [item["id"] for item in evidence],
+        )
+        return []
+
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+    _approve_plan(env, run["id"])
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    # 写动作 + 验证探针各一次远程调用，顺序固定。
+    commands = [call["command"] for call in env["runner"].calls]
+    assert commands == ["systemctl restart nginx", "uptime"]
+
+    row = _run_row(env, run["id"])
+    assert row.status == "completed"
+    assert row.outcome == "resolved"
+
+    # 观察归一化：每个已执行 Step 恰好一条 Evidence（observe 多轮
+    # 重入不重复落），标记不可信，大输出留在加密 Artifact。
+    evidence = _evidence_rows(env, run["id"])
+    assert [item.kind for item in evidence] == [
+        "action_observation", "verification_observation",
+    ]
+    assert all(bool(item.trusted) is False for item in evidence)
+    assert all(item.step_id for item in evidence)
+    assert len({item.step_id for item in evidence}) == 2
+    for item in evidence:
+        assert json.loads(item.artifact_ids_json or "[]")
+
+    concluded = [
+        e for e in _events(env, run["id"])
+        if e.event_type == "run_concluded"
+    ]
+    assert len(concluded) == 1
+    payload = json.loads(concluded[0].payload_json)
+    assert payload["outcome"] == "resolved"
+    assert payload["requested"] == "resolved"
+    assert payload["forced"] == ""
+    assert set(payload["evidence_ids"]) == {item.id for item in evidence}
+
+
+def test_completed_run_without_conclusion_defaults_to_inconclusive(env):
+    """模型没有给出结论：默认 inconclusive，绝不虚构成功。"""
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"]()
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    row = _run_row(env, run["id"])
+    assert row.status == "completed"
+    assert row.outcome == "inconclusive"
+    assert "run_concluded" not in [
+        e.event_type for e in _events(env, run["id"])
+    ]
+    # 观察照常归一化，供后续人工/续传引用。
+    evidence = _evidence_rows(env, run["id"])
+    assert len(evidence) == 1
+    assert evidence[0].kind == "action_observation"
+
+
+def test_resolved_without_verification_observation_is_downgraded(env):
+    """只做过只读调查就想 resolved：服务端强制降为 inconclusive。"""
+    calls = {"n": 0}
+
+    def planner(context):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            step = context["repo"].propose_probe(
+                context["owner"], context["role"],
+                context["run_id"], "system.load",
+            )
+            return [step["id"]]
+        evidence = env["repo"].list_evidence(
+            context["owner"], context["run_id"],
+        )
+        context["repo"].conclude_run(
+            context["owner"], context["role"], context["run_id"],
+            "resolved", [item["id"] for item in evidence],
+        )
+        return []
+
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert _run_row(env, run["id"]).outcome == "inconclusive"
+    concluded = [
+        e for e in _events(env, run["id"])
+        if e.event_type == "run_concluded"
+    ]
+    assert len(concluded) == 1
+    payload = json.loads(concluded[0].payload_json)
+    assert payload["requested"] == "resolved"
+    assert payload["forced"] == "verification_missing"

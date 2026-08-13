@@ -480,6 +480,57 @@ def test_rev55_autonomy_migration_matches_baseline_and_orm():
     assert "`custom_profile_json` text DEFAULT NULL" in run_ddl.group(1)
 
 
+def test_rev56_autonomy_evidence_table_matches_baseline_and_orm():
+    """M1/S3 切片 4：rev56 新增 Evidence 表后，orange.sql 与 ORM 一致。"""
+    from app.core.db.database import db
+
+    rev56 = (
+        BACKEND / "mysqldir" / "rev56_ai_autonomy_evidence.sql"
+    ).read_text(encoding="utf-8")
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+
+    def create_columns(source, table):
+        match = re.search(
+            r"CREATE TABLE(?: IF NOT EXISTS)? `" + table
+            + r"` \((.*?)\)\s*ENGINE=",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        assert match, f"{table} is missing from the schema source"
+        return set(
+            re.findall(r"^\s*`([^`]+)`\s+", match.group(1), re.MULTILINE)
+        )
+
+    # 守卫式 CREATE：表已存在时不重复建表，脚本可重复执行。
+    assert rev56.count("information_schema.TABLES") == 1
+    assert rev56.count("PREPARE stmt FROM @sql;") == 1
+    assert "t_ai_autonomous_evidence" in rev56
+
+    baseline_columns = create_columns(schema, "t_ai_autonomous_evidence")
+    orm_columns = set(
+        db.metadata.tables["t_ai_autonomous_evidence"].columns.keys()
+    )
+    migration_columns = create_columns(rev56, "t_ai_autonomous_evidence")
+    assert baseline_columns == orm_columns == migration_columns
+
+    evidence_ddl = re.search(
+        r"CREATE TABLE `t_ai_autonomous_evidence` \((.*?)\)\s*ENGINE=",
+        schema,
+        re.DOTALL,
+    )
+    assert evidence_ddl, "orange.sql must define t_ai_autonomous_evidence"
+    # Evidence 永远标记不可信：默认 0，无其它默认可意外置 1。
+    assert "`trusted` tinyint(1) NOT NULL DEFAULT 0" in evidence_ddl.group(1)
+    assert (
+        "REFERENCES `t_ai_autonomous_run` (`id`) ON DELETE CASCADE"
+        in evidence_ddl.group(1)
+    )
+    # 全新基线的 DROP 顺序必须先于父表之外引用它的表。
+    assert schema.index(
+        "DROP TABLE IF EXISTS `t_ai_autonomous_evidence`;"
+    ) < schema.index("DROP TABLE IF EXISTS `t_ai_autonomous_run`;")
+
+
 def test_dockerfile_builds_from_committed_requirements_without_resolving_lock():
     dockerfile = (BACKEND / "Dockerfile").read_text(encoding="utf-8")
     assert "pip-compile" not in dockerfile

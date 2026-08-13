@@ -42,6 +42,7 @@ from app.ai.autonomy.guardian import (
 from app.ai.autonomy.lease import RunLeaseService
 from app.ai.autonomy.planner import (
     PlannerProposalError,
+    summarize_evidence,
     summarize_step_history,
 )
 from app.ai.autonomy.plans import (
@@ -124,6 +125,28 @@ class _ClaimFencedPlannerRepository:
             self._lock_claim(run_id)
             return self._repo.propose_plan(
                 owner, role, run_id, summary, actions,
+            )
+        except Exception:
+            self._repo.session.rollback()
+            raise
+
+    def propose_verification(
+        self, owner, role, run_id, probe_id, params=None,
+    ):
+        try:
+            self._lock_claim(run_id)
+            return self._repo.propose_verification(
+                owner, role, run_id, probe_id, params,
+            )
+        except Exception:
+            self._repo.session.rollback()
+            raise
+
+    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+        try:
+            self._lock_claim(run_id)
+            return self._repo.conclude_run(
+                owner, role, run_id, outcome, evidence_ids,
             )
         except Exception:
             self._repo.session.rollback()
@@ -439,6 +462,9 @@ class AutonomyDriver:
                     ),
                 },
                 'history': summarize_step_history(self.session, run_id),
+                # 大输出留在加密 Artifact；模型只读得到有界脱敏
+                # 的 Evidence 摘要（切片 4）。
+                'evidence': summarize_evidence(self.session, run_id),
             }
             proposed = list(self.planner(context) or [])
             return {
@@ -453,9 +479,14 @@ class AutonomyDriver:
             def proposed_steps():
                 return (
                     self.session.query(t_ai_autonomous_step)
-                    .filter_by(
-                        run_id=run_id, kind=StepKind.ACTION.value,
-                        status=StepStatus.PROPOSED.value,
+                    .filter(
+                        t_ai_autonomous_step.run_id == run_id,
+                        t_ai_autonomous_step.kind.in_([
+                            StepKind.ACTION.value,
+                            StepKind.VERIFICATION.value,
+                        ]),
+                        t_ai_autonomous_step.status
+                        == StepStatus.PROPOSED.value,
                     )
                     .order_by(t_ai_autonomous_step.seq.asc())
                     .all()
@@ -587,6 +618,9 @@ class AutonomyDriver:
 
         def observe(state):
             self._guard()
+            # 执行观察归一化成有界脱敏 Evidence（幂等，恢复重入
+            # 不重复落）；大输出本体仍在加密 Artifact。
+            self._record_run_evidence(run_id)
             step_id = str(state.get('pending_step_id') or '')
             if not step_id:
                 return {}
@@ -625,6 +659,73 @@ class AutonomyDriver:
             'verify': verify,
             'decide': decide,
         }
+
+    # ------------------------------------------------------------------
+    # 观察归一化：Evidence 引用（S3 切片 4）
+    # ------------------------------------------------------------------
+
+    def _record_run_evidence(self, run_id):
+        """把已执行的观察归一化成有界脱敏 Evidence。
+
+        幂等：每个 Step 至多一条 Evidence，恢复重入不重复落。
+        Evidence 只是不可信观察的索引，大输出本体仍在加密
+        Artifact；模型后续只能读到这里的有界摘要。
+        """
+        from app.core.db.database import (
+            t_ai_autonomous_artifact,
+            t_ai_autonomous_evidence,
+            t_ai_autonomous_step,
+        )
+
+        executed = (
+            StepStatus.SUCCEEDED.value,
+            StepStatus.FAILED.value,
+            StepStatus.OUTCOME_UNKNOWN.value,
+        )
+        steps = self.session.query(t_ai_autonomous_step).filter(
+            t_ai_autonomous_step.run_id == run_id,
+            t_ai_autonomous_step.kind.in_([
+                StepKind.ACTION.value, StepKind.VERIFICATION.value,
+            ]),
+            t_ai_autonomous_step.status.in_(executed),
+        ).order_by(t_ai_autonomous_step.seq.asc()).all()
+        if not steps:
+            return
+        recorded = {
+            row.step_id for row in self.session.query(
+                t_ai_autonomous_evidence.step_id,
+            ).filter_by(run_id=run_id).all() if row.step_id
+        }
+        run = None
+        for step in steps:
+            if step.id in recorded:
+                continue
+            artifact_ids = [
+                row.id for row in self.session.query(
+                    t_ai_autonomous_artifact.id,
+                ).filter_by(run_id=run_id, step_id=step.id).all()
+            ]
+            if run is None:
+                run = self._run_row(run_id)
+            kind = (
+                'verification_observation'
+                if step.kind == StepKind.VERIFICATION.value
+                else 'action_observation'
+            )
+            summary = sanitize_text(
+                '%s: %s%s' % (
+                    step.status,
+                    step.summary or '',
+                    ' | %s' % step.note if step.note else '',
+                ),
+            )[:500]
+            self.repo.record_evidence(
+                str(run.owner), run_id,
+                kind=kind,
+                summary=summary,
+                step_id=step.id,
+                artifact_ids=artifact_ids,
+            )
 
     # ------------------------------------------------------------------
     # 计划级授权：一次授权一个稳定计划（S3 切片 2）

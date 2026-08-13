@@ -33,6 +33,7 @@ from app.core.db.database import (
     db,
     t_ai_autonomous_artifact,
     t_ai_autonomous_event,
+    t_ai_autonomous_evidence,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
     t_group,
@@ -72,6 +73,7 @@ def repo_env(monkeypatch):
             t_ai_autonomous_step.__table__,
             t_ai_autonomous_event.__table__,
             t_ai_autonomous_artifact.__table__,
+            t_ai_autonomous_evidence.__table__,
         ],
     )
     session = sessionmaker(bind=engine)()
@@ -1430,3 +1432,290 @@ def test_expired_plan_authorization_invalidates_approval(repo_env):
             "admin", "admin", run["id"], step["id"],
             operation="approve", expected_revision=int(run_row.revision),
         )
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 4：Evidence 归一 / Verification 提案 / 三态 Outcome
+# ---------------------------------------------------------------------------
+
+def _succeeded_write_step(repo_env, run_id, seq):
+    """直接持久化一个已成功的写动作 step，模拟执行器落库结果。"""
+    import uuid as _uuid
+
+    step_id = _uuid.uuid4().hex
+    action = StructuredAction(
+        kind="systemd",
+        target_id=repo_env["host_id"],
+        system_user_id=19,
+        parameters={"operation": "restart", "unit": "nginx"},
+        timeout_seconds=60,
+        step_id=step_id,
+    )
+    step = t_ai_autonomous_step(
+        id=step_id,
+        run_id=run_id,
+        kind="action",
+        status="succeeded",
+        seq=seq,
+        summary="restart nginx",
+        action_json=json.dumps(
+            action.to_canonical_dict(), sort_keys=True, ensure_ascii=True,
+        ),
+        action_digest=build_action_digest(action, SECRET_KEY),
+        note="",
+    )
+    repo_env["session"].add(step)
+    repo_env["session"].commit()
+    return step_id
+
+
+def _insert_artifact(repo_env, run_id, step_id=None):
+    """绕过加密直接插一条 Artifact 行（仅用于 Evidence 引用归属校验）。"""
+    import uuid as _uuid
+
+    artifact = t_ai_autonomous_artifact(
+        id=_uuid.uuid4().hex,
+        run_id=run_id,
+        step_id=step_id,
+        kind="command_output",
+        title="observation",
+        content_ciphertext="ciphertext-placeholder",
+        size_bytes=22,
+        truncated=False,
+        expires_at=datetime.datetime.utcnow() + datetime.timedelta(days=7),
+    )
+    repo_env["session"].add(artifact)
+    repo_env["session"].commit()
+    return artifact.id
+
+
+def test_record_evidence_normalizes_and_marks_untrusted(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    step_id = _succeeded_write_step(repo_env, run["id"], seq=1)
+    artifact_id = _insert_artifact(repo_env, run["id"], step_id=step_id)
+
+    evidence = repo.record_evidence(
+        "admin", run["id"],
+        kind="action_observation",
+        summary="succeeded: restart nginx | " + "x" * 600,
+        step_id=step_id,
+        artifact_ids=[artifact_id, artifact_id, ""],
+    )
+
+    assert evidence["kind"] == "action_observation"
+    assert evidence["step_id"] == step_id
+    # 摘要有界截 500；Evidence 永远不可信；Artifact 引用去重。
+    assert len(evidence["summary"]) == 500
+    assert evidence["trusted"] is False
+    assert evidence["artifact_ids"] == [artifact_id]
+
+    listed = repo.list_evidence("admin", run["id"])
+    assert [item["id"] for item in listed] == [evidence["id"]]
+
+
+def test_record_evidence_rejects_unknown_kind(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+
+    with pytest.raises(AutonomyValidationError, match="unknown evidence kind"):
+        repo.record_evidence(
+            "admin", run["id"], kind="trusted_fact", summary="nope",
+        )
+
+
+def test_record_evidence_rejects_cross_run_artifacts(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    import uuid as _uuid
+
+    # 不属于本 Run 的 Artifact 引用一律拒绝（owner 隔离的引用层）。
+    with pytest.raises(
+        AutonomyValidationError, match="same-run artifacts",
+    ):
+        repo.record_evidence(
+            "admin", run["id"],
+            kind="action_observation", summary="steal foreign artifact",
+            artifact_ids=[_uuid.uuid4().hex],
+        )
+
+
+def test_record_evidence_owner_isolation(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+
+    with pytest.raises(AutonomyNotFound):
+        repo.record_evidence(
+            "intruder", run["id"],
+            kind="action_observation", summary="cross-owner write",
+        )
+    with pytest.raises(AutonomyNotFound):
+        repo.list_evidence("intruder", run["id"])
+
+
+def test_propose_verification_requires_prior_succeeded_write(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+
+    # 没有任何写副作用就提议验证属于模型幻觉，fail-closed 拒绝。
+    with pytest.raises(
+        AutonomyValidationError, match="prior succeeded write",
+    ):
+        repo.propose_verification(
+            "admin", "admin", run["id"], "system.load",
+        )
+
+
+def test_propose_verification_creates_readonly_probe_step(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    _succeeded_write_step(repo_env, run["id"], seq=1)
+
+    step = repo.propose_verification(
+        "admin", "admin", run["id"], "system.load",
+    )
+
+    assert step["kind"] == "verification"
+    assert step["status"] == "proposed"
+    row = repo_env["session"].get(t_ai_autonomous_step, step["id"])
+    snapshot = json.loads(row.action_json)
+    assert snapshot["kind"] == "probe"
+    assert snapshot["parameters"]["probe_id"] == "system.load"
+
+    events = repo_env["session"].query(t_ai_autonomous_event).filter_by(
+        run_id=run["id"], event_type="step_proposed",
+    ).all()
+    payload = json.loads(events[-1].payload_json)
+    assert payload["step_kind"] == "verification"
+
+
+def test_propose_verification_rejects_unknown_probe(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    _succeeded_write_step(repo_env, run["id"], seq=1)
+
+    with pytest.raises(AutonomyValidationError, match="unknown probe"):
+        repo.propose_verification(
+            "admin", "admin", run["id"], "rm.rootfs",
+        )
+
+
+def test_conclude_run_requires_same_run_evidence(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+
+    with pytest.raises(
+        AutonomyValidationError, match="evidence citations",
+    ):
+        repo.conclude_run("admin", "admin", run["id"], "resolved", [])
+    with pytest.raises(
+        AutonomyValidationError, match="same-run evidence",
+    ):
+        repo.conclude_run(
+            "admin", "admin", run["id"], "resolved", ["deadbeef" * 4],
+        )
+
+
+def test_conclude_run_rejects_unknown_outcome(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    evidence = repo.record_evidence(
+        "admin", run["id"],
+        kind="action_observation", summary="observation",
+    )
+
+    with pytest.raises(AutonomyValidationError, match="unknown outcome"):
+        repo.conclude_run(
+            "admin", "admin", run["id"], "success", [evidence["id"]],
+        )
+
+
+def test_conclude_run_resolved_without_verification_is_downgraded(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    evidence = repo.record_evidence(
+        "admin", run["id"],
+        kind="action_observation", summary="write succeeded",
+    )
+
+    # 动作成功不是目标达成的证明：缺验证观察绝不允许 resolved。
+    result = repo.conclude_run(
+        "admin", "admin", run["id"], "resolved", [evidence["id"]],
+    )
+    assert result["outcome"] == "inconclusive"
+    assert result["requested"] == "resolved"
+    assert result["forced"] == "verification_missing"
+
+
+def test_conclude_run_resolved_with_verification_observation(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    action_ev = repo.record_evidence(
+        "admin", run["id"],
+        kind="action_observation", summary="write succeeded",
+    )
+    verify_ev = repo.record_evidence(
+        "admin", run["id"],
+        kind="verification_observation", summary="probe exit 0",
+    )
+
+    result = repo.conclude_run(
+        "admin", "admin", run["id"], "resolved",
+        [action_ev["id"], verify_ev["id"]],
+    )
+    assert result["outcome"] == "resolved"
+    assert result["forced"] == ""
+
+    events = repo_env["session"].query(t_ai_autonomous_event).filter_by(
+        run_id=run["id"], event_type="run_concluded",
+    ).all()
+    payload = json.loads(events[-1].payload_json)
+    assert payload["outcome"] == "resolved"
+    assert payload["requested"] == "resolved"
+    assert payload["forced"] == ""
+
+
+def test_conclude_run_uncertain_write_forces_inconclusive(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    _succeeded_write_step(repo_env, run["id"], seq=1)
+    # 结果不确定的写动作仍在库里：S2 语义保留，绝不自动收口成功。
+    repo_env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"],
+    ).update({"status": "outcome_unknown"})
+    repo_env["session"].commit()
+    verify_ev = repo.record_evidence(
+        "admin", run["id"],
+        kind="verification_observation", summary="probe exit 0",
+    )
+
+    result = repo.conclude_run(
+        "admin", "admin", run["id"], "resolved", [verify_ev["id"]],
+    )
+    assert result["outcome"] == "inconclusive"
+    assert result["forced"] == "uncertain_write"
+
+
+def test_conclude_run_first_conclusion_wins(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    evidence = repo.record_evidence(
+        "admin", run["id"],
+        kind="action_observation", summary="observation",
+    )
+
+    first = repo.conclude_run(
+        "admin", "admin", run["id"], "not_resolved", [evidence["id"]],
+    )
+    assert first["outcome"] == "not_resolved"
+    assert first["already_concluded"] is False
+
+    # 终局 Outcome 恰好一个：重复结论不改写也不报错。
+    second = repo.conclude_run(
+        "admin", "admin", run["id"], "resolved", [evidence["id"]],
+    )
+    assert second["outcome"] == "not_resolved"
+    assert second["already_concluded"] is True
+
+    run_row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    assert run_row.outcome == "not_resolved"
