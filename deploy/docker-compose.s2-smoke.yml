@@ -8,7 +8,7 @@ name: ${COMPOSE_PROJECT_NAME:-orangeserver_s2_smoke}
 
 x-smoke-environment: &smoke-environment
   OGS_ENV: dev
-  OGS_DATA_DIR: /tmp/orangeserver-s2-smoke
+  OGS_DATA_DIR: /app/data
   OGS_FLASK_SECRET_KEY: ${OGS_S2_SMOKE_FLASK_SECRET:?smoke secret required}
   OGS_FERNET_KEYS: ${OGS_S2_SMOKE_FERNET_KEY:?smoke Fernet key required}
   OGS_MYSQL_HOST: mysql-fresh
@@ -159,14 +159,14 @@ services:
       - >-
         install -m 0600 -o ogs -g ogs
         /run/secrets/s2-client-key
-        /tmp/orangeserver-s2-smoke/key/s2-client-key
+        /app/data/key/s2-client-key
     networks: [smoke-internal]
     volumes:
       - type: bind
         source: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/.s2-smoke/s2-client-key
         target: /run/secrets/s2-client-key
         read_only: true
-      - smoke-ssh-client-key:/tmp/orangeserver-s2-smoke/key
+      - smoke-ssh-client-key:/app/data/key
 
   autonomy-worker:
     build:
@@ -194,7 +194,7 @@ services:
     volumes:
       - type: volume
         source: smoke-ssh-client-key
-        target: /tmp/orangeserver-s2-smoke/key
+        target: /app/data/key
         read_only: true
     healthcheck:
       test:
@@ -235,7 +235,7 @@ services:
         read_only: true
       - type: volume
         source: smoke-ssh-client-key
-        target: /tmp/orangeserver-s2-smoke/key
+        target: /app/data/key
         read_only: true
     depends_on:
       mysql-fresh: {condition: service_healthy}

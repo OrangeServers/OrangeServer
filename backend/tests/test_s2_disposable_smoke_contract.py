@@ -40,13 +40,15 @@ def test_s2_smoke_compose_is_isolated_and_builds_current_backend():
     assert 'OGS_AI_AUTONOMY_LEASE_TTL_SECONDS: 30' in compose
     assert 'OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis' in compose
     assert 'OGS_S2_SMOKE_UPGRADE_MYSQL_HOST: mysql-upgrade' in compose
+    assert 'OGS_DATA_DIR: /app/data' in compose
     assert 'PYTHONPATH: /app' in compose
     assert 'ssh-target:' in compose
     assert 'dockerfile: Dockerfile.ssh-target' in compose
     assert 'OGS_SSH_HOST_KEY_POLICY: auto' in compose
     assert 'target: /run/secrets/s2-client-key' in compose
     assert 'target: /run/secrets/s2-client-key.pub' in compose
-    assert compose.count('target: /tmp/orangeserver-s2-smoke/key') == 2
+    assert compose.count('/app/data/key') == 4
+    assert '/tmp/orangeserver-s2-smoke' not in compose
     assert 'install -m 0600 -o ogs -g ogs' in compose
     assert 'smoke-ssh-client-key:' in compose
     assert 'read_only: true' in compose
