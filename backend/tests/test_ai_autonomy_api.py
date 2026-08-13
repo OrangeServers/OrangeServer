@@ -181,7 +181,7 @@ def test_non_admin_is_rejected_even_when_enabled(api, monkeypatch):
     response = client.post(
         "/ai/autonomous-runs",
         json={"goal": "g", "host_id": 1, "system_user_id": 2,
-              "mode": "assisted"},
+              "mode": "ask"},
     )
     assert response.status_code == 403
 
@@ -194,7 +194,7 @@ def test_create_run_passes_boundary_inputs_to_repository(api, monkeypatch):
         "goal": "diagnose latency",
         "host_id": 7,
         "system_user_id": 19,
-        "mode": "assisted",
+        "mode": "ask",
         "budget": {"max_actions": 3},
     })
     assert response.status_code == 200
@@ -206,7 +206,7 @@ def test_create_run_passes_boundary_inputs_to_repository(api, monkeypatch):
         "goal": "diagnose latency",
         "host_id": 7,
         "system_user_id": 19,
-        "mode": "assisted",
+        "mode": "ask",
         "budget_payload": {"max_actions": 3},
     }
 
@@ -311,7 +311,7 @@ def test_autonomy_errors_map_to_documented_status_codes(
     response = client.post(
         "/ai/autonomous-runs",
         json={"goal": "g", "host_id": 1, "system_user_id": 2,
-              "mode": "assisted"},
+              "mode": "ask"},
     )
     assert response.status_code == status
     assert exc.args[0] in response.get_json()["msg"]
@@ -324,7 +324,7 @@ def test_unexpected_error_becomes_500_without_details(api, monkeypatch):
     response = client.post(
         "/ai/autonomous-runs",
         json={"goal": "g", "host_id": 1, "system_user_id": 2,
-              "mode": "assisted"},
+              "mode": "ask"},
     )
     assert response.status_code == 500
     assert "db exploded" not in response.get_json()["msg"]

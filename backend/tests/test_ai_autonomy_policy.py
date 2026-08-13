@@ -16,6 +16,7 @@ from app.ai.autonomy.actions import (
 from app.ai.autonomy.policy import (
     BUDGET_LIMITS,
     ApprovalDecision,
+    PolicyDecision,
     PolicyViolation,
     classify_action,
     classify_shell_command,
@@ -23,6 +24,14 @@ from app.ai.autonomy.policy import (
     parse_budget,
     validate_mode_for_environment,
 )
+
+
+def test_policy_decision_contract_uses_harness_allow_ask_deny_terms():
+    assert [decision.value for decision in PolicyDecision] == [
+        "allow", "ask", "deny",
+    ]
+    # Existing internal imports keep working without adding another value.
+    assert ApprovalDecision is PolicyDecision
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +304,29 @@ def test_unknown_mode_or_environment_is_rejected():
         validate_mode_for_environment("full_auto", "lab")
     with pytest.raises(ValueError):
         validate_mode_for_environment("read_only", "dmz")
+
+
+def test_auto_profile_is_lab_only_while_other_product_modes_are_portable():
+    for mode in ("auto", "lab_autonomous"):
+        with pytest.raises(PolicyViolation):
+            validate_mode_for_environment(mode, "production")
+        validate_mode_for_environment(mode, "lab")
+
+    for mode in ("ask", "ai_review", "custom"):
+        for environment in ("production", "staging", "lab"):
+            validate_mode_for_environment(mode, environment)
+
+
+def test_product_modes_share_server_policy_and_never_turn_ask_into_permission():
+    probe = _action(kind="probe", parameters={"probe_id": "system.load"})
+    shell = _action(kind="shell", parameters={"command": "uptime"})
+
+    for mode in ("ask", "ai_review", "auto", "custom"):
+        decision, _ = classify_action(mode, probe, "lab")
+        assert decision is PolicyDecision.ALLOW
+
+        decision, _ = classify_action(mode, shell, "lab")
+        assert decision is PolicyDecision.ASK
 
 
 # ---------------------------------------------------------------------------

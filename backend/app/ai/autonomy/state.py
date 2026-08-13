@@ -54,9 +54,38 @@ class StepKind(str, Enum):
 
 
 class RunMode(str, Enum):
+    ASK = 'ask'
+    AI_REVIEW = 'ai_review'
+    AUTO = 'auto'
+    CUSTOM = 'custom'
+
+    # Persisted compatibility values from the unpublished v1 graph.
     READ_ONLY = 'read_only'
     ASSISTED = 'assisted'
     LAB_AUTONOMOUS = 'lab_autonomous'
+
+
+CANONICAL_RUN_MODES = (
+    RunMode.ASK,
+    RunMode.AI_REVIEW,
+    RunMode.AUTO,
+    RunMode.CUSTOM,
+)
+
+_LEGACY_RUN_MODE_MAP = {
+    RunMode.ASSISTED: RunMode.ASK,
+    RunMode.LAB_AUTONOMOUS: RunMode.AUTO,
+    RunMode.READ_ONLY: RunMode.READ_ONLY,
+}
+
+
+def normalize_run_mode(value):
+    """Return the canonical permission profile for a persisted Run mode."""
+    try:
+        mode = RunMode(value)
+    except ValueError:
+        raise AutonomyStateError('unknown run mode: %r' % (value,)) from None
+    return _LEGACY_RUN_MODE_MAP.get(mode, mode)
 
 
 class AiEnvironment(str, Enum):
@@ -105,7 +134,7 @@ RUN_TRANSITIONS = {
 # rejected），不引入 roadmap 之外的独立 rejected 状态。
 STEP_TRANSITIONS = {
     StepStatus.PROPOSED: {
-        StepStatus.WAITING_APPROVAL, StepStatus.RUNNING,
+        StepStatus.WAITING_APPROVAL, StepStatus.APPROVED, StepStatus.RUNNING,
         StepStatus.SKIPPED, StepStatus.FAILED, StepStatus.CANCELLED,
     },
     StepStatus.WAITING_APPROVAL: {

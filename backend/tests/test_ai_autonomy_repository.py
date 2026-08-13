@@ -108,7 +108,7 @@ def repo_env(monkeypatch):
             goal="diagnose latency",
             host_id=env["host_id"],
             system_user_id=19,
-            mode="assisted",
+            mode="ask",
         )
         payload.update(kwargs)
         run = repo.create_run("admin", "admin", **payload)
@@ -131,13 +131,14 @@ def test_create_run_defaults_and_event_trail(repo_env):
         goal="diagnose latency",
         host_id=repo_env["host_id"],
         system_user_id=19,
-        mode="assisted",
+        mode="ask",
     )
     assert run["status"] == "draft"
     assert run["revision"] == 0
     assert run["host_alias"] == "web-01"
     assert run["system_user_alias"] == "readonly"
     assert run["budget"]["max_actions"] == 30
+    assert run["graph_version"] == "v2"
 
     events = repo_env["session"].query(t_ai_autonomous_event).all()
     assert [event.event_type for event in events] == ["run_created"]
@@ -147,6 +148,39 @@ def test_create_run_defaults_and_event_trail(repo_env):
     assert payload["system_user_id"] == 19
     assert "password" not in payload
     assert "credential" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("mode", ["ask", "ai_review", "auto", "custom"])
+def test_product_permission_profiles_create_v2_runs(repo_env, mode):
+    repo = repo_env["repo"]
+    repo.set_host_environment(repo_env["host_id"], "lab")
+
+    run = repo.create_run(
+        "admin", "admin",
+        goal="investigate service health",
+        host_id=repo_env["host_id"],
+        system_user_id=19,
+        mode=mode,
+    )
+
+    assert run["mode"] == mode
+    assert run["graph_version"] == "v2"
+
+
+@pytest.mark.parametrize("legacy_mode", [
+    "read_only", "assisted", "lab_autonomous",
+])
+def test_new_runs_reject_legacy_permission_modes(repo_env, legacy_mode):
+    repo_env["repo"].set_host_environment(repo_env["host_id"], "lab")
+
+    with pytest.raises(AutonomyValidationError):
+        repo_env["repo"].create_run(
+            "admin", "admin",
+            goal="legacy mode must not create a new v1 run",
+            host_id=repo_env["host_id"],
+            system_user_id=19,
+            mode=legacy_mode,
+        )
 
 
 def test_create_run_inserts_run_before_first_event_under_fk():
@@ -192,7 +226,7 @@ def test_create_run_inserts_run_before_first_event_under_fk():
             goal="fk ordering regression",
             host_id=int(host.id),
             system_user_id=19,
-            mode="assisted",
+            mode="ask",
         )
         assert run["status"] == "draft"
         rows = session.query(t_ai_autonomous_event).filter_by(
@@ -218,7 +252,7 @@ def test_create_run_validation_failures(repo_env, overrides):
         goal="diagnose latency",
         host_id=repo_env["host_id"],
         system_user_id=19,
-        mode="assisted",
+        mode="ask",
     )
     payload.update(overrides)
     with pytest.raises(AutonomyValidationError):
@@ -231,7 +265,7 @@ def test_create_run_requires_asset_authorization(repo_env):
         repo_env["repo"].create_run(
             "admin", "admin",
             goal="diagnose", host_id=repo_env["host_id"],
-            system_user_id=19, mode="assisted",
+            system_user_id=19, mode="ask",
         )
 
 
@@ -241,7 +275,7 @@ def test_create_run_requires_credential_authorization(repo_env):
         repo_env["repo"].create_run(
             "admin", "admin",
             goal="diagnose", host_id=repo_env["host_id"],
-            system_user_id=19, mode="assisted",
+            system_user_id=19, mode="ask",
         )
 
 
@@ -257,16 +291,16 @@ def test_lab_mode_needs_admin_maintained_lab_environment(repo_env):
         repo.create_run(
             "admin", "admin",
             goal="lab experiment", host_id=repo_env["host_id"],
-            system_user_id=19, mode="lab_autonomous",
+            system_user_id=19, mode="auto",
         )
 
     repo.set_host_environment(repo_env["host_id"], "lab")
     run = repo.create_run(
         "admin", "admin",
         goal="lab experiment", host_id=repo_env["host_id"],
-        system_user_id=19, mode="lab_autonomous",
+        system_user_id=19, mode="auto",
     )
-    assert run["mode"] == "lab_autonomous"
+    assert run["mode"] == "auto"
 
 
 def test_only_one_active_run_per_host(repo_env):
@@ -275,7 +309,7 @@ def test_only_one_active_run_per_host(repo_env):
         repo_env["repo"].create_run(
             "admin", "admin",
             goal="second run", host_id=repo_env["host_id"],
-            system_user_id=19, mode="assisted",
+            system_user_id=19, mode="ask",
         )
 
 
@@ -287,7 +321,7 @@ def test_database_unique_key_blocks_a_second_active_run(repo_env):
     first = repo.create_run(
         "admin", "admin",
         goal="first run", host_id=host_id,
-        system_user_id=19, mode="assisted",
+        system_user_id=19, mode="ask",
     )
     first_row = session.get(t_ai_autonomous_run, first["id"])
     first_row.status = "needs_attention"
@@ -302,7 +336,7 @@ def test_database_unique_key_blocks_a_second_active_run(repo_env):
         host_alias="web-01",
         system_user_id=19,
         system_user_alias="readonly",
-        mode="assisted",
+        mode="ask",
         status="draft",
         revision=0,
         budget_json="{}",
@@ -324,7 +358,7 @@ def test_database_unique_key_blocks_a_second_active_run(repo_env):
         host_alias="web-01",
         system_user_id=19,
         system_user_alias="readonly",
-        mode="assisted",
+        mode="ask",
         status="completed",
         revision=1,
         budget_json="{}",
@@ -338,7 +372,7 @@ def test_database_unique_key_blocks_a_second_active_run(repo_env):
     replacement = repo.create_run(
         "admin", "admin",
         goal="replacement run", host_id=host_id,
-        system_user_id=19, mode="assisted",
+        system_user_id=19, mode="ask",
     )
     replacement_row = session.get(t_ai_autonomous_run, replacement["id"])
     assert replacement_row.active_host_id == host_id
@@ -384,7 +418,7 @@ def test_create_run_maps_active_host_unique_violation(
         repo_env["repo"].create_run(
             "admin", "admin",
             goal="concurrent run", host_id=repo_env["host_id"],
-            system_user_id=19, mode="assisted",
+            system_user_id=19, mode="ask",
         )
 
 
@@ -414,7 +448,7 @@ def test_create_run_does_not_remap_unrelated_integrity_error(
         repo_env["repo"].create_run(
             "admin", "admin",
             goal="bad insert", host_id=repo_env["host_id"],
-            system_user_id=19, mode="assisted",
+            system_user_id=19, mode="ask",
         )
     assert caught.value is error
 
@@ -428,7 +462,7 @@ def test_start_run_moves_draft_to_queued_and_bumps_revision(repo_env):
     run = repo.create_run(
         "admin", "admin",
         goal="diagnose", host_id=repo_env["host_id"],
-        system_user_id=19, mode="assisted",
+        system_user_id=19, mode="ask",
     )
     started = repo.start_run("admin", "admin", run["id"])
     assert started["status"] == "queued"
@@ -443,7 +477,7 @@ def test_start_run_rechecks_asset_and_credential_authorization(repo_env):
     run = repo.create_run(
         "admin", "admin",
         goal="diagnose", host_id=repo_env["host_id"],
-        system_user_id=19, mode="assisted",
+        system_user_id=19, mode="ask",
     )
     repo_env["platform_state"]["asset_ok"] = False
     with pytest.raises(AutonomyPermissionError):
@@ -495,7 +529,7 @@ def test_cancel_draft_is_terminal_without_permission_revalidation(repo_env):
     repo = repo_env["repo"]
     run = repo.create_run(
         "admin", "admin", goal="cancel draft",
-        host_id=repo_env["host_id"], system_user_id=19, mode="assisted",
+        host_id=repo_env["host_id"], system_user_id=19, mode="ask",
     )
     repo_env["platform_state"]["asset_ok"] = False
     repo_env["platform_state"]["credential_ok"] = False
@@ -592,7 +626,7 @@ def test_propose_probe_requires_active_run(repo_env):
     run = repo.create_run(
         "admin", "admin",
         goal="diagnose", host_id=repo_env["host_id"],
-        system_user_id=19, mode="assisted",
+        system_user_id=19, mode="ask",
     )
     with pytest.raises(AutonomyConflict):
         repo.propose_probe("admin", "admin", run["id"], "system.load")
@@ -793,7 +827,7 @@ def test_cross_run_step_id_is_a_conflict_not_a_leak(waiting_env):
         id="other-run", owner="admin", goal="second",
         host_id=int(other_host.id), host_alias="web-02",
         system_user_id=19, system_user_alias="readonly",
-        mode="assisted", status="queued", revision=0,
+        mode="ask", status="queued", revision=0, graph_version="v2",
         budget_json="{}", latest_event_seq=0,
     )
     session.add(other_run)
@@ -842,7 +876,7 @@ def test_decision_rechecks_asset_credential_and_environment(waiting_env):
     # 环境在等待审批期间被改回 production 时，lab 模式的 Run 必须被拦下。
     session = waiting_env["session"]
     run_row = session.get(t_ai_autonomous_run, waiting_env["run_id"])
-    run_row.mode = "lab_autonomous"
+    run_row.mode = "auto"
     session.commit()
     with pytest.raises(AutonomyPermissionError):
         repo.decide(

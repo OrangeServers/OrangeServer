@@ -42,7 +42,7 @@ def make_handlers(trace, decide_done=None):
 
 def compile_v1(handlers):
     return build_graph(
-        DEFAULT_GRAPH_VERSION, handlers,
+        'v1', handlers,
     ).compile(checkpointer=MemorySaver())
 
 
@@ -53,7 +53,7 @@ def thread(run_id='run-graph-1'):
 def initial_input(run_id='run-graph-1', pending_step_id='step-7'):
     return {
         'run_id': run_id,
-        'graph_version': DEFAULT_GRAPH_VERSION,
+        'graph_version': 'v1',
         'loops': 0,
         'pending_step_id': pending_step_id,
     }
@@ -75,17 +75,18 @@ def test_cursor_state_is_compact():
     assert set(GraphCursor.__annotations__.keys()) == {
         'run_id', 'graph_version', 'owner', 'goal', 'phase', 'loops',
         'proposed_steps',
-        'pending_step_id', 'decision', 'done', 'summary',
+        'pending_step_id', 'policy_decision', 'decision', 'done', 'summary',
     }
 
 
 def test_build_graph_rejects_unknown_version():
     handlers = make_handlers([])
     with pytest.raises(AutonomyGraphError):
-        build_graph('v2', handlers)
+        build_graph('v3', handlers)
     with pytest.raises(AutonomyGraphError):
         build_graph('', handlers)
-    assert list_graph_versions() == ['v1']
+    assert DEFAULT_GRAPH_VERSION == 'v2'
+    assert list_graph_versions() == ['v1', 'v2']
 
 
 def test_build_graph_rejects_missing_handlers():
@@ -178,3 +179,46 @@ def test_separate_threads_do_not_share_state():
     b = compiled.invoke(initial_input(run_id='run-b'), thread('run-b'))
     assert a['__interrupt__'][0].value['run_id'] == 'run-a'
     assert b['__interrupt__'][0].value['run_id'] == 'run-b'
+
+
+def test_v2_allow_bypasses_approval_pause_and_runs_to_completion():
+    trace = []
+    handlers = make_handlers(trace)
+
+    def allow_policy(state):
+        trace.append('policy')
+        return {'policy_decision': 'allow'}
+
+    handlers['policy'] = allow_policy
+    compiled = build_graph('v2', handlers).compile(checkpointer=MemorySaver())
+    result = compiled.invoke({
+        'run_id': 'run-v2-allow',
+        'graph_version': 'v2',
+        'pending_step_id': 'step-allow',
+        'loops': 0,
+    }, thread('run-v2-allow'))
+
+    assert '__interrupt__' not in result
+    assert trace == ['plan', 'policy', 'execute', 'observe', 'verify', 'decide']
+    assert result['done'] is True
+
+
+def test_v2_ask_uses_the_existing_approval_interrupt():
+    trace = []
+    handlers = make_handlers(trace)
+
+    def ask_policy(state):
+        trace.append('policy')
+        return {'policy_decision': 'ask'}
+
+    handlers['policy'] = ask_policy
+    compiled = build_graph('v2', handlers).compile(checkpointer=MemorySaver())
+    result = compiled.invoke({
+        'run_id': 'run-v2-ask',
+        'graph_version': 'v2',
+        'pending_step_id': 'step-ask',
+        'loops': 0,
+    }, thread('run-v2-ask'))
+
+    assert '__interrupt__' in result
+    assert trace == ['plan', 'policy']

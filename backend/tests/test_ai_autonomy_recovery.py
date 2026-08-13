@@ -102,6 +102,12 @@ def env(monkeypatch):
     host_seq = {"n": 0}
 
     def create_queued_run(**kwargs):
+        graph_version = kwargs.pop("graph_version", None)
+        legacy_mode = kwargs.get("mode") if kwargs.get("mode") in {
+            "read_only", "assisted", "lab_autonomous",
+        } else None
+        if legacy_mode is not None:
+            kwargs["mode"] = "ask"
         host_seq["n"] += 1
         n = host_seq["n"]
         host = t_host(
@@ -114,10 +120,17 @@ def env(monkeypatch):
             goal="recover safely",
             host_id=int(host.id),
             system_user_id=21,
-            mode="assisted",
+            mode="ask",
         )
         payload.update(kwargs)
         run = repo.create_run("admin", "admin", **payload)
+        if graph_version is not None or legacy_mode is not None:
+            row = session.get(t_ai_autonomous_run, run["id"])
+            if graph_version is not None:
+                row.graph_version = graph_version
+            if legacy_mode is not None:
+                row.mode = legacy_mode
+            session.commit()
         return repo.start_run("admin", "admin", run["id"])
 
     planner_calls = {"n": 0}
@@ -348,7 +361,7 @@ def test_kill_during_write_lands_outcome_unknown_never_replays(env):
 # ---------------------------------------------------------------------------
 
 def test_checkpoint_lost_with_waiting_step_stays_paused(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     saver = MemorySaver()
     driver = env["make_driver"](saver=saver)
     claimed = env["claim"](run["id"])
@@ -372,7 +385,7 @@ def test_checkpoint_lost_with_waiting_step_stays_paused(env):
 
 
 def test_checkpoint_lost_with_approved_step_rebuilds_execute(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     saver = MemorySaver()
     driver = env["make_driver"](saver=saver)
     claimed = env["claim"](run["id"])

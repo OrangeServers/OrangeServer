@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """M1/S1+S2: 服务端动作策略、预算、敏感路径与永久拒绝清单。
 
-策略完全由服务端持有：
+策略完全由服务端持有，采用常见 Harness 的 allow/ask/deny 契约：
 - probe（服务端自有探针）是唯一可自动执行的只读动作；
 - file_read 永不自动：敏感路径直接拒绝，其余等待精确审批；
 - systemd/package_install 结构化写动作永不自动：read_only 拒绝，
@@ -12,8 +12,9 @@
 - 永久拒绝清单（磁盘分区格式化、根目录宽删、主动读秘密、横向
   SSH、绕过审计）即使命中人工精确审批也不执行；黑名单只提供
   风险信号，永久拒绝清单才是硬规则。
-- lab_autonomous 仅由管理员维护的 t_host.ai_environment='lab'
-  授予；名为 lab 的普通资产组不带来任何自治能力。
+- auto（以及兼容值 lab_autonomous）仅由管理员维护的
+  t_host.ai_environment='lab' 授予；名为 lab 的普通资产组不带来
+  任何自动执行能力。
 """
 import re
 from dataclasses import dataclass
@@ -21,13 +22,24 @@ from enum import Enum
 from typing import Any, Dict, Optional, Tuple
 
 from app.ai.autonomy.actions import StructuredAction
-from app.ai.autonomy.state import AiEnvironment, RunMode
+from app.ai.autonomy.state import AiEnvironment, RunMode, normalize_run_mode
 
 
-class ApprovalDecision(str, Enum):
-    AUTO = 'auto'
-    APPROVAL_REQUIRED = 'approval_required'
-    DENIED = 'denied'
+class PolicyDecision(str, Enum):
+    """Deterministic harness decision; the model never grants permission."""
+
+    ALLOW = 'allow'
+    ASK = 'ask'
+    DENY = 'deny'
+
+    # Compatibility names for existing internal callers. Enum aliases do not
+    # add policy values or change the persisted allow/ask/deny vocabulary.
+    AUTO = 'allow'
+    APPROVAL_REQUIRED = 'ask'
+    DENIED = 'deny'
+
+
+ApprovalDecision = PolicyDecision
 
 
 class PolicyViolation(Exception):
@@ -195,7 +207,7 @@ _SHELL_RISK_PATTERNS = (
 )
 
 
-def classify_shell_command(command: str) -> Tuple[ApprovalDecision, str]:
+def classify_shell_command(command: str) -> Tuple[PolicyDecision, str]:
     """对任意 Shell 文本做风险分级。
 
     shell 动作永远不可能自动执行；永久拒绝清单命中直接拒绝。
@@ -204,16 +216,16 @@ def classify_shell_command(command: str) -> Tuple[ApprovalDecision, str]:
     """
     text = str(command or '')
     if not text.strip():
-        return ApprovalDecision.DENIED, 'empty command'
+        return PolicyDecision.DENY, 'empty command'
     deny_reason = permanent_deny_reason(text)
     if deny_reason is not None:
-        return ApprovalDecision.DENIED, deny_reason
+        return PolicyDecision.DENY, deny_reason
     for pattern, reason in _SHELL_RISK_PATTERNS:
         if pattern.search(text):
-            return ApprovalDecision.APPROVAL_REQUIRED, (
+            return PolicyDecision.ASK, (
                 'high-risk shell requires exact approval: %s' % reason
             )
-    return ApprovalDecision.APPROVAL_REQUIRED, 'arbitrary shell requires exact approval'
+    return PolicyDecision.ASK, 'arbitrary shell requires exact approval'
 
 
 # ---------------------------------------------------------------------------
@@ -221,12 +233,16 @@ def classify_shell_command(command: str) -> Tuple[ApprovalDecision, str]:
 # ---------------------------------------------------------------------------
 
 def validate_mode_for_environment(mode: str, environment: str) -> None:
-    """lab_autonomous 只授予管理员标记为 lab 的资产。"""
-    RunMode(mode)
-    AiEnvironment(environment)
-    if mode == RunMode.LAB_AUTONOMOUS.value and environment != AiEnvironment.LAB.value:
+    """自动档只授予管理员标记为 lab 的资产。"""
+    parsed_mode = RunMode(mode)
+    parsed_environment = AiEnvironment(environment)
+    canonical_mode = normalize_run_mode(parsed_mode.value)
+    if (
+        canonical_mode == RunMode.AUTO
+        and parsed_environment != AiEnvironment.LAB
+    ):
         raise PolicyViolation(
-            'lab_autonomous mode requires ai_environment=lab on the target host'
+            'auto mode requires ai_environment=lab on the target host'
         )
 
 
@@ -234,7 +250,7 @@ def classify_action(
     mode: str,
     action: StructuredAction,
     environment: str,
-) -> Tuple[ApprovalDecision, str]:
+) -> Tuple[PolicyDecision, str]:
     """服务端策略：返回 (决策, 原因)。
 
     - probe 是服务端自有只读探针，任何模式下都可自动（参数在
@@ -246,32 +262,32 @@ def classify_action(
     - file_patch/file_restore 带备份承诺的文件写动作同样永不自动：
       read_only 拒绝，敏感路径拒绝，其余要求精确审批。
     """
-    RunMode(mode)
+    canonical_mode = normalize_run_mode(mode)
     AiEnvironment(environment)
     kind = str(action.kind)
     if kind == 'probe':
-        return ApprovalDecision.AUTO, 'server-owned read-only probe'
+        return PolicyDecision.ALLOW, 'server-owned read-only probe'
     if kind == 'file_read':
         path = str(action.parameters.get('path') or '')
         if is_sensitive_path(path):
-            return ApprovalDecision.DENIED, 'sensitive path is denied by server policy'
-        return ApprovalDecision.APPROVAL_REQUIRED, 'general file reads are never automatic'
+            return PolicyDecision.DENY, 'sensitive path is denied by server policy'
+        return PolicyDecision.ASK, 'general file reads are never automatic'
     if kind == 'shell':
         command = str(action.parameters.get('command') or '')
         decision, reason = classify_shell_command(command)
-        if decision == ApprovalDecision.DENIED:
-            return ApprovalDecision.DENIED, reason
-        if mode == RunMode.READ_ONLY.value:
-            return ApprovalDecision.DENIED, 'shell actions are denied in read_only mode'
-        return ApprovalDecision.APPROVAL_REQUIRED, reason
+        if decision == PolicyDecision.DENY:
+            return PolicyDecision.DENY, reason
+        if canonical_mode == RunMode.READ_ONLY:
+            return PolicyDecision.DENY, 'shell actions are denied in read_only mode'
+        return PolicyDecision.ASK, reason
     if kind in ('systemd', 'package_install'):
         # 结构化写动作：模板与参数白名单在 actions 层校验；这里
         # 只决定审批策略——永不自动。
-        if mode == RunMode.READ_ONLY.value:
-            return ApprovalDecision.DENIED, (
+        if canonical_mode == RunMode.READ_ONLY:
+            return PolicyDecision.DENY, (
                 '%s actions are denied in read_only mode' % kind
             )
-        return ApprovalDecision.APPROVAL_REQUIRED, (
+        return PolicyDecision.ASK, (
             'structured write requires exact approval'
         )
     if kind in ('file_patch', 'file_restore'):
@@ -279,12 +295,12 @@ def classify_action(
         # 敏感路径在策略层先拒绝，其余永不自动。
         path = str(action.parameters.get('path') or '')
         if is_sensitive_path(path):
-            return ApprovalDecision.DENIED, 'sensitive path is denied by server policy'
-        if mode == RunMode.READ_ONLY.value:
-            return ApprovalDecision.DENIED, (
+            return PolicyDecision.DENY, 'sensitive path is denied by server policy'
+        if canonical_mode == RunMode.READ_ONLY:
+            return PolicyDecision.DENY, (
                 '%s actions are denied in read_only mode' % kind
             )
-        return ApprovalDecision.APPROVAL_REQUIRED, (
+        return PolicyDecision.ASK, (
             'file write requires exact approval'
         )
-    return ApprovalDecision.DENIED, 'unknown action kind'
+    return PolicyDecision.DENY, 'unknown action kind'

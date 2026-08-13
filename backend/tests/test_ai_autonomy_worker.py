@@ -78,7 +78,7 @@ def worker_env(monkeypatch):
             goal="diagnose latency",
             host_id=int(host.id),
             system_user_id=19,
-            mode="assisted",
+            mode="ask",
         )
         payload.update(kwargs)
         run = repo.create_run("admin", "admin", **payload)
@@ -482,7 +482,7 @@ def test_dispatch_recoverable_sweeps_expired_before_dispatch(worker_env):
     # 先建超期 draft 再建活动 Run：同 host 活动 Run 互斥。
     draft = worker_env["repo"].create_run(
         "admin", "admin", goal="stale draft",
-        host_id=int(host.id), system_user_id=19, mode="assisted",
+        host_id=int(host.id), system_user_id=19, mode="ask",
     )
     row = session.get(t_ai_autonomous_run, draft["id"])
     row.updated_at = (

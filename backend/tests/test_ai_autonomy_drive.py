@@ -18,6 +18,7 @@ from app.ai.autonomy import drive as drive_mod
 from app.ai.autonomy.drive import AutonomyDriver
 from app.ai.autonomy.executor import RunnerResult
 from app.ai.autonomy.lease import RunLeaseService
+from app.ai.autonomy.policy import PolicyDecision
 from app.ai.autonomy.repository import AutonomyRepository
 from app.ai.autonomy.state import StepStatus
 from app.core import config
@@ -125,6 +126,12 @@ def env(monkeypatch):
     host_seq = {"n": 0}
 
     def create_queued_run(**kwargs):
+        graph_version = kwargs.pop("graph_version", None)
+        legacy_mode = kwargs.get("mode") if kwargs.get("mode") in {
+            "read_only", "assisted", "lab_autonomous",
+        } else None
+        if legacy_mode is not None:
+            kwargs["mode"] = "ask"
         host_seq["n"] += 1
         n = host_seq["n"]
         host = t_host(
@@ -137,10 +144,17 @@ def env(monkeypatch):
             goal="diagnose latency",
             host_id=int(host.id),
             system_user_id=19,
-            mode="assisted",
+            mode="ask",
         )
         payload.update(kwargs)
         run = repo.create_run("admin", "admin", **payload)
+        if graph_version is not None or legacy_mode is not None:
+            row = session.get(t_ai_autonomous_run, run["id"])
+            if graph_version is not None:
+                row.graph_version = graph_version
+            if legacy_mode is not None:
+                row.mode = legacy_mode
+            session.commit()
         return repo.start_run("admin", "admin", run["id"])
 
     planner_calls = {"n": 0}
@@ -233,8 +247,80 @@ def _approve_and_drive(env, driver, run_id, operation="approve"):
 # 首轮驱动：规划 → 策略 → 审批暂停
 # ---------------------------------------------------------------------------
 
+def test_v2_allowed_probe_executes_without_per_step_approval(env):
+    run = env["create_queued_run"](mode="ask")
+    assert _run_row(env, run["id"]).graph_version == "v2"
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    row = _run_row(env, run["id"])
+    assert row.status == "completed"
+    step = env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).one()
+    assert step.status == "succeeded"
+    assert _pending_step(env, run["id"]) is None
+    event_types = [event.event_type for event in _events(env, run["id"])]
+    assert "step_policy_decided" in event_types
+    assert "steps_waiting_approval" not in event_types
+
+
+def test_v2_ask_pauses_without_calling_the_runner(env, monkeypatch):
+    monkeypatch.setattr(
+        drive_mod, "classify_action",
+        lambda *_args: (PolicyDecision.ASK, "test boundary needs approval"),
+    )
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_PAUSED
+    assert env["runner"].calls == []
+    assert _run_row(env, run["id"]).status == "waiting_approval"
+    assert _pending_step(env, run["id"]) is not None
+
+
+def test_v2_tampered_action_is_denied_without_calling_the_runner(env):
+    planner_calls = {"count": 0}
+
+    def tampering_planner(context):
+        planner_calls["count"] += 1
+        if planner_calls["count"] > 1:
+            return []
+        step = context["repo"].propose_probe(
+            context["owner"], context["role"],
+            context["run_id"], "system.load",
+        )
+        row = _step_row(env, step["id"])
+        snapshot = json.loads(row.action_json)
+        snapshot["action_version"] += 1
+        row.action_json = json.dumps(snapshot, sort_keys=True)
+        env["session"].commit()
+        return [step["id"]]
+
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=tampering_planner)
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert env["runner"].calls == []
+    step = env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).one()
+    assert step.status == "failed"
+    assert step.note == "malformed action snapshot"
+
+
 def test_first_drive_pauses_at_approval(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     driver = env["make_driver"]()
     claimed = env["claim"](run["id"])
 
@@ -254,7 +340,9 @@ def test_first_drive_pauses_at_approval(env):
 
 def test_checkpoint_does_not_store_the_run_goal(env):
     secret_goal = "diagnose password=checkpoint-secret"
-    run = env["create_queued_run"](goal=secret_goal)
+    run = env["create_queued_run"](
+        goal=secret_goal, mode="assisted", graph_version="v1",
+    )
     driver = env["make_driver"]()
 
     assert driver.drive(run["id"], env["claim"](run["id"])) == (
@@ -273,7 +361,7 @@ def test_checkpoint_does_not_store_the_run_goal(env):
 
 
 def test_second_drive_without_decision_stays_paused(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     driver = env["make_driver"]()
     claimed = env["claim"](run["id"])
     assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
@@ -292,7 +380,7 @@ def test_second_drive_without_decision_stays_paused(env):
 # ---------------------------------------------------------------------------
 
 def test_resume_approved_executes_and_completes(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     driver = env["make_driver"]()
     claimed = env["claim"](run["id"])
     assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
@@ -313,7 +401,7 @@ def test_resume_approved_executes_and_completes(env):
 
 
 def test_resume_rejected_skips_execution(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     driver = env["make_driver"]()
     claimed = env["claim"](run["id"])
     assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
@@ -330,7 +418,7 @@ def test_resume_rejected_skips_execution(env):
 
 
 def test_cancel_between_pause_and_resume_skips_execution(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     driver = env["make_driver"]()
     claimed = env["claim"](run["id"])
     assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
@@ -453,7 +541,7 @@ def test_finalize_preserves_unknown_outcome_over_cancel(env):
 
 
 def test_terminal_run_is_skipped(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     driver = env["make_driver"]()
     claimed = env["claim"](run["id"])
     assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
@@ -528,7 +616,7 @@ def test_duration_budget_exhausted_before_side_effects(env):
 
 
 def test_remaining_duration_caps_command_timeout(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     row = _run_row(env, run["id"])
     row.started_at = (
         drive_mod._utcnow() - datetime.timedelta(seconds=3590)
@@ -547,7 +635,7 @@ def test_remaining_duration_caps_command_timeout(env):
 
 
 def test_lease_loss_during_remote_execution_aborts_graph(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     driver = env["make_driver"]()
     claimed = env["claim"](run["id"])
     assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
@@ -577,7 +665,7 @@ def test_lease_loss_during_remote_execution_aborts_graph(env):
 
 
 def test_heartbeat_started_and_stopped(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     driver = env["make_driver"]()
     claimed = env["claim"](run["id"])
     assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
@@ -595,7 +683,7 @@ def test_heartbeat_started_and_stopped(env):
 # ---------------------------------------------------------------------------
 
 def test_scan_excludes_healthy_paused_runs(env):
-    run = env["create_queued_run"]()
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
     driver = env["make_driver"]()
     claimed = env["claim"](run["id"])
     assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED

@@ -34,18 +34,19 @@ from app.ai.autonomy.actions import (
     verify_action_digest,
 )
 from app.ai.autonomy.policy import (
-    ApprovalDecision,
     Budget,
+    PolicyDecision,
     classify_action,
     parse_budget,
     validate_mode_for_environment,
 )
+from app.ai.autonomy.graph import DEFAULT_GRAPH_VERSION
 from app.ai.autonomy.state import (
     ACTIVE_RUN_STATUSES,
+    CANONICAL_RUN_MODES,
     AiEnvironment,
     AutonomyStateError,
     DecisionOperation,
-    RunMode,
     RunStatus,
     StepKind,
     StepStatus,
@@ -298,6 +299,7 @@ class AutonomyRepository:
             'status': row.status,
             'outcome': row.outcome,
             'revision': int(row.revision or 0),
+            'graph_version': row.graph_version,
             'budget': json.loads(row.budget_json or '{}'),
             'latest_event_seq': int(row.latest_event_seq or 0),
             'cancel_requested': bool(row.cancel_requested),
@@ -339,7 +341,7 @@ class AutonomyRepository:
         goal = sanitize_text(goal).strip()
         if not goal or len(goal) > 512:
             raise AutonomyValidationError('goal must be 1..512 characters')
-        if mode not in {m.value for m in RunMode}:
+        if mode not in {m.value for m in CANONICAL_RUN_MODES}:
             raise AutonomyValidationError('unknown mode: %r' % (mode,))
         try:
             budget = parse_budget(budget_payload)
@@ -386,6 +388,7 @@ class AutonomyRepository:
             system_user_id=system_user_id,
             system_user_alias=str(credential.get('alias') or ''),
             mode=mode,
+            graph_version=DEFAULT_GRAPH_VERSION,
             status=RunStatus.DRAFT.value,
             revision=0,
             budget_json=json.dumps(budget.to_dict(), sort_keys=True),
@@ -609,9 +612,9 @@ class AutonomyRepository:
         ).count() + 1
         summary = redacted_summary(action)
 
-        if decision == ApprovalDecision.DENIED:
+        if decision == PolicyDecision.DENY:
             initial_status = StepStatus.FAILED.value
-        elif decision == ApprovalDecision.APPROVAL_REQUIRED:
+        elif decision == PolicyDecision.ASK:
             initial_status = StepStatus.WAITING_APPROVAL.value
         else:
             # 自动通过的探针留给执行器（S2）；S1 不执行任何远程命令。
@@ -628,7 +631,7 @@ class AutonomyRepository:
                 action.to_canonical_dict(), sort_keys=True, ensure_ascii=True,
             ),
             action_digest=build_action_digest(action, self.secret_key),
-            note='' if decision != ApprovalDecision.DENIED else reason[:255],
+            note='' if decision != PolicyDecision.DENY else reason[:255],
         )
         self.session.add(step)
         self._bump(run)
@@ -636,7 +639,7 @@ class AutonomyRepository:
             'step_id': step_id, 'seq': seq, 'probe_id': str(probe_id),
             'decision': decision.value, 'reason': reason,
         })
-        if decision == ApprovalDecision.APPROVAL_REQUIRED:
+        if decision == PolicyDecision.ASK:
             if run.status != RunStatus.WAITING_APPROVAL.value:
                 assert_run_transition(run.status, RunStatus.WAITING_APPROVAL.value)
                 run.status = RunStatus.WAITING_APPROVAL.value

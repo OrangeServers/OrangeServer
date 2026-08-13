@@ -4,15 +4,18 @@ import pytest
 
 from app.ai.autonomy.state import (
     ACTIVE_RUN_STATUSES,
+    CANONICAL_RUN_MODES,
     RUN_TRANSITIONS,
     STEP_TRANSITIONS,
     TERMINAL_RUN_STATUSES,
     TERMINAL_STEP_STATUSES,
     AutonomyStateError,
+    RunMode,
     RunStatus,
     StepStatus,
     assert_run_transition,
     assert_step_transition,
+    normalize_run_mode,
 )
 
 
@@ -72,6 +75,7 @@ ILLEGAL_RUN_TRANSITIONS = [
 
 LEGAL_STEP_TRANSITIONS = [
     ("proposed", "waiting_approval"),
+    ("proposed", "approved"),
     ("proposed", "running"),
     ("proposed", "skipped"),
     ("proposed", "failed"),
@@ -107,7 +111,6 @@ ILLEGAL_STEP_TRANSITIONS = [
     ("outcome_unknown", "cancelled"),
     # proposed 不能直接成功。
     ("proposed", "succeeded"),
-    ("proposed", "approved"),
     ("approved", "succeeded"),
 ]
 
@@ -164,3 +167,24 @@ def test_active_run_statuses_exclude_terminal_and_match_transition_table():
 def test_every_run_status_appears_in_exactly_one_transition_bucket():
     assert set(RUN_TRANSITIONS) == set(RunStatus)
     assert set(STEP_TRANSITIONS) == set(StepStatus)
+
+
+def test_permission_profiles_use_the_four_product_modes():
+    assert CANONICAL_RUN_MODES == (
+        RunMode.ASK,
+        RunMode.AI_REVIEW,
+        RunMode.AUTO,
+        RunMode.CUSTOM,
+    )
+    assert [mode.value for mode in CANONICAL_RUN_MODES] == [
+        "ask", "ai_review", "auto", "custom",
+    ]
+
+
+@pytest.mark.parametrize(("legacy", "canonical"), [
+    ("assisted", RunMode.ASK),
+    ("lab_autonomous", RunMode.AUTO),
+    ("read_only", RunMode.READ_ONLY),
+])
+def test_legacy_run_modes_have_explicit_runtime_mapping(legacy, canonical):
+    assert normalize_run_mode(legacy) is canonical

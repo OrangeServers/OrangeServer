@@ -16,6 +16,16 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Every autonomy endpoint stays rejected until `OGS_AI_AUTONOMY_ENABLED` is
   explicitly set, and this stage performs no remote execution.
 
+### Changed
+
+- The disabled-by-default M1 autonomy workflow now uses the common
+  `allow` / `ask` / `deny` harness contract and four permission profiles:
+  ask every time, AI review, automatic, and custom. New runs use a versioned
+  LangGraph route where server-owned read-only probes continue without a
+  per-step prompt, while `ask` still pauses at the existing approval interrupt
+  and `deny` can never be elevated by a model. Persisted v1 runs retain their
+  original graph and legacy mode semantics for recovery.
+
 ## [1.0.4] - 2026-07-30
 
 ### Fixed

@@ -77,7 +77,7 @@ def expiry_env(monkeypatch):
             goal="diagnose latency",
             host_id=int(host.id),
             system_user_id=19,
-            mode="assisted",
+            mode="ask",
         )
         payload.update(kwargs)
         return repo.create_run("admin", "admin", **payload)

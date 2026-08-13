@@ -14,9 +14,9 @@
   的情况下产生远程副作用。
 - 租约丢失即中止：心跳续租失败后，驱动循环在下一个节点边界立刻
   中止，不再产生任何副作用，也不释放（已不属于自己）的租约。
-- v1 约束：所有动作步骤都经 approval_pause 人工审批；role 固定
-  'admin'（自治入口在路由层强制管理员），多角色支持需先把 role
-  持久化到 Run 行。
+- v1 兼容图仍让所有动作经过 approval_pause；v2 使用服务端
+  allow/ask/deny 决策，仅 ask 暂停。role 固定 'admin'（自治入口在
+  路由层强制管理员），多角色支持需先把 role 持久化到 Run 行。
 """
 import datetime
 import json
@@ -25,10 +25,15 @@ import threading
 
 from langgraph.types import Command
 
+from app.ai.autonomy.actions import (
+    ActionValidationError,
+    action_from_dict,
+    verify_action_digest,
+)
 from app.ai.autonomy.executor import AutonomyExecutor
 from app.ai.autonomy.graph import AutonomyGraphError, build_graph
 from app.ai.autonomy.lease import RunLeaseService
-from app.ai.autonomy.policy import Budget
+from app.ai.autonomy.policy import Budget, PolicyDecision, classify_action
 from app.ai.autonomy.recovery import (
     MODE_BOUNDARY,
     MODE_HALT,
@@ -268,23 +273,85 @@ class AutonomyDriver:
                 .all()
             )
             if not steps:
-                return {}
+                return {
+                    'pending_step_id': '',
+                    'policy_decision': PolicyDecision.ALLOW.value,
+                    'decision': '',
+                }
             run = self._run_row(run_id)
-            for step in steps:
+            if str(run.graph_version or '') != 'v2':
+                for step in steps:
+                    assert_step_transition(
+                        step.status, StepStatus.WAITING_APPROVAL.value,
+                    )
+                    step.status = StepStatus.WAITING_APPROVAL.value
+                assert_run_transition(
+                    run.status, RunStatus.WAITING_APPROVAL.value,
+                )
+                run.status = RunStatus.WAITING_APPROVAL.value
+                self.repo._bump(run)
+                self.repo.append_event(run, 'steps_waiting_approval', {
+                    'step_ids': [step.id for step in steps],
+                })
+                self.repo._commit()
+                return {'pending_step_id': steps[0].id}
+
+            # v2 evaluates one immutable action snapshot per graph loop. The
+            # executor will independently revalidate digest and permissions
+            # immediately before any side effect.
+            step = steps[0]
+            try:
+                snapshot = json.loads(step.action_json or '')
+                action = action_from_dict(snapshot)
+                if not verify_action_digest(
+                    action, step.action_digest, self.repo.secret_key,
+                ):
+                    decision = PolicyDecision.DENY
+                    reason = 'action digest mismatch'
+                else:
+                    host = self.repo._get_host_row(run.host_id)
+                    decision, reason = classify_action(
+                        run.mode, action, host.ai_environment,
+                    )
+            except (ActionValidationError, TypeError, ValueError):
+                decision = PolicyDecision.DENY
+                reason = 'malformed action snapshot'
+
+            if decision == PolicyDecision.ALLOW:
+                assert_step_transition(step.status, StepStatus.APPROVED.value)
+                step.status = StepStatus.APPROVED.value
+                step.note = 'allowed by server policy'
+            elif decision == PolicyDecision.ASK:
                 assert_step_transition(
                     step.status, StepStatus.WAITING_APPROVAL.value,
                 )
                 step.status = StepStatus.WAITING_APPROVAL.value
-            assert_run_transition(
-                run.status, RunStatus.WAITING_APPROVAL.value,
-            )
-            run.status = RunStatus.WAITING_APPROVAL.value
+                if run.status != RunStatus.WAITING_APPROVAL.value:
+                    assert_run_transition(
+                        run.status, RunStatus.WAITING_APPROVAL.value,
+                    )
+                    run.status = RunStatus.WAITING_APPROVAL.value
+            else:
+                assert_step_transition(step.status, StepStatus.FAILED.value)
+                step.status = StepStatus.FAILED.value
+                step.note = reason[:255]
+
             self.repo._bump(run)
-            self.repo.append_event(run, 'steps_waiting_approval', {
-                'step_ids': [step.id for step in steps],
+            self.repo.append_event(run, 'step_policy_decided', {
+                'step_id': step.id,
+                'decision': decision.value,
+                'reason': reason,
             })
+            if decision == PolicyDecision.ASK:
+                self.repo.append_event(run, 'steps_waiting_approval', {
+                    'step_ids': [step.id],
+                })
             self.repo._commit()
-            return {'pending_step_id': steps[0].id}
+            return {
+                'pending_step_id': step.id,
+                'policy_decision': decision.value,
+                'decision': '',
+            }
 
         def execute(state):
             self._guard()
