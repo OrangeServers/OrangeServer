@@ -8,7 +8,7 @@ export default {
   subtitle: 'Supervise every autonomous AI run on your assets, driven by server-authoritative state',
   create: 'New task draft',
   featureDisabled: 'Autonomous runs are disabled: set OGS_AI_AUTONOMY_ENABLED on the server and restart.',
-  notReady: 'Infrastructure not ready ({reason}); the server will reject create and start requests.',
+  notReady: 'Infrastructure not ready ({reason}); started runs will not execute. Drafts can still be created.',
   reason: {
     ready: 'ready',
     feature_disabled: 'feature disabled',
