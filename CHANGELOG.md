@@ -28,6 +28,10 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Chat autonomy draft reference cards now use creation time plus a stable ID
+  when restoring history, so refreshing a conversation does not change their
+  display order.
+
 - The unreleased autonomy SSH runner now remains compatible with older Linux
   `setsid` implementations that do not support `--wait`, while the development
   Worker inherits the configured host-key policy from the backend.

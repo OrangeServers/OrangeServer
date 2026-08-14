@@ -487,6 +487,7 @@ import {
   getDiagnosticRun,
 } from '@/api/aiDiagnostics'
 import { aiJsonRequest, postAiStream } from '@/utils/aiStream'
+import { sortAutonomyDrafts } from '@/utils/autonomyDrafts'
 import {
   AI_CONTEXT_MODE_DEEP,
   AI_CONTEXT_MODE_STANDARD,
@@ -1678,18 +1679,20 @@ function normalizeAutonomyDraft(data: Record<string, unknown>): AiAutonomyDraft 
 function upsertAutonomyDraft(data: Record<string, unknown>): void {
   const draft = normalizeAutonomyDraft(data)
   if (!draft) return
+  const next = [...autonomyDrafts.value]
   const index = autonomyDrafts.value.findIndex(
     item => item.run_id === draft.run_id,
   )
   if (index < 0) {
-    autonomyDrafts.value.push(draft)
-    return
+    next.push(draft)
+  } else {
+    next[index] = {
+      ...next[index],
+      ...draft,
+      created_at: next[index].created_at || draft.created_at,
+    }
   }
-  autonomyDrafts.value[index] = {
-    ...autonomyDrafts.value[index],
-    ...draft,
-    created_at: autonomyDrafts.value[index].created_at || draft.created_at,
-  }
+  autonomyDrafts.value = sortAutonomyDrafts(next)
 }
 
 function restoreAutonomyDrafts(items: AiAutonomyDraft[]): AiAutonomyDraft[] {
@@ -1701,7 +1704,7 @@ function restoreAutonomyDrafts(items: AiAutonomyDraft[]): AiAutonomyDraft[] {
       restored.push(draft)
     }
   }
-  return restored
+  return sortAutonomyDrafts(restored)
 }
 
 function summarizeToolData(data: Record<string, unknown>): string {
