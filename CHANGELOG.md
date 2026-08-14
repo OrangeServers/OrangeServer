@@ -16,6 +16,16 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Every autonomy endpoint stays rejected until `OGS_AI_AUTONOMY_ENABLED` is
   explicitly set, and this stage performs no remote execution.
 
+- AI autonomy M1/S3 planning, evidence and product loop (disabled by
+  default): a server-side tool-calling planner whose immutable plan steps are
+  bound to a one-time plan-level authorization digest, an optional Guardian
+  that can only tighten `ask` decisions, redacted untrusted Evidence, an
+  independent verification step and tri-state run outcomes, read-only REST
+  and resumable SSE contracts for runs, an administrator workbench
+  (`/ai-runs`), and chat draft reference cards that can never start, approve
+  or cancel runs. The feature remains gated behind
+  `OGS_AI_AUTONOMY_ENABLED` and is not part of a release deployment.
+
 ### Changed
 
 - The disabled-by-default M1 autonomy workflow now uses the common
