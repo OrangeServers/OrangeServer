@@ -671,6 +671,12 @@ def migrate_and_prime():
             execute_sql_script(
                 upgrade, '/smoke/sql/rev54_ai_autonomy_lease.sql',
             )
+            execute_sql_script(
+                upgrade, '/smoke/sql/rev55_ai_autonomy_custom_profile.sql',
+            )
+            execute_sql_script(
+                upgrade, '/smoke/sql/rev56_ai_autonomy_evidence.sql',
+            )
         require(schema_snapshot(fresh) == schema_snapshot(upgrade),
                 'fresh and v1.0.4 upgraded autonomy schemas differ')
         for connection, prefix, host_id in (
