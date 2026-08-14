@@ -70,6 +70,9 @@ services:
       OGS_MYSQL_PORT: 3306
       OGS_REDIS_HOST: redis
       OGS_REDIS_PORT: 6379
+      # 与 dev.yml 的 backend 对齐：worker 同样直连临时 lab 主机，
+      # 缺省会回落 reject 导致 unknown host key 直接拒绝。
+      OGS_SSH_HOST_KEY_POLICY: auto
       OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-false}
       OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis
       OGS_AI_AUTONOMY_REDIS_PORT: 6379
