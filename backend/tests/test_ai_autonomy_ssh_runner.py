@@ -208,7 +208,9 @@ def test_working_directory_is_posix_quoted_inside_setsid_wrapper():
 
     assert result.termination == TERMINATION_EXITED
     wrapper = primary.commands[0]
+    assert "if setsid --wait true" in wrapper
     assert "setsid --wait sh -c" in wrapper
+    assert "setsid sh -c" in wrapper
     assert "OGS_AUTONOMY_PGID:fixedtoken123:%s" in wrapper
     assert "/tmp/.ogs-autonomy-" not in wrapper
     quoted_directory = "'/opt/app dir/it'\"'\"'s'"

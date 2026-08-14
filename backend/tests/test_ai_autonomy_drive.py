@@ -649,6 +649,22 @@ def test_planner_context_carries_authoritative_budget_and_history(env):
     assert observed["goal"] == "diagnose latency"
 
 
+def test_planner_context_forces_plan_after_three_distinct_probes(env):
+    """The phase handoff is derived from authoritative successful actions."""
+    run = env["create_queued_run"]()
+    for probe_id in ("system.load", "system.memory", "system.disk_usage"):
+        step = env["repo"].propose_probe(
+            "admin", "admin", run["id"], probe_id,
+        )
+        row = _step_row(env, step["id"])
+        row.status = StepStatus.SUCCEEDED.value
+    env["session"].commit()
+
+    driver = env["make_driver"]()
+
+    assert driver._planner_requires_plan(run["id"]) is True
+
+
 def test_no_saver_fails_closed(env):
     run = env["create_queued_run"]()
     driver = env["make_driver"](saver_factory=None)

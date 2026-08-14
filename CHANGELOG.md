@@ -26,6 +26,20 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   or cancel runs. The feature remains gated behind
   `OGS_AI_AUTONOMY_ENABLED` and is not part of a release deployment.
 
+### Fixed
+
+- The unreleased autonomy SSH runner now remains compatible with older Linux
+  `setsid` implementations that do not support `--wait`, while the development
+  Worker inherits the configured host-key policy from the backend.
+
+- The unreleased autonomy Planner now gives OpenAI-compatible reasoning models
+  such as DeepSeek one bounded, server-selected tool-contract repair after a
+  phase or parameter mismatch; rejected first proposals remain side-effect
+  free and all repaired plans still pass the server action fences. Finish
+  citations are constrained to server-issued same-run Evidence IDs; a second
+  invalid citation after an independent verification fails closed to an
+  inconclusive outcome without replaying writes.
+
 ### Changed
 
 - The disabled-by-default M1 autonomy workflow now uses the common

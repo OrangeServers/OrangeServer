@@ -16,6 +16,7 @@
   不进 checkpoint。
 """
 import logging
+import re
 
 from app.ai.autonomy.actions import (
     ActionValidationError,
@@ -65,9 +66,164 @@ REASON_PLAN_CONFLICT = 'plan_conflict'
 class PlannerProposalError(Exception):
     """规划器一轮提议失败：可预期、fail-closed、原因短 token。"""
 
-    def __init__(self, reason):
+    def __init__(self, reason, *, repair_tool=None):
         self.reason = str(reason)[:64]
+        # 只保留服务端选定的工具名，不把供应商/模型原始内容带入
+        # 重试消息或事件。None 表示该错误不适合协议修复。
+        self.repair_tool = repair_tool
         super().__init__(self.reason)
+
+
+def _plan_contract_category(exc):
+    """Return a bounded log token for a rejected model-generated plan.
+
+    The underlying validation text may contain a model-supplied path or other
+    untrusted data.  Keep that text out of worker logs and events while still
+    making provider compatibility failures diagnosable.
+    """
+    detail = str(exc).lower()
+    if 'unexpected parameters' in detail:
+        return 'unexpected_parameters'
+    if 'missing parameters' in detail:
+        return 'missing_parameters'
+    if 'unknown action kind' in detail or 'plans do not support' in detail:
+        return 'unknown_action_kind'
+    if 'action kind' in detail and 'not' in detail:
+        return 'unknown_action_kind'
+    if 'patch content' in detail:
+        return 'patch_content'
+    if 'patch path' in detail or 'path ' in detail:
+        return 'path_policy'
+    if 'parameter ' in detail and 'whitelist' in detail:
+        return 'parameter_whitelist'
+    if 'parameter ' in detail and 'metacharacters' in detail:
+        return 'parameter_metacharacters'
+    if 'plan action denied' in detail:
+        return 'policy_denied'
+    return 'plan_contract'
+
+
+def _plan_action_contracts():
+    """Describe the exact structured action parameter contracts to providers."""
+    return (
+        'probe: params must include probe_id and only that probe declared '
+        'parameters; '
+        'systemd: params exactly {"operation":"start|stop|restart",'
+        '"unit":"service-name"}; '
+        'package_install: params exactly {"manager":"apt|dnf",'
+        '"package":"package-name"}; '
+        'file_patch: params exactly {"path":"/etc/... or /opt/...",'
+        '"content":"non-empty text"} and never backup_path because the '
+        'server creates the managed backup; '
+        'file_restore: params exactly {"path":"...",'
+        '"backup_path":"managed backup path from this Run"}. '
+        'Do not invent action kinds, file_read, shell, host, user, or '
+        'credential parameters.'
+    )
+
+
+def _conclusion_contract_category(exc):
+    """Return a bounded log token for a rejected conclusion citation."""
+    detail = str(exc).lower()
+    if 'same-run evidence' in detail:
+        return 'evidence_citation'
+    if 'unknown outcome' in detail:
+        return 'outcome_value'
+    if 'too many evidence' in detail:
+        return 'evidence_limit'
+    return 'conclusion_contract'
+
+
+_EVIDENCE_ID_RE = re.compile(r'\bid=([A-Za-z0-9][A-Za-z0-9_-]*)')
+
+
+def _evidence_ids(context, *, verification_only=False):
+    """Extract only server-rendered Evidence IDs from the bounded context."""
+    ids = []
+    for entry in context.get('evidence') or []:
+        text = str(entry or '')
+        if verification_only and 'kind=verification_observation' not in text:
+            continue
+        match = _EVIDENCE_ID_RE.search(text)
+        if match and match.group(1) not in ids:
+            ids.append(match.group(1))
+    return ids[:CONCLUSION_MAX_CITATIONS]
+
+
+def _safe_finish_fallback(context):
+    """Fail closed to an inconclusive conclusion after a bad finish repair.
+
+    DeepSeek-compatible providers sometimes keep citing artifact IDs even
+    after a forced finish repair.  If this Run already has a fresh server
+    verification, ending as inconclusive with that exact server-rendered ID
+    is safer than leaving a verified side-effect Run failed or inventing a
+    resolved outcome.  The repository still authoritatively validates the
+    citation and active Run state.
+    """
+    evidence_ids = _evidence_ids(context, verification_only=True)
+    if not evidence_ids:
+        return False
+    try:
+        context['repo'].conclude_run(
+            str(context.get('owner') or ''),
+            str(context.get('role') or ''),
+            str(context.get('run_id') or ''),
+            'inconclusive',
+            evidence_ids,
+        )
+    except (AutonomyConflict, AutonomyValidationError):
+        return False
+    logger.info(
+        'autonomy planner finish fallback: inconclusive with server evidence',
+    )
+    return True
+
+
+def _repair_message(tool_name, context=None):
+    """为一次有界协议修复生成不含敏感上下文的提示。"""
+    if tool_name == PLAN_TOOL_NAME:
+        return (
+            '上一轮工具提议没有通过服务端合同。现在只调用 propose_plan，'
+            '不要调用 propose_verification 或其它工具。计划必须是非空的'
+            ' summary + actions；每个 action 必须含 kind 和 object 类型的'
+            ' params。允许的 kind 只有：%s。file_read 不是计划动作；需要'
+            '读取时使用服务端探针。目标、主机、用户和凭据由服务端绑定，'
+            '不要放入参数。参数合同：%s'
+            % (', '.join(PLAN_ACTION_KINDS), _plan_action_contracts())
+        )
+    if tool_name == VERIFICATION_TOOL_NAME:
+        return (
+            '上一轮工具提议没有通过服务端合同。现在只调用'
+            ' propose_verification，返回一个服务端只读探针，参数必须是'
+            ' object；不要调用 propose_plan，也不要输出主机、用户或凭据。'
+        )
+    if tool_name == PROPOSAL_TOOL_NAME:
+        return (
+            '上一轮工具提议没有通过服务端合同。现在只调用 propose_probe，'
+            '返回一个服务端目录中的只读探针，params 必须是 object；不要'
+            '输出任意 Shell、主机、用户或凭据。'
+        )
+    if tool_name == FINISH_TOOL_NAME:
+        valid_ids = _evidence_ids(context or {})
+        verification_ids = _evidence_ids(
+            context or {}, verification_only=True,
+        )
+        evidence_hint = (
+            '本轮合法 Evidence ID 只有：%s。优先引用验证 Evidence：%s。'
+            % (', '.join(valid_ids), ', '.join(verification_ids))
+            if valid_ids else
+            '当前上下文没有可用 Evidence ID；不要虚构 ID。'
+        )
+        return (
+            '上一轮 finish 结论没有通过服务端合同。现在只调用 finish；'
+            '若提供结论，outcome 只能是 resolved、not_resolved 或 '
+            'inconclusive，evidence_ids 必须是非空数组，并且只能逐字引用'
+            '已有 Evidence 摘要中标记为 id= 的同一 Run Evidence ID；不要引用'
+            'artifact ID、step ID、digest 或自行编造 ID。若无法确定结果，'
+            '使用 inconclusive，但仍引用最近的验证观察 Evidence。'
+            + evidence_hint
+        )
+    return ''
 
 
 def summarize_step_history(session, run_id, limit=HISTORY_STEP_LIMIT):
@@ -120,10 +276,10 @@ def summarize_evidence(session, run_id, limit=EVIDENCE_ENTRY_LIMIT):
     entries = []
     for row in reversed(rows):
         line = sanitize_text(
-            '[%s] %s (id=%s)' % (
+            'id=%s | kind=%s | summary=%s' % (
+                str(row.id or ''),
                 str(row.kind or ''),
                 str(row.summary or ''),
-                str(row.id or ''),
             ),
         )[:EVIDENCE_ENTRY_CHARS]
         entries.append(line)
@@ -147,8 +303,15 @@ def _probe_catalog():
     return '\n'.join(lines)
 
 
-def proposal_tool_schemas():
+def proposal_tool_schemas(context=None):
     """提议/计划/收尾三个服务端自有工具；模型输出只允许这些结构。"""
+    valid_evidence_ids = _evidence_ids(context or {})
+    finish_evidence_items = {'type': 'string'}
+    if valid_evidence_ids:
+        # OpenAI-compatible providers that honor JSON Schema can now only
+        # emit server-rendered same-run IDs; the repository remains the final
+        # authority for providers that ignore the enum.
+        finish_evidence_items['enum'] = valid_evidence_ids
     return [
         {
             'type': 'function',
@@ -182,8 +345,8 @@ def proposal_tool_schemas():
                     '调查充分后提议一个有界、有序的修复计划，一次授权'
                     '后按序执行。只允许结构化动作族：'
                     '%s。目标与凭据由服务端绑定，你不要也不能指定；'
-                    '参数必须命中服务端白名单。'
-                    % ', '.join(PLAN_ACTION_KINDS)
+                    '参数必须命中服务端白名单。参数合同：%s'
+                    % (', '.join(PLAN_ACTION_KINDS), _plan_action_contracts())
                 ),
                 'parameters': {
                     'type': 'object',
@@ -201,6 +364,7 @@ def proposal_tool_schemas():
                                     },
                                     'params': {
                                         'type': 'object',
+                                        'description': _plan_action_contracts(),
                                         'additionalProperties': {
                                             'type': 'string',
                                         },
@@ -260,7 +424,7 @@ def proposal_tool_schemas():
                         'evidence_ids': {
                             'type': 'array',
                             'maxItems': CONCLUSION_MAX_CITATIONS,
-                            'items': {'type': 'string'},
+                            'items': finish_evidence_items,
                         },
                     },
                 },
@@ -294,9 +458,16 @@ def _user_message(context):
     history_block = '\n'.join(history) if history else '（暂无观察）'
     evidence = context.get('evidence') or []
     evidence_block = '\n'.join(evidence) if evidence else '（暂无证据）'
+    phase = (
+        '服务端已完成最低只读调查门槛；本轮必须调用 propose_plan，'
+        '不要继续调用只读探针。'
+        if context.get('require_plan') else
+        '服务端尚未要求切换阶段；请按已有观察选择下一步。'
+    )
     return (
         '调查目标：%s\n'
         '当前第 %s 轮；剩余动作额度 %s。\n'
+        '阶段约束：%s\n'
         '已有观察摘要：\n%s\n'
         '已有 Evidence（结论只能引用这里的 id）：\n%s\n'
         '请提议下一个只读探针、提议一个有序修复计划、提议验证，'
@@ -305,6 +476,7 @@ def _user_message(context):
             sanitize_text(str(context.get('goal') or ''))[:GOAL_CHARS],
             int(context.get('loops', 0)) + 1,
             int(budget.get('remaining_actions', 0)),
+            phase,
             history_block,
             evidence_block,
         )
@@ -312,10 +484,11 @@ def _user_message(context):
 
 
 class ToolCallingPlanner:
-    """驱动循环的 planner 可调用对象；每轮至多落一个探针提议。
+    """驱动循环的 planner 可调用对象；每轮至多落一个提议 Step。
 
     adapter_factory 在调用边界惰性取用（Provider 配置读库），
-    测试注入替身工厂与替身 repo，不碰真实网络。
+    测试注入替身工厂与替身 repo，不碰真实网络。模型阶段/参数偏差
+    最多触发一次指定工具的协议修复，修复前不落任何 Step。
     """
 
     def __init__(self, adapter_factory):
@@ -339,9 +512,18 @@ class ToolCallingPlanner:
             {'role': 'system', 'content': _system_message()},
             {'role': 'user', 'content': _user_message(context)},
         ]
-        tools = proposal_tool_schemas()
+        tools = proposal_tool_schemas(context)
+        tool_choice = (
+            {
+                'type': 'function',
+                'function': {'name': PLAN_TOOL_NAME},
+            }
+            if context.get('require_plan') else 'required'
+        )
         try:
-            result = self._complete(adapter, messages, tools)
+            result = self._complete(
+                adapter, messages, tools, tool_choice=tool_choice,
+            )
         except ProviderConfigError:
             raise PlannerProposalError(REASON_PROVIDER_NOT_CONFIGURED)
         except PlannerProposalError:
@@ -350,12 +532,69 @@ class ToolCallingPlanner:
             logger.warning('autonomy planner provider call failed: %s', exc)
             raise PlannerProposalError(REASON_PROVIDER_CALL_FAILED)
 
+        try:
+            return self._dispatch(context, result)
+        except PlannerProposalError as primary:
+            repair_tool = primary.repair_tool
+            if not repair_tool:
+                raise
+            repair_content = _repair_message(repair_tool, context)
+            if not repair_content:
+                raise
+            logger.info(
+                'autonomy planner protocol repair requested: %s',
+                repair_tool,
+            )
+            repair_messages = list(messages) + [{
+                'role': 'user',
+                'content': repair_content,
+            }]
+            try:
+                repaired = self._complete(
+                    adapter,
+                    repair_messages,
+                    tools,
+                    tool_choice={
+                        'type': 'function',
+                        'function': {'name': repair_tool},
+                    },
+                )
+            except Exception as exc:
+                # 修复是可选的供应商兼容层，失败仍保持原来的 fail-closed
+                # 原因；绝不把一次重试错误伪装成已执行。
+                logger.info(
+                    'autonomy planner protocol repair failed: %s',
+                    type(exc).__name__,
+                )
+                raise primary from exc
+            try:
+                return self._dispatch(context, repaired)
+            except PlannerProposalError as repaired_error:
+                if (
+                    repair_tool == FINISH_TOOL_NAME
+                    and repaired_error.repair_tool == FINISH_TOOL_NAME
+                    and _safe_finish_fallback(context)
+                ):
+                    return []
+                raise
+
+    def _dispatch(self, context, result):
+        """裁决一次已归一化响应；任何落库仍由 repository 围栏。"""
         if result.truncated or result.finish_reason == 'length':
             raise PlannerProposalError(REASON_OUTPUT_TRUNCATED)
         calls = tuple(result.tool_calls)
         if len(calls) != 1:
-            raise PlannerProposalError(REASON_AMBIGUOUS_PROPOSAL)
+            raise PlannerProposalError(
+                REASON_AMBIGUOUS_PROPOSAL,
+                repair_tool=PLAN_TOOL_NAME if context.get('require_plan')
+                else None,
+            )
         call = calls[0]
+        if context.get('require_plan') and call.name != PLAN_TOOL_NAME:
+            raise PlannerProposalError(
+                REASON_UNSUPPORTED_PROPOSAL,
+                repair_tool=PLAN_TOOL_NAME,
+            )
         if call.name == FINISH_TOOL_NAME:
             self._conclude(context, call.arguments)
             return []
@@ -367,9 +606,15 @@ class ToolCallingPlanner:
             raise PlannerProposalError(REASON_UNSUPPORTED_PROPOSAL)
 
         probe_id = str(call.arguments.get('probe_id') or '')
-        params = call.arguments.get('params') or {}
+        params = call.arguments.get('params')
+        if params is None:
+            params = call.arguments.get('parameters')
+        params = params or {}
         if not isinstance(params, dict):
-            raise PlannerProposalError(REASON_MALFORMED_PROPOSAL)
+            raise PlannerProposalError(
+                REASON_MALFORMED_PROPOSAL,
+                repair_tool=PROPOSAL_TOOL_NAME,
+            )
         try:
             step = context['repo'].propose_probe(
                 str(context.get('owner') or ''),
@@ -378,10 +623,16 @@ class ToolCallingPlanner:
                 probe_id,
                 params,
             )
-        except AutonomyValidationError:
-            raise PlannerProposalError(REASON_UNSUPPORTED_PROPOSAL)
+        except AutonomyValidationError as exc:
+            raise PlannerProposalError(
+                REASON_UNSUPPORTED_PROPOSAL,
+                repair_tool=PROPOSAL_TOOL_NAME,
+            ) from exc
         except ActionValidationError:
-            raise PlannerProposalError(REASON_MALFORMED_PROPOSAL)
+            raise PlannerProposalError(
+                REASON_MALFORMED_PROPOSAL,
+                repair_tool=PROPOSAL_TOOL_NAME,
+            )
         except AutonomyConflict:
             raise PlannerProposalError(REASON_RUN_NOT_ACTIVE)
         return [step['id']]
@@ -393,9 +644,15 @@ class ToolCallingPlanner:
         支持的提议一样 fail-closed。
         """
         probe_id = str(arguments.get('probe_id') or '')
-        params = arguments.get('params') or {}
+        params = arguments.get('params')
+        if params is None:
+            params = arguments.get('parameters')
+        params = params or {}
         if not isinstance(params, dict):
-            raise PlannerProposalError(REASON_MALFORMED_PROPOSAL)
+            raise PlannerProposalError(
+                REASON_MALFORMED_PROPOSAL,
+                repair_tool=VERIFICATION_TOOL_NAME,
+            )
         try:
             step = context['repo'].propose_verification(
                 str(context.get('owner') or ''),
@@ -404,10 +661,23 @@ class ToolCallingPlanner:
                 probe_id,
                 params,
             )
-        except AutonomyValidationError:
-            raise PlannerProposalError(REASON_UNSUPPORTED_PROPOSAL)
+        except AutonomyValidationError as exc:
+            # 只有“写成功之后才能验证”这一条前置条件需要切回计划；
+            # 其它验证参数错误仍在同一工具合同内修复。
+            repair_tool = (
+                PLAN_TOOL_NAME
+                if 'prior succeeded write action' in str(exc)
+                else VERIFICATION_TOOL_NAME
+            )
+            raise PlannerProposalError(
+                REASON_UNSUPPORTED_PROPOSAL,
+                repair_tool=repair_tool,
+            ) from exc
         except ActionValidationError:
-            raise PlannerProposalError(REASON_MALFORMED_PROPOSAL)
+            raise PlannerProposalError(
+                REASON_MALFORMED_PROPOSAL,
+                repair_tool=VERIFICATION_TOOL_NAME,
+            )
         except AutonomyConflict:
             raise PlannerProposalError(REASON_RUN_NOT_ACTIVE)
         return [step['id']]
@@ -428,7 +698,10 @@ class ToolCallingPlanner:
             or not isinstance(evidence_ids, list)
             or not evidence_ids
         ):
-            raise PlannerProposalError(REASON_MALFORMED_PROPOSAL)
+            raise PlannerProposalError(
+                REASON_MALFORMED_PROPOSAL,
+                repair_tool=FINISH_TOOL_NAME,
+            )
         try:
             context['repo'].conclude_run(
                 str(context.get('owner') or ''),
@@ -438,8 +711,13 @@ class ToolCallingPlanner:
                 [str(item) for item in evidence_ids],
             )
         except AutonomyValidationError as exc:
+            logger.info(
+                'autonomy planner conclusion contract rejected: %s',
+                _conclusion_contract_category(exc),
+            )
             raise PlannerProposalError(
                 REASON_MALFORMED_PROPOSAL,
+                repair_tool=FINISH_TOOL_NAME,
             ) from exc
         except AutonomyConflict as exc:
             raise PlannerProposalError(REASON_RUN_NOT_ACTIVE) from exc
@@ -453,17 +731,26 @@ class ToolCallingPlanner:
         summary = str(arguments.get('summary') or '')
         actions = arguments.get('actions')
         if not summary.strip() or not isinstance(actions, list) or not actions:
-            raise PlannerProposalError(REASON_MALFORMED_PROPOSAL)
+            raise PlannerProposalError(
+                REASON_MALFORMED_PROPOSAL,
+                repair_tool=PLAN_TOOL_NAME,
+            )
         normalized = []
         for item in actions:
             if not isinstance(item, dict):
-                raise PlannerProposalError(REASON_MALFORMED_PROPOSAL)
+                raise PlannerProposalError(
+                    REASON_MALFORMED_PROPOSAL,
+                    repair_tool=PLAN_TOOL_NAME,
+                )
             kind = str(item.get('kind') or '')
             params = item.get('params')
             if params is None:
                 params = item.get('parameters')
             if not isinstance(params, dict):
-                raise PlannerProposalError(REASON_MALFORMED_PROPOSAL)
+                raise PlannerProposalError(
+                    REASON_MALFORMED_PROPOSAL,
+                    repair_tool=PLAN_TOOL_NAME,
+                )
             normalized.append({'kind': kind, 'params': params})
         try:
             step = context['repo'].propose_plan(
@@ -473,10 +760,20 @@ class ToolCallingPlanner:
                 summary,
                 normalized,
             )
-        except AutonomyValidationError:
-            raise PlannerProposalError(REASON_UNSUPPORTED_PROPOSAL)
+        except AutonomyValidationError as exc:
+            logger.info(
+                'autonomy planner plan contract rejected: %s',
+                _plan_contract_category(exc),
+            )
+            raise PlannerProposalError(
+                REASON_UNSUPPORTED_PROPOSAL,
+                repair_tool=PLAN_TOOL_NAME,
+            ) from exc
         except ActionValidationError:
-            raise PlannerProposalError(REASON_MALFORMED_PROPOSAL)
+            raise PlannerProposalError(
+                REASON_MALFORMED_PROPOSAL,
+                repair_tool=PLAN_TOOL_NAME,
+            )
         except AutonomyConflict as exc:
             if 'plan' in str(exc):
                 raise PlannerProposalError(REASON_PLAN_CONFLICT)
@@ -484,13 +781,13 @@ class ToolCallingPlanner:
         return [step['id']]
 
     @staticmethod
-    def _complete(adapter, messages, tools):
+    def _complete(adapter, messages, tools, *, tool_choice='required'):
         """先强制工具调用；供应商不支持该模式时降级一次再裁决。"""
         from app.ai.provider import ProviderResponseError
 
         try:
             return adapter.complete(
-                messages=messages, tools=tools, tool_choice='required',
+                messages=messages, tools=tools, tool_choice=tool_choice,
             )
         except Exception as exc:
             detail = str(exc).lower()

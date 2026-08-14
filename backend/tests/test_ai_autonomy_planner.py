@@ -103,6 +103,54 @@ class FakeRepo:
         return {"outcome": outcome, "already_concluded": False}
 
 
+class VerificationBeforeWriteRepo(FakeRepo):
+    """Model-phase fence used to reproduce an early verification proposal."""
+
+    def propose_verification(
+        self, owner, role, run_id, probe_id, params=None,
+    ):
+        raise AutonomyValidationError(
+            "verification requires a prior succeeded write action",
+        )
+
+
+class OneShotConclusionRepo(FakeRepo):
+    """Make the first conclusion citation fail, then accept the repair."""
+
+    def __init__(self, error):
+        super().__init__()
+        self._error = error
+
+    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+        self.calls.append({
+            "owner": owner, "role": role, "run_id": run_id,
+            "outcome": outcome, "evidence_ids": evidence_ids,
+        })
+        if self._error is not None:
+            error, self._error = self._error, None
+            raise error
+        return {"outcome": outcome, "already_concluded": False}
+
+
+class RepairFailsThenFallbackRepo(FakeRepo):
+    """Reject both provider citations, then accept the safe fallback."""
+
+    def __init__(self, error):
+        super().__init__()
+        self._remaining_errors = 2
+        self._error = error
+
+    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+        self.calls.append({
+            "owner": owner, "role": role, "run_id": run_id,
+            "outcome": outcome, "evidence_ids": evidence_ids,
+        })
+        if self._remaining_errors:
+            self._remaining_errors -= 1
+            raise self._error
+        return {"outcome": outcome, "already_concluded": False}
+
+
 def make_context(repo, **budget_overrides):
     budget = {"remaining_loops": 5, "remaining_actions": 5}
     budget.update(budget_overrides)
@@ -496,6 +544,60 @@ def test_verification_without_prior_write_maps_to_unsupported():
     assert excinfo.value.reason == "unsupported_proposal"
 
 
+def test_deepseek_early_verification_is_repaired_to_plan():
+    """A rejected phase choice gets one forced, side-effect-free repair."""
+    repo = VerificationBeforeWriteRepo()
+    adapter = FakeAdapter(results=[
+        FakeChatResult([verification_call()]),
+        FakeChatResult([plan_call("restart service")]),
+    ])
+
+    assert make_planner(adapter)(make_context(repo)) == ["step-1"]
+    assert repo.calls == [{
+        "owner": "admin", "role": "admin", "run_id": "run-1",
+        "summary": "restart service",
+        "actions": [{"kind": "systemd", "params": {
+            "operation": "restart", "unit": "nginx",
+        }}],
+    }]
+    assert len(adapter.requests) == 2
+    repair = adapter.requests[1]
+    assert repair["tool_choice"] == {
+        "type": "function",
+        "function": {"name": PLAN_TOOL_NAME},
+    }
+    assert "服务端合同" in repair["messages"][-1]["content"]
+
+
+def test_investigation_handoff_forces_plan_after_probe_phase():
+    """A provider cannot loop on probes after the server phase handoff."""
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[
+        FakeChatResult([probe_call()]),
+        FakeChatResult([plan_call("restart service")]),
+    ])
+
+    context = make_context(repo, remaining_actions=10)
+    context["require_plan"] = True
+
+    assert make_planner(adapter)(context) == ["step-1"]
+    assert repo.calls == [{
+        "owner": "admin", "role": "admin", "run_id": "run-1",
+        "summary": "restart service",
+        "actions": [{"kind": "systemd", "params": {
+            "operation": "restart", "unit": "nginx",
+        }}],
+    }]
+    assert adapter.requests[0]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": PLAN_TOOL_NAME},
+    }
+    assert adapter.requests[1]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": PLAN_TOOL_NAME},
+    }
+
+
 def test_verification_schema_pins_the_probe_registry_enum():
     from app.ai.autonomy.actions import list_probe_ids
 
@@ -553,6 +655,71 @@ def test_conclude_validation_error_maps_to_malformed_proposal():
         make_planner(adapter)(make_context(repo))
 
     assert excinfo.value.reason == "malformed_proposal"
+
+
+def test_conclude_validation_error_gets_one_finish_repair():
+    repo = OneShotConclusionRepo(
+        AutonomyValidationError(
+            "conclusion may only cite same-run evidence",
+        ),
+    )
+    adapter = FakeAdapter(results=[
+        FakeChatResult([
+            finish_conclusion_call("resolved", ("artifact-not-evidence",)),
+        ]),
+        FakeChatResult([
+            finish_conclusion_call("inconclusive", ("ev-1",)),
+        ]),
+    ])
+
+    assert make_planner(adapter)(make_context(repo)) == []
+    assert len(repo.calls) == 2
+    assert adapter.requests[1]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": FINISH_TOOL_NAME},
+    }
+    assert "artifact ID" in adapter.requests[1]["messages"][-1]["content"]
+
+
+def test_finish_repair_falls_back_to_safe_inconclusive_evidence():
+    repo = RepairFailsThenFallbackRepo(
+        AutonomyValidationError(
+            "conclusion may only cite same-run evidence",
+        ),
+    )
+    adapter = FakeAdapter(results=[
+        FakeChatResult([
+            finish_conclusion_call("resolved", ("artifact-id",)),
+        ]),
+        FakeChatResult([
+            finish_conclusion_call("resolved", ("still-artifact-id",)),
+        ]),
+    ])
+    context = make_context(repo)
+    context["evidence"] = [
+        "id=action-1 | kind=action_observation | summary=write succeeded",
+        "id=verify-1 | kind=verification_observation | summary=target verified",
+    ]
+
+    assert make_planner(adapter)(context) == []
+    assert repo.calls[-1]["outcome"] == "inconclusive"
+    assert repo.calls[-1]["evidence_ids"] == ["verify-1"]
+    assert len(adapter.requests) == 2
+
+
+def test_finish_schema_pins_same_run_evidence_ids():
+    context = make_context(FakeRepo())
+    context["evidence"] = [
+        "id=verify-1 | kind=verification_observation | summary=verified",
+    ]
+
+    finish = next(
+        item for item in proposal_tool_schemas(context)
+        if item["function"]["name"] == FINISH_TOOL_NAME
+    )
+    assert finish["function"]["parameters"]["properties"][
+        "evidence_ids"
+    ]["items"]["enum"] == ["verify-1"]
 
 
 def test_conclude_conflict_maps_to_run_not_active():

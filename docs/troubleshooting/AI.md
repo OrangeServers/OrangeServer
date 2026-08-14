@@ -38,6 +38,17 @@ Issue。服务端错误日志也应先脱敏。
 - Base URL、TLS 证书和出口网络正常；
 - 上游返回的模型 ID 与配置完全一致。
 
+自治 Planner 对 DeepSeek 等 OpenAI-compatible 推理模型的工具阶段/参数
+偏差提供一次有界协议修复：服务端指定应返回的函数，再次经过动作白名单和
+计划授权校验。Evidence 引用也受服务端生成的同一 Run ID 枚举约束；若模型在
+一次修复后仍引用 artifact/step ID，但本 Run 已有独立验证 Evidence，服务端只
+安全收口为 `inconclusive`，不会虚构成功或重放写动作。其它修复仍失败时保持
+`planner_failed` 的 fail-closed 结果。
+
+如果 Run 已经完成至少三类成功的只读探针、且尚未出现写动作，驱动会把下一轮
+阶段有界收束到 `propose_plan`，避免 DeepSeek 等兼容模型在调查充分后继续循环
+提议探针；这不会替模型生成计划，也不会绕过计划审批与动作白名单。
+
 只通过普通聊天测试不能证明 AI 运维可用，必须通过设置页的 Tool Calling 测试。
 
 ## 1M 深度诊断不可选

@@ -30,6 +30,7 @@ from langgraph.types import Command
 
 from app.ai.autonomy.actions import (
     ActionValidationError,
+    WRITE_KINDS,
     action_from_dict,
     verify_action_digest,
 )
@@ -91,6 +92,12 @@ RESUME_CONTINUE = 'continue'
 # 单次 drive 内自动恢复次数上限：防止 decide 不收敛时无限自恢复；
 # 正常循环每轮最多一次自动恢复，上限已含充分余量。
 MAX_RESUMES_PER_DRIVE = 64
+
+# DeepSeek 等 OpenAI-compatible planner 可能在调查已经充分后继续选择
+# propose_probe。完成三类成功的只读探针且尚未出现写动作时，服务端把
+# 下一轮阶段收束到 propose_plan；这只是工具阶段约束，不替模型生成
+# 计划，也不绕过后续计划审批。
+MIN_DISTINCT_PROBES_BEFORE_PLAN = 3
 
 
 class DriveAbort(Exception):
@@ -423,6 +430,38 @@ class AutonomyDriver:
     # 节点 handlers
     # ------------------------------------------------------------------
 
+    def _planner_requires_plan(self, run_id):
+        """Return whether the next planner turn must hand off to a plan.
+
+        This is derived only from successful server-owned probe actions and
+        the presence of any structured write action. It is intentionally a
+        bounded phase guard for providers that keep selecting a read tool;
+        it never creates a plan or changes the action/approval policy.
+        """
+        from app.core.db.database import t_ai_autonomous_step
+
+        rows = self.session.query(t_ai_autonomous_step).filter(
+            t_ai_autonomous_step.run_id == run_id,
+            t_ai_autonomous_step.kind == StepKind.ACTION.value,
+        ).all()
+        probe_ids = set()
+        for row in rows:
+            try:
+                action = action_from_dict(json.loads(row.action_json or ''))
+            except (ActionValidationError, TypeError, ValueError):
+                continue
+            kind = str(action.kind)
+            if kind in WRITE_KINDS:
+                return False
+            if (
+                kind == 'probe'
+                and row.status == StepStatus.SUCCEEDED.value
+            ):
+                probe_id = str(action.parameters.get('probe_id') or '')
+                if probe_id:
+                    probe_ids.add(probe_id)
+        return len(probe_ids) >= MIN_DISTINCT_PROBES_BEFORE_PLAN
+
     def _build_handlers(self, run_id):
         planner_repo = _ClaimFencedPlannerRepository(
             self.repo, self._lock_current_claim,
@@ -465,6 +504,7 @@ class AutonomyDriver:
                 # 大输出留在加密 Artifact；模型只读得到有界脱敏
                 # 的 Evidence 摘要（切片 4）。
                 'evidence': summarize_evidence(self.session, run_id),
+                'require_plan': self._planner_requires_plan(run_id),
             }
             proposed = list(self.planner(context) or [])
             return {
@@ -1383,8 +1423,8 @@ class AutonomyDriver:
                 self._fail_run(run, 'planner_unavailable', 'planner not wired')
                 return RESULT_FAILED
             except PlannerProposalError as exc:
-                # 模型/供应商侧可预期失败：fail-closed 落终态，绝不
-                # 重试或留下半执行 Step。
+                # Planner 内部的一次协议修复仍未收敛：fail-closed 落
+                # 终态，驱动层不再重试或留下半执行 Step。
                 self._fail_run(run, 'planner_failed', exc.reason)
                 return RESULT_FAILED
             except DurationBudgetExhausted:
