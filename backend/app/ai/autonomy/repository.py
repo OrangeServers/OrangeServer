@@ -15,6 +15,7 @@
 import datetime
 import json
 import re
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from app.ai.autonomy.actions import (
     ActionValidationError,
     StructuredAction,
+    WRITE_KINDS,
     action_from_dict,
     build_action_digest,
     build_probe_command,
@@ -40,15 +42,29 @@ from app.ai.autonomy.policy import (
     validate_mode_for_environment,
 )
 from app.ai.autonomy.graph import DEFAULT_GRAPH_VERSION
+from app.ai.autonomy.plans import (
+    PLAN_MAX_ACTIONS,
+    PLAN_SUMMARY_CHARS,
+    PlanAuthorizationError,
+    build_plan_digest,
+    build_plan_snapshot,
+    canonical_plan_json,
+    parse_plan_snapshot,
+    validate_plan_action,
+    verify_plan_authorization,
+)
 from app.ai.autonomy.state import (
     ACTIVE_RUN_STATUSES,
     CANONICAL_RUN_MODES,
     AiEnvironment,
     DecisionOperation,
+    RunMode,
+    RunOutcome,
     RunStatus,
     StepKind,
     StepStatus,
     TERMINAL_RUN_STATUSES,
+    TERMINAL_STEP_STATUSES,
     assert_run_transition,
     assert_step_transition,
 )
@@ -78,6 +94,54 @@ _CONTROL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 _SECRET_KEY_MARKERS = (
     'password', 'secret', 'token', 'credential', 'private_key',
 )
+# M1/S3 切片 3：custom 档案可选的动作类别是服务端固定集合（与
+# classify_action 支持的 kind 一致）；不引入策略表达式语言，目标
+# 范围就是 Run 创建时绑定的单一主机。probe 是服务端自有只读探针，
+# 不在可选集合里，任何档案下都不受 custom 限制。
+CUSTOM_ACTION_CATEGORIES = frozenset({
+    'file_read', 'file_patch', 'file_restore', 'package_install',
+    'shell', 'systemd',
+})
+
+# M1/S3 切片 4：Evidence 是不可信观察的有界索引。类别固定；摘要
+# 限长 500；结论至多引用 16 条同一 Run 的 Evidence。
+EVIDENCE_KINDS = frozenset({
+    'action_observation', 'verification_observation',
+})
+EVIDENCE_SUMMARY_CHARS = 500
+MAX_EVIDENCE_CITATIONS = 16
+
+
+def parse_custom_profile(payload):
+    """解析 custom 权限档案；只接受 {action_categories: [...]}。
+
+    类别必须来自服务端固定集合：非空、去重、未知拒绝。非法输入
+    直接拒绝而不是静默钳制。
+    """
+    if not isinstance(payload, dict):
+        raise AutonomyValidationError('custom profile must be an object')
+    unknown = set(payload) - {'action_categories'}
+    if unknown:
+        raise AutonomyValidationError(
+            'unknown custom profile fields: %s' % ', '.join(sorted(unknown))
+        )
+    raw = payload.get('action_categories')
+    if not isinstance(raw, list) or not raw:
+        raise AutonomyValidationError(
+            'custom profile requires a non-empty action_categories list'
+        )
+    categories = []
+    for item in raw:
+        name = str(item or '')
+        if name not in CUSTOM_ACTION_CATEGORIES:
+            raise AutonomyValidationError(
+                'unknown action category: %r' % (name,)
+            )
+        if name not in categories:
+            categories.append(name)
+    return {'action_categories': categories}
+
+
 _ACTIVE_HOST_UNIQUE_KEY = 'uq_ai_auto_run_active_host'
 _SQLITE_ACTIVE_HOST_UNIQUE_ERROR = (
     'UNIQUE constraint failed: t_ai_autonomous_run.active_host_id'
@@ -301,6 +365,10 @@ class AutonomyRepository:
             'system_user_id': int(row.system_user_id),
             'system_user_alias': row.system_user_alias,
             'mode': row.mode,
+            'custom_profile': (
+                json.loads(row.custom_profile_json)
+                if getattr(row, 'custom_profile_json', None) else None
+            ),
             'status': row.status,
             'outcome': row.outcome,
             'revision': int(row.revision or 0),
@@ -340,6 +408,7 @@ class AutonomyRepository:
         system_user_id: int,
         mode: str,
         budget_payload: Optional[Dict[str, Any]] = None,
+        profile_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         from app.core.db.database import t_ai_autonomous_run
 
@@ -348,6 +417,18 @@ class AutonomyRepository:
             raise AutonomyValidationError('goal must be 1..512 characters')
         if mode not in {m.value for m in CANONICAL_RUN_MODES}:
             raise AutonomyValidationError('unknown mode: %r' % (mode,))
+        if mode == RunMode.CUSTOM.value:
+            if profile_payload is None:
+                raise AutonomyValidationError(
+                    'custom mode requires an action_categories profile'
+                )
+            custom_profile = parse_custom_profile(profile_payload)
+        else:
+            if profile_payload is not None:
+                raise AutonomyValidationError(
+                    'custom profile is only valid with mode=custom'
+                )
+            custom_profile = None
         try:
             budget = parse_budget(budget_payload)
         except Exception as exc:
@@ -397,6 +478,10 @@ class AutonomyRepository:
             system_user_id=system_user_id,
             system_user_alias=str(credential.get('alias') or ''),
             mode=mode,
+            custom_profile_json=(
+                json.dumps(custom_profile, sort_keys=True)
+                if custom_profile else None
+            ),
             graph_version=DEFAULT_GRAPH_VERSION,
             status=RunStatus.DRAFT.value,
             revision=0,
@@ -422,6 +507,7 @@ class AutonomyRepository:
         self.append_event(run, 'run_created', {
             'mode': mode, 'host_id': host_id,
             'system_user_id': system_user_id,
+            'custom_profile': custom_profile,
         })
         self._commit()
         return self._run_to_dict(run)
@@ -568,6 +654,97 @@ class AutonomyRepository:
         return run
 
     # ------------------------------------------------------------------
+    # 权威读取器：Event / Artifact（S3 切片 5）
+    #
+    # MySQL 快照是唯一权威来源；这些读取器只做 owner 隔离与脱敏
+    # 边界复核，绝不改写任何状态（SSE 轮询依赖其纯读语义）。
+    # ------------------------------------------------------------------
+
+    MAX_EVENT_BATCH = 500
+
+    @staticmethod
+    def _event_to_dict(row) -> Dict[str, Any]:
+        try:
+            payload = json.loads(row.payload_json or '{}')
+        except ValueError:
+            payload = {}
+        return {
+            'sequence': int(row.sequence),
+            'event_type': row.event_type,
+            'payload': payload,
+            'created_at': row.created_at,
+        }
+
+    def list_events(
+        self,
+        owner: str,
+        run_id: str,
+        after_seq: int = 0,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """按单调递增 sequence 回放 after_seq 之后的事件（不含 after_seq）。"""
+        from app.core.db.database import t_ai_autonomous_event
+
+        self._get_run_row(owner, run_id)
+        batch = max(1, min(int(limit or self.MAX_EVENT_BATCH), self.MAX_EVENT_BATCH))
+        rows = self.session.query(t_ai_autonomous_event).filter(
+            t_ai_autonomous_event.run_id == run_id,
+            t_ai_autonomous_event.sequence > int(after_seq),
+        ).order_by(
+            t_ai_autonomous_event.sequence.asc(),
+        ).limit(batch).all()
+        return [self._event_to_dict(row) for row in rows]
+
+    @staticmethod
+    def _artifact_meta(row) -> Dict[str, Any]:
+        return {
+            'id': row.id,
+            'run_id': row.run_id,
+            'step_id': row.step_id,
+            'kind': row.kind,
+            'title': row.title,
+            'size_bytes': int(row.size_bytes or 0),
+            'truncated': bool(row.truncated),
+            'expired': bool(
+                row.expires_at is not None and row.expires_at < _utcnow()
+            ),
+            'created_at': row.created_at,
+        }
+
+    def list_artifacts(self, owner: str, run_id: str) -> List[Dict[str, Any]]:
+        """只返回 Artifact 元数据；正文必须走 get_artifact 单条读取。"""
+        from app.core.db.database import t_ai_autonomous_artifact
+
+        self._get_run_row(owner, run_id)
+        rows = self.session.query(t_ai_autonomous_artifact).filter_by(
+            run_id=run_id,
+        ).order_by(t_ai_autonomous_artifact.created_at.asc()).all()
+        return [self._artifact_meta(row) for row in rows]
+
+    def get_artifact(
+        self, owner: str, run_id: str, artifact_id: str,
+    ) -> Dict[str, Any]:
+        """解密读取单个 Artifact 正文。
+
+        跨 Run 的 artifact_id 与已过保留期的 Artifact 一律 Not Found，
+        不泄露其他 Run 内 Artifact 的存在性。
+        """
+        from app.core.db.database import t_ai_autonomous_artifact
+        from app.tools.basesec import decrypt_secret
+
+        self._get_run_row(owner, run_id)
+        row = self.session.query(t_ai_autonomous_artifact).filter_by(
+            id=artifact_id, run_id=run_id,
+        ).first()
+        if row is None:
+            raise AutonomyNotFound('artifact not found')
+        if row.expires_at is not None and row.expires_at < _utcnow():
+            raise AutonomyNotFound('artifact expired')
+        meta = self._artifact_meta(row)
+        meta['content'] = decrypt_secret(row.content_ciphertext)
+        return meta
+
+    # ------------------------------------------------------------------
     # Step 提议（服务端自有探针）
     # ------------------------------------------------------------------
 
@@ -597,6 +774,7 @@ class AutonomyRepository:
             raise AutonomyValidationError(str(exc)) from exc
 
         self._revalidate_boundaries(owner, role, run)
+        self._enforce_custom_profile(run, 'probe')
         budget = Budget(**json.loads(run.budget_json or '{}'))
         action_count = self.session.query(t_ai_autonomous_step).filter_by(
             run_id=run_id, kind=StepKind.ACTION.value,
@@ -672,6 +850,327 @@ class AutonomyRepository:
         return self._step_to_dict(step)
 
     # ------------------------------------------------------------------
+    # 验证提案：副作用后的全新只读观察（S3 切片 4）
+    # ------------------------------------------------------------------
+
+    def propose_verification(
+        self,
+        owner: str,
+        role: str,
+        run_id: str,
+        probe_id: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """提议一个 verification Step：只读探针，且必须已有写副作用。
+
+        动作成功不等于目标达成：验证必须是副作用之后的全新只读
+        观察。还没有任何写动作成功过就提议验证属于模型幻觉，
+        fail-closed 拒绝。
+        """
+        from app.core.db.database import t_ai_autonomous_step
+
+        run = self._get_run_row(owner, run_id)
+        if run.status not in {
+            RunStatus.QUEUED.value, RunStatus.RUNNING.value,
+            RunStatus.WAITING_APPROVAL.value,
+        }:
+            raise AutonomyConflict(
+                'steps can only be proposed while the run is active'
+            )
+        if not self._has_succeeded_write(run_id):
+            raise AutonomyValidationError(
+                'verification requires a prior succeeded write action'
+            )
+        if str(probe_id or '') not in list_probe_ids():
+            raise AutonomyValidationError('unknown probe: %r' % (probe_id,))
+        try:
+            normalized = validate_probe(probe_id, params or {})
+        except ActionValidationError as exc:
+            raise AutonomyValidationError(str(exc)) from exc
+
+        self._revalidate_boundaries(owner, role, run)
+        budget = Budget(**json.loads(run.budget_json or '{}'))
+        host = self._get_host_row(run.host_id)
+        try:
+            build_probe_command(
+                probe_id, normalized, target_host=str(host.host_ip),
+            )
+        except ActionValidationError as exc:
+            raise AutonomyValidationError(str(exc)) from exc
+
+        step_id = uuid.uuid4().hex
+        parameters = dict(normalized, probe_id=str(probe_id))
+        action = StructuredAction(
+            kind='probe',
+            target_id=int(run.host_id),
+            system_user_id=int(run.system_user_id),
+            parameters=parameters,
+            timeout_seconds=min(budget.command_timeout_seconds, 600),
+            step_id=step_id,
+        )
+        # 探针在策略下永远 ALLOW；这里仍复核一遍，绝不信任假定。
+        decision, reason = classify_action(
+            run.mode, action, host.ai_environment,
+        )
+        if decision != PolicyDecision.ALLOW:
+            raise AutonomyValidationError(
+                'verification probe unexpectedly not allowed'
+            )
+
+        seq = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id,
+        ).count() + 1
+        step = t_ai_autonomous_step(
+            id=step_id,
+            run_id=run_id,
+            kind=StepKind.VERIFICATION.value,
+            status=StepStatus.PROPOSED.value,
+            seq=seq,
+            summary=redacted_summary(action),
+            action_json=json.dumps(
+                action.to_canonical_dict(), sort_keys=True, ensure_ascii=True,
+            ),
+            action_digest=build_action_digest(action, self.secret_key),
+            note='',
+        )
+        self.session.add(step)
+        self._bump(run)
+        self.append_event(run, 'step_proposed', {
+            'step_id': step_id, 'seq': seq, 'probe_id': str(probe_id),
+            'step_kind': StepKind.VERIFICATION.value,
+            'decision': decision.value, 'reason': reason,
+        })
+        self._commit()
+        return self._step_to_dict(step)
+
+    def _has_succeeded_write(self, run_id: str) -> bool:
+        """本 Run 是否已有写动作成功落库（验证的前置条件）。"""
+        from app.core.db.database import t_ai_autonomous_step
+
+        rows = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id,
+            kind=StepKind.ACTION.value,
+            status=StepStatus.SUCCEEDED.value,
+        ).all()
+        for row in rows:
+            try:
+                action = action_from_dict(json.loads(row.action_json or ''))
+            except (ActionValidationError, TypeError, ValueError):
+                continue
+            if str(action.kind) in WRITE_KINDS:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # 权限档案：custom 类别在提案时强制（S3 切片 3）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _custom_profile(run):
+        raw = getattr(run, 'custom_profile_json', None)
+        if not raw:
+            return None
+        try:
+            profile = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return profile if isinstance(profile, dict) else None
+
+    def _enforce_custom_profile(self, run, kind) -> None:
+        """custom 档案只放行选定的动作类别；probe 永不受限。
+
+        档案缺失/损坏时 fail-closed：写动作拒绝，探针放行（探针是
+        服务端自有只读能力，不属于管理员可配置的动作类别）。
+        """
+        if str(run.mode or '') != RunMode.CUSTOM.value:
+            return
+        if str(kind) == 'probe':
+            return
+        profile = self._custom_profile(run)
+        allowed = set((profile or {}).get('action_categories') or [])
+        if str(kind) not in allowed:
+            raise AutonomyValidationError(
+                'action category %r is not in the custom profile'
+                % (str(kind),)
+            )
+
+    # ------------------------------------------------------------------
+    # 计划提案：一次授权一个稳定计划（S3 切片 2）
+    # ------------------------------------------------------------------
+
+    def _plan_binding(self, run) -> Dict[str, Any]:
+        """执行/决策边界从权威 Run/Host 行现取的当前绑定。
+
+        与计划快照比较：目标、凭据引用、模式、预算、图版本或
+        资产环境任一漂移，计划授权即失效回 ask。
+        """
+        host = self._get_host_row(run.host_id)
+        return {
+            'target_id': int(run.host_id),
+            'credential_ref': 'system_user:%d' % int(run.system_user_id),
+            'mode': str(run.mode or ''),
+            'budget': json.loads(run.budget_json or '{}'),
+            'graph_version': str(run.graph_version or ''),
+            'environment': str(host.ai_environment),
+        }
+
+    def propose_plan(
+        self,
+        owner: str,
+        role: str,
+        run_id: str,
+        summary: str,
+        actions: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """把模型提议的有序动作列表固化成不可变 plan Step。
+
+        目标绑定、预算、图版本与凭据引用全部取自权威 Run 行；
+        每个动作预先分配 step_id 并进 digest，展开执行时绝不重新
+        生成。任一动作被服务端策略拒绝则整体拒绝，绝不落半张计划。
+        """
+        from app.core.db.database import t_ai_autonomous_step
+
+        run = self._get_run_row(owner, run_id)
+        if run.status not in {
+            RunStatus.QUEUED.value, RunStatus.RUNNING.value,
+            RunStatus.WAITING_APPROVAL.value,
+        }:
+            raise AutonomyConflict(
+                'steps can only be proposed while the run is active'
+            )
+        items = list(actions or [])
+        if not items:
+            raise AutonomyValidationError('plan requires at least one action')
+        if len(items) > PLAN_MAX_ACTIONS:
+            raise AutonomyValidationError(
+                'plan exceeds %d actions' % PLAN_MAX_ACTIONS
+            )
+        # 同一 Run 同时只允许一个未决计划：旧计划必须先被决策或
+        # 执行完毕，避免两张计划争抢同一份授权。
+        active_plan = (
+            self.session.query(t_ai_autonomous_step)
+            .filter_by(run_id=run_id, kind=StepKind.PLAN.value)
+            .filter(
+                t_ai_autonomous_step.status.notin_(
+                    [s.value for s in TERMINAL_STEP_STATUSES],
+                ),
+            )
+            .first()
+        )
+        if active_plan is not None:
+            raise AutonomyConflict(
+                'a plan already requires a decision or execution'
+            )
+
+        self._revalidate_boundaries(owner, role, run)
+        budget = Budget(**json.loads(run.budget_json or '{}'))
+        action_count = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id, kind=StepKind.ACTION.value,
+        ).count()
+        if action_count + len(items) > int(budget.max_actions):
+            raise AutonomyConflict('action budget exhausted')
+
+        host = self._get_host_row(run.host_id)
+        constructed = []
+        needs_ask = False
+        for item in items:
+            if not isinstance(item, dict):
+                raise AutonomyValidationError(
+                    'plan actions must be objects'
+                )
+            kind = str(item.get('kind') or '')
+            params = item.get('params')
+            if params is None:
+                params = item.get('parameters') or {}
+            step_id = uuid.uuid4().hex
+            try:
+                normalized = validate_plan_action(
+                    kind, params,
+                    run_id=run_id, step_id=step_id,
+                    target_host=str(host.host_ip),
+                )
+            except ActionValidationError as exc:
+                raise AutonomyValidationError(str(exc)) from exc
+            self._enforce_custom_profile(run, kind)
+            action = StructuredAction(
+                kind=kind,
+                target_id=int(run.host_id),
+                system_user_id=int(run.system_user_id),
+                parameters=normalized,
+                timeout_seconds=min(budget.command_timeout_seconds, 600),
+                step_id=step_id,
+            )
+            decision, reason = classify_action(
+                run.mode, action, host.ai_environment,
+            )
+            if decision == PolicyDecision.DENY:
+                raise AutonomyValidationError(
+                    'plan action denied by server policy: %s' % reason
+                )
+            if decision == PolicyDecision.ASK:
+                needs_ask = True
+            constructed.append(action)
+
+        ordered_digests = [
+            build_action_digest(action, self.secret_key)
+            for action in constructed
+        ]
+        expires_at = int(time.time()) + _approval_ttl_seconds()
+        snapshot = build_plan_snapshot(
+            graph_version=str(run.graph_version or ''),
+            mode=str(run.mode or ''),
+            target_id=int(run.host_id),
+            system_user_id=int(run.system_user_id),
+            budget=budget.to_dict(),
+            expires_at=expires_at,
+            summary=sanitize_text(summary)[:PLAN_SUMMARY_CHARS],
+            actions_canonical=[
+                action.to_canonical_dict() for action in constructed
+            ],
+            ordered_action_digests=ordered_digests,
+        )
+
+        plan_step_id = uuid.uuid4().hex
+        initial_status = (
+            StepStatus.WAITING_APPROVAL.value
+            if needs_ask else StepStatus.APPROVED.value
+        )
+        seq = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id,
+        ).count() + 1
+        step = t_ai_autonomous_step(
+            id=plan_step_id,
+            run_id=run_id,
+            kind=StepKind.PLAN.value,
+            status=initial_status,
+            seq=seq,
+            summary=sanitize_text(summary)[:255] or 'plan',
+            action_json=canonical_plan_json(snapshot),
+            action_digest=build_plan_digest(snapshot, self.secret_key),
+            note='',
+        )
+        self.session.add(step)
+        self._bump(run)
+        self.append_event(run, 'plan_proposed', {
+            'step_id': plan_step_id,
+            'seq': seq,
+            'action_count': len(constructed),
+            'decision': 'ask' if needs_ask else 'allow',
+        })
+        if needs_ask:
+            if run.status != RunStatus.WAITING_APPROVAL.value:
+                assert_run_transition(
+                    run.status, RunStatus.WAITING_APPROVAL.value,
+                )
+                run.status = RunStatus.WAITING_APPROVAL.value
+                self._bump(run)
+            self.append_event(run, 'steps_waiting_approval', {
+                'step_ids': [plan_step_id],
+            })
+        self._commit()
+        return self._step_to_dict(step)
+
+    # ------------------------------------------------------------------
     # 原子审批决策
     # ------------------------------------------------------------------
 
@@ -724,15 +1223,29 @@ class AutonomyRepository:
         if step.status != StepStatus.WAITING_APPROVAL.value:
             raise AutonomyConflict('step is not awaiting approval')
 
-        # digest 复核：快照被篡改则审批无效。
-        try:
-            action = action_from_dict(json.loads(step.action_json or '{}'))
-        except (ActionValidationError, ValueError):
-            raise AutonomyConflict('action snapshot is corrupted') from None
-        if not verify_action_digest(
-            action, step.action_digest, self.secret_key,
-        ):
-            raise AutonomyConflict('action digest mismatch')
+        # digest 复核：快照被篡改则审批无效。plan Step 走计划级
+        # 授权复核（digest + 过期 + 当前绑定），动作 Step 走单动作
+        # digest 复核。
+        if step.kind == StepKind.PLAN.value:
+            try:
+                snapshot = parse_plan_snapshot(step.action_json or '')
+                verify_plan_authorization(
+                    snapshot, step.action_digest,
+                    self._plan_binding(run), self.secret_key,
+                )
+            except PlanAuthorizationError as exc:
+                raise AutonomyConflict(
+                    'plan authorization invalid: %s' % exc.reason,
+                ) from None
+        else:
+            try:
+                action = action_from_dict(json.loads(step.action_json or '{}'))
+            except (ActionValidationError, ValueError):
+                raise AutonomyConflict('action snapshot is corrupted') from None
+            if not verify_action_digest(
+                action, step.action_digest, self.secret_key,
+            ):
+                raise AutonomyConflict('action digest mismatch')
 
         # 决策边界重新校验当前权限、凭据授权与资产环境。
         self._revalidate_boundaries(owner, role, run)
@@ -860,4 +1373,170 @@ class AutonomyRepository:
             'kind': artifact.kind,
             'size_bytes': size_bytes,
             'truncated': truncated,
+        }
+
+    # ------------------------------------------------------------------
+    # Evidence 与三态 Outcome（S3 切片 4）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _evidence_to_dict(row) -> Dict[str, Any]:
+        try:
+            artifact_ids = json.loads(row.artifact_ids_json or '[]')
+        except (TypeError, ValueError):
+            artifact_ids = []
+        return {
+            'id': row.id,
+            'run_id': row.run_id,
+            'step_id': row.step_id,
+            'kind': row.kind,
+            'summary': row.summary,
+            'artifact_ids': list(artifact_ids),
+            # M1 的 Evidence 永远不可信：只作索引，不作结论凭据。
+            'trusted': bool(row.trusted),
+            'created_at': getattr(row, 'created_at', None),
+        }
+
+    def record_evidence(
+        self,
+        owner: str,
+        run_id: str,
+        *,
+        kind: str,
+        summary: str,
+        step_id: Optional[str] = None,
+        artifact_ids: Optional[List[str]] = None,
+        commit: bool = True,
+    ) -> Dict[str, Any]:
+        """把一次执行观察归一化成有界脱敏的 Evidence 引用。
+
+        大输出本体留在加密 Artifact；Evidence 只是索引，永远标记
+        不可信。引用的 Artifact 必须属于同一 Run。
+        """
+        from app.core.db.database import (
+            t_ai_autonomous_artifact, t_ai_autonomous_evidence,
+        )
+
+        self._get_run_row(owner, run_id)
+        if str(kind) not in EVIDENCE_KINDS:
+            raise AutonomyValidationError('unknown evidence kind: %r' % (kind,))
+        text = sanitize_text(summary or '')[:EVIDENCE_SUMMARY_CHARS]
+        ids: List[str] = []
+        for artifact_id in (artifact_ids or []):
+            artifact_id = str(artifact_id or '')
+            if artifact_id and artifact_id not in ids:
+                ids.append(artifact_id)
+        if ids:
+            found = self.session.query(t_ai_autonomous_artifact.id).filter(
+                t_ai_autonomous_artifact.run_id == run_id,
+                t_ai_autonomous_artifact.id.in_(ids),
+            ).count()
+            if found != len(ids):
+                raise AutonomyValidationError(
+                    'evidence may only reference same-run artifacts'
+                )
+        evidence = t_ai_autonomous_evidence(
+            id=uuid.uuid4().hex,
+            run_id=run_id,
+            step_id=step_id,
+            kind=str(kind),
+            summary=text,
+            artifact_ids_json=json.dumps(ids),
+            trusted=False,
+        )
+        self.session.add(evidence)
+        if commit:
+            self._commit()
+        return self._evidence_to_dict(evidence)
+
+    def list_evidence(self, owner: str, run_id: str) -> List[Dict[str, Any]]:
+        from app.core.db.database import t_ai_autonomous_evidence
+
+        self._get_run_row(owner, run_id)
+        rows = self.session.query(t_ai_autonomous_evidence).filter_by(
+            run_id=run_id,
+        ).order_by(t_ai_autonomous_evidence.created_at.asc()).all()
+        return [self._evidence_to_dict(row) for row in rows]
+
+    def conclude_run(
+        self,
+        owner: str,
+        role: str,
+        run_id: str,
+        outcome: str,
+        evidence_ids: List[str],
+    ) -> Dict[str, Any]:
+        """落库唯一终局 Outcome：必须引用同一 Run 的 Evidence。
+
+        fail-closed 降级：存在结果不确定的写动作时绝不 resolved；
+        resolved 必须引用至少一条验证观察。缺失证据的结论只能
+        inconclusive，绝不虚构成功。首个结论获胜，后续不改写。
+        """
+        from app.core.db.database import (
+            t_ai_autonomous_evidence, t_ai_autonomous_step,
+        )
+
+        run = self._get_run_row(owner, run_id)
+        if str(run.outcome or ''):
+            # 终局 Outcome 恰好一个：重复结论不改写也不报错。
+            return {'outcome': run.outcome, 'already_concluded': True}
+        if run.status not in {
+            RunStatus.QUEUED.value, RunStatus.RUNNING.value,
+            RunStatus.WAITING_APPROVAL.value,
+        }:
+            raise AutonomyConflict(
+                'outcome can only be concluded while the run is active'
+            )
+        if str(outcome) not in {o.value for o in RunOutcome}:
+            raise AutonomyValidationError('unknown outcome: %r' % (outcome,))
+        ids: List[str] = []
+        for evidence_id in (evidence_ids or []):
+            evidence_id = str(evidence_id or '').strip()
+            if evidence_id and evidence_id not in ids:
+                ids.append(evidence_id)
+        if not ids:
+            raise AutonomyValidationError(
+                'conclusion requires same-run evidence citations'
+            )
+        if len(ids) > MAX_EVIDENCE_CITATIONS:
+            raise AutonomyValidationError('too many evidence citations')
+        rows = self.session.query(t_ai_autonomous_evidence).filter(
+            t_ai_autonomous_evidence.run_id == run_id,
+            t_ai_autonomous_evidence.id.in_(ids),
+        ).all()
+        if len(rows) != len(ids):
+            raise AutonomyValidationError(
+                'conclusion may only cite same-run evidence'
+            )
+
+        requested = str(outcome)
+        forced = ''
+        uncertain = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id, status=StepStatus.OUTCOME_UNKNOWN.value,
+        ).count()
+        if uncertain:
+            # S2 语义保留：写结果未确认绝不自动收口成 resolved。
+            outcome = RunOutcome.INCONCLUSIVE.value
+            forced = 'uncertain_write'
+        elif requested == RunOutcome.RESOLVED.value and not any(
+            row.kind == 'verification_observation' for row in rows
+        ):
+            # 动作成功不是目标达成的证明：缺验证观察不能 resolved。
+            outcome = RunOutcome.INCONCLUSIVE.value
+            forced = 'verification_missing'
+
+        run.outcome = outcome
+        self._bump(run)
+        self.append_event(run, 'run_concluded', {
+            'outcome': outcome,
+            'requested': requested,
+            'forced': forced,
+            'evidence_ids': ids,
+        })
+        self._commit()
+        return {
+            'outcome': outcome,
+            'requested': requested,
+            'forced': forced,
+            'already_concluded': False,
         }

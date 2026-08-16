@@ -11,6 +11,7 @@ export default {
   batchScript: 'Batch scripts',
   webTerminal: 'Web terminal',
   aiAgent: 'AI operations',
+  aiRuns: 'Autonomous runs',
   authority: 'Authorization',
   cron: 'Scheduled jobs',
   fileTransfer: 'File transfer',

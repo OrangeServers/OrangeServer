@@ -236,11 +236,25 @@ def _build_remote_command(command: str, working_directory: str, token: str) -> s
     )
 
     # setsid makes the approved payload the leader of a dedicated process
-    # group. --wait preserves the payload's exact exit status even if setsid
-    # must fork. The process group identity comes from the in-memory handshake.
+    # group. Newer util-linux versions support ``--wait`` to preserve the
+    # payload's exact exit status even if setsid must fork, but older Linux
+    # hosts (including the supported CentOS 7 test image) reject that option.
+    # Probe the capability and use the foreground form as a portable fallback;
+    # the non-interactive SSH shell on those hosts propagates its child status.
+    # The process group identity comes from the in-memory handshake.
+    quoted_session_payload = _shell_quote(session_payload)
+    launcher = " ".join(
+        [
+            "if setsid --wait true >/dev/null 2>&1; then",
+            "setsid --wait sh -c " + quoted_session_payload + ";",
+            "else",
+            "setsid sh -c " + quoted_session_payload + ";",
+            "fi",
+        ]
+    )
     return "; ".join(
         [
-            "setsid --wait sh -c " + _shell_quote(session_payload),
+            launcher,
             "_ogs_rc=$?",
             'exit "$_ogs_rc"',
         ]

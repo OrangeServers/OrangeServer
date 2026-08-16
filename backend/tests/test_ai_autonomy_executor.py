@@ -44,6 +44,7 @@ from app.core.db.database import (
     t_acc_user,
     t_ai_autonomous_artifact,
     t_ai_autonomous_event,
+    t_ai_autonomous_evidence,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
     t_group,
@@ -101,7 +102,8 @@ def env():
                 t_ai_autonomous_run.__table__,
                 t_ai_autonomous_step.__table__,
                 t_ai_autonomous_event.__table__,
-                t_ai_autonomous_artifact.__table__],
+                t_ai_autonomous_artifact.__table__,
+                t_ai_autonomous_evidence.__table__],
     )
     control_session_factory = sessionmaker(bind=engine)
     session = control_session_factory()
@@ -1246,3 +1248,65 @@ def test_file_restore_rejects_unowned_or_cross_run_backup(env):
             "admin", "admin", run["id"], restore_step,
         )
     assert env["runner"].calls == []
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 4：verification Step 只允许全新只读探针
+# ---------------------------------------------------------------------------
+
+def test_verification_step_executes_readonly_probe(env):
+    """副作用之后的全新只读观察：verification step 走只读探针。"""
+    run = env["create_queued_run"]()
+    write_step = env["add_approved_action_step"](
+        run["id"], "systemd",
+        {"operation": "restart", "unit": "nginx"},
+    )
+    env["executor"].execute_step(
+        "admin", "admin", run["id"], write_step,
+    )
+    verification = env["repo"].propose_verification(
+        "admin", "admin", run["id"], "system.load",
+    )
+    row = env["session"].query(t_ai_autonomous_step).filter_by(
+        id=verification["id"],
+    ).one()
+    row.status = "approved"
+    env["session"].commit()
+
+    result = env["executor"].execute_step(
+        "admin", "admin", run["id"], verification["id"],
+    )
+    assert result["step_status"] == "succeeded"
+    assert row.kind == "verification"
+    assert env["runner"].calls[-1]["command"] == "uptime"
+
+
+def test_verification_step_rejects_non_probe_action(env):
+    """verification step 里藏写动作：执行层 fail-closed 拒绝。"""
+    run = env["create_queued_run"]()
+    step_id = uuid.uuid4().hex
+    action = StructuredAction(
+        kind="shell",
+        target_id=int(run["host_id"]),
+        system_user_id=19,
+        parameters={"command": "echo smuggled-write"},
+        timeout_seconds=30,
+        step_id=step_id,
+    )
+    env["session"].add(t_ai_autonomous_step(
+        id=step_id, run_id=run["id"], kind="verification",
+        status="approved", seq=96, summary="smuggled write",
+        action_json=json.dumps(
+            action.to_canonical_dict(), sort_keys=True,
+        ),
+        action_digest=build_action_digest(action, SECRET_KEY),
+        note="",
+    ))
+    env["session"].commit()
+
+    with pytest.raises(AutonomyConflict, match="read-only probes"):
+        env["executor"].execute_step(
+            "admin", "admin", run["id"], step_id,
+        )
+    assert env["runner"].calls == []
+    assert _step_row(env, step_id).status == "approved"

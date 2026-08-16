@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 from app.ai.autonomy.actions import (
     ActionValidationError,
+    WRITE_KINDS,
     action_from_dict,
     build_file_patch_command,
     build_file_restore_command,
@@ -58,13 +59,6 @@ from app.ai.autonomy.state import (
     assert_run_transition,
     assert_step_transition,
 )
-
-# 需要“写意图先落库”的动作类别。shell 是通用写入口（永远精确
-# 审批）；systemd/package_install 是服务端模板的结构化写动作；
-# file_patch/file_restore 是带备份与恢复承诺的文件写动作。
-WRITE_KINDS = frozenset({
-    'shell', 'systemd', 'package_install', 'file_patch', 'file_restore',
-})
 
 # 已计入动作预算的 Step 状态。
 _EXECUTED_STEP_STATUSES = (
@@ -547,7 +541,9 @@ class AutonomyExecutor:
 
         if bool(run.cancel_requested):
             raise AutonomyConflict('run cancellation was requested')
-        if step.kind != StepKind.ACTION.value:
+        if step.kind not in (
+            StepKind.ACTION.value, StepKind.VERIFICATION.value,
+        ):
             raise AutonomyConflict('only action steps can be executed')
         if step.status != StepStatus.APPROVED.value:
             raise AutonomyConflict(
@@ -563,6 +559,15 @@ class AutonomyExecutor:
 
         # 副作用前的最后一道复核：digest + 权限/凭据/环境。
         action = self._load_action(step)
+        if (
+            step.kind == StepKind.VERIFICATION.value
+            and str(action.kind) != 'probe'
+        ):
+            # verification Step 只承载副作用后的全新只读观察，绝
+            # 不是再执行一遍写动作。
+            raise AutonomyConflict(
+                'verification steps may only run read-only probes'
+            )
         self.repo._revalidate_boundaries(owner, role, run)
 
         budget = Budget(**json.loads(run.budget_json or '{}'))

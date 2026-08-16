@@ -31,6 +31,8 @@ class FakeRepo:
         self.calls.append((name, args, kwargs))
         if self.exc is not None:
             raise self.exc
+        if isinstance(self.result, list):
+            return [dict(item) for item in self.result]
         return dict(self.result)
 
     def create_run(self, owner, role, **kwargs):
@@ -64,6 +66,18 @@ class FakeRepo:
         return self._record(
             "set_host_environment", host_id, environment,
         )
+
+    def get_run(self, owner, run_id):
+        return self._record("get_run", owner, run_id)
+
+    def list_artifacts(self, owner, run_id):
+        return self._record("list_artifacts", owner, run_id)
+
+    def get_artifact(self, owner, run_id, artifact_id):
+        return self._record("get_artifact", owner, run_id, artifact_id)
+
+    def list_evidence(self, owner, run_id):
+        return self._record("list_evidence", owner, run_id)
 
 
 @pytest.fixture()
@@ -107,6 +121,19 @@ def test_routes_are_registered_with_expected_verbs():
     ]
     assert "POST" in rules[
         "/ai/autonomy/hosts/<int:host_id>/environment"
+    ]
+    assert "GET" in rules[
+        "/ai/autonomous-runs/<string:run_id>/artifacts"
+    ]
+    assert "GET" in rules[
+        "/ai/autonomous-runs/<string:run_id>/artifacts/"
+        "<string:artifact_id>"
+    ]
+    assert "GET" in rules[
+        "/ai/autonomous-runs/<string:run_id>/evidence"
+    ]
+    assert "GET" in rules[
+        "/ai/autonomous-runs/<string:run_id>/stream"
     ]
 
 
@@ -163,6 +190,10 @@ def test_every_mutating_endpoint_is_rejected_when_flag_disabled(
         ("post", "/ai/autonomous-runs/r1/cancel", {}),
         ("post", "/ai/autonomous-runs/r1/steps", {}),
         ("post", "/ai/autonomous-runs/r1/steps/s1/decision", {}),
+        ("get", "/ai/autonomous-runs/r1/artifacts", None),
+        ("get", "/ai/autonomous-runs/r1/artifacts/a1", None),
+        ("get", "/ai/autonomous-runs/r1/evidence", None),
+        ("get", "/ai/autonomous-runs/r1/stream", None),
         ("post", "/ai/autonomy/hosts/1/environment", {}),
     ]
     for verb, url, payload in targets:
@@ -208,6 +239,7 @@ def test_create_run_passes_boundary_inputs_to_repository(api, monkeypatch):
         "system_user_id": 19,
         "mode": "ask",
         "budget_payload": {"max_actions": 3},
+        "profile_payload": None,
     }
 
 
@@ -331,18 +363,27 @@ def test_unexpected_error_becomes_500_without_details(api, monkeypatch):
 
 
 def test_disabling_flag_does_not_touch_existing_ai_features():
-    """既有 AI 聊天/诊断/批量审批不依赖自治 flag。"""
+    """既有 AI 聊天/诊断/批量审批不依赖自治 flag。
+
+    S3 切片 7 例外：聊天侧 create_autonomy_draft 草稿闸门按契约
+    受 flag 控制，但仅限该方法，其余聊天链路不受影响。
+    """
     from pathlib import Path
 
     backend = Path(__file__).resolve().parents[1]
     for relpath in (
         "app/api/ai_api.py",
         "app/assets/batch_service.py",
-        "app/ai/tools.py",
         "app/ai/runner.py",
     ):
         source = (backend / relpath).read_text(encoding="utf-8")
         assert "AI_AUTONOMY_ENABLED" not in source, relpath
+
+    tools_source = (backend / "app/ai/tools.py").read_text(encoding="utf-8")
+    draft_start = tools_source.index("def _create_autonomy_draft")
+    next_def = tools_source.index("\n    def ", draft_start + 1)
+    outside_draft = tools_source[:draft_start] + tools_source[next_def:]
+    assert "AI_AUTONOMY_ENABLED" not in outside_draft
 
 
 def test_existing_ai_routes_still_register_when_flag_module_loads():
@@ -356,3 +397,271 @@ def test_existing_ai_routes_still_register_when_flag_module_loads():
     assert "/ai/diagnostic-profiles" in rules
     assert "/ai/diagnostics" in rules
     assert "/ai/autonomous-runs" in rules
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 5：owner 隔离读取端点 + 可续传 SSE
+# ---------------------------------------------------------------------------
+
+def test_artifact_list_passes_through_owner_scoped_reader(api, monkeypatch):
+    client, state = api
+    _enable(monkeypatch, True)
+    state["repo"] = FakeRepo(result=[{"id": "a1", "kind": "step_output"}])
+    response = client.get("/ai/autonomous-runs/r1/artifacts")
+    assert response.status_code == 200
+    assert state["repo"].calls == [("list_artifacts", ("admin", "r1"), {})]
+    assert response.get_json()["data"]["artifacts"][0]["id"] == "a1"
+
+
+def test_artifact_content_passes_through_owner_scoped_reader(api, monkeypatch):
+    client, state = api
+    _enable(monkeypatch, True)
+    state["repo"] = FakeRepo(result={"id": "a1", "content": "load 0.1"})
+    response = client.get("/ai/autonomous-runs/r1/artifacts/a1")
+    assert response.status_code == 200
+    assert state["repo"].calls == [
+        ("get_artifact", ("admin", "r1", "a1"), {}),
+    ]
+    assert response.get_json()["data"]["content"] == "load 0.1"
+
+
+def test_evidence_list_passes_through_owner_scoped_reader(api, monkeypatch):
+    client, state = api
+    _enable(monkeypatch, True)
+    state["repo"] = FakeRepo(result=[{"id": "ev1", "trusted": False}])
+    response = client.get("/ai/autonomous-runs/r1/evidence")
+    assert response.status_code == 200
+    assert state["repo"].calls == [("list_evidence", ("admin", "r1"), {})]
+    body = response.get_json()["data"]["evidence"][0]
+    assert body["id"] == "ev1"
+    assert body["trusted"] is False
+
+
+def test_rest_timestamps_serialize_as_iso_not_rfc1123(api, monkeypatch):
+    """手测发现：Flask 默认把 datetime 序列化成 RFC 1123（http_date），
+    前端 parseLogTime 解析失败导致详情页「创建于」显示为 —。
+    REST 输出必须与 SSE 一致采用 ISO 字符串。"""
+    from datetime import datetime as dt
+
+    created = dt(2026, 8, 13, 13, 51, 14)
+    client, state = api
+    _enable(monkeypatch, True)
+    state["repo"] = FakeRepo(result={
+        "id": "run-1",
+        "status": "draft",
+        "created_at": created,
+        "started_at": None,
+        "steps": [{"id": "s1", "created_at": created}],
+    })
+    response = client.get("/ai/autonomous-runs/run-1")
+    assert response.status_code == 200
+    body = response.get_json()["data"]
+    assert body["created_at"] == created.isoformat()
+    assert body["started_at"] is None
+    assert body["steps"][0]["created_at"] == created.isoformat()
+    # RFC 1123 特征（如 " GMT"）不得出现在任何时间戳字段。
+    assert "GMT" not in response.get_data(as_text=True)
+
+
+def test_stream_unknown_run_fails_closed_before_streaming(api, monkeypatch):
+    client, state = api
+    _enable(monkeypatch, True)
+    state["repo"] = FakeRepo(exc=AutonomyNotFound("gone"))
+    response = client.get("/ai/autonomous-runs/r1/stream")
+    assert response.status_code == 404
+    assert "gone" in response.get_json()["msg"]
+
+
+class StreamRepo:
+    """切片 5 SSE 替身：按单调 sequence 回放，可脚本化翻终态。"""
+
+    MAX_EVENT_BATCH = 500
+
+    def __init__(self, events, status="completed", flips_after=0):
+        self.events = list(events)
+        self.initial_status = status
+        self.flips_after = flips_after
+        self.get_run_calls = 0
+        self.list_events_cursors = []
+        self.snapshot_calls = 0
+
+    def _current_status(self):
+        # 已完成计数的调用（本轮之前）超过阈值才翻终态。
+        if self.flips_after and self.get_run_calls >= self.flips_after + 1:
+            return "completed"
+        return self.initial_status
+
+    def get_run(self, owner, run_id):
+        self.get_run_calls += 1
+        return {
+            "id": run_id,
+            "status": self._current_status(),
+            "latest_event_seq": (
+                self.events[-1]["sequence"] if self.events else 0
+            ),
+        }
+
+    def list_events(self, owner, run_id, after_seq=0, limit=None):
+        self.list_events_cursors.append(after_seq)
+        return [
+            event for event in self.events
+            if event["sequence"] > after_seq
+        ]
+
+    def snapshot(self, owner, run_id):
+        self.snapshot_calls += 1
+        return {
+            "id": run_id, "status": "completed", "steps": [],
+            "allowed_operations": [],
+            "latest_event_seq": (
+                self.events[-1]["sequence"] if self.events else 0
+            ),
+        }
+
+
+def _parse_sse_frames(text):
+    frames = []
+    for block in text.split("\n\n"):
+        block = block.strip("\n")
+        if not block:
+            continue
+        frame = {}
+        for line in block.splitlines():
+            key, _sep, value = line.partition(":")
+            frame[key.strip()] = value.strip()
+        frames.append(frame)
+    return frames
+
+
+def _stream_events():
+    return [
+        {"sequence": 1, "event_type": "run_started", "payload": {}},
+        {
+            "sequence": 2,
+            "event_type": "step_executed",
+            "payload": {"step_id": "s1", "succeeded": True},
+        },
+    ]
+
+
+def test_stream_replays_events_then_closes_with_terminal_snapshot(
+    api, monkeypatch,
+):
+    client, state = api
+    _enable(monkeypatch, True)
+    monkeypatch.setattr(views, "STREAM_POLL_SECONDS", 0)
+    repo = StreamRepo(_stream_events(), status="completed")
+    state["repo"] = repo
+
+    response = client.get("/ai/autonomous-runs/r1/stream")
+    assert response.status_code == 200
+    assert response.mimetype == "text/event-stream"
+
+    frames = _parse_sse_frames(response.get_data(as_text=True))
+    assert [frame["event"] for frame in frames] == [
+        "run_started", "step_executed", "terminal",
+    ]
+    # 单调 sequence 作为 SSE id，供客户端携 Last-Event-ID 续传。
+    assert [frame["id"] for frame in frames[:2]] == ["1", "2"]
+    import json as _json
+
+    terminal = _json.loads(frames[-1]["data"])
+    assert terminal["status"] == "completed"
+    assert terminal["allowed_operations"] == []
+    # 终局快照恰好一次：单轮回放即收口，绝不重复业务转换。
+    assert repo.list_events_cursors == [0]
+    assert repo.snapshot_calls == 1
+
+
+def test_stream_resumes_from_last_event_id_without_duplicates(
+    api, monkeypatch,
+):
+    client, state = api
+    _enable(monkeypatch, True)
+    monkeypatch.setattr(views, "STREAM_POLL_SECONDS", 0)
+    repo = StreamRepo(_stream_events(), status="completed")
+    state["repo"] = repo
+
+    # Last-Event-ID（标准重连头）优先于查询参数。
+    response = client.get(
+        "/ai/autonomous-runs/r1/stream?after_seq=0",
+        headers={"Last-Event-ID": "1"},
+    )
+    frames = _parse_sse_frames(response.get_data(as_text=True))
+    assert [frame["event"] for frame in frames] == [
+        "step_executed", "terminal",
+    ]
+    assert repo.list_events_cursors == [1]
+
+
+def test_stream_resumes_from_after_seq_query(api, monkeypatch):
+    client, state = api
+    _enable(monkeypatch, True)
+    monkeypatch.setattr(views, "STREAM_POLL_SECONDS", 0)
+    repo = StreamRepo(_stream_events(), status="completed")
+    state["repo"] = repo
+
+    response = client.get("/ai/autonomous-runs/r1/stream?after_seq=2")
+    frames = _parse_sse_frames(response.get_data(as_text=True))
+    # 游标已追平：只剩终局快照，重连不重复任何业务事件。
+    assert [frame["event"] for frame in frames] == ["terminal"]
+    assert repo.list_events_cursors == [2]
+
+
+@pytest.mark.parametrize("header,query", [
+    ("not-a-number", "also-bad"),
+    ("", ""),
+])
+def test_stream_malformed_resume_positions_fall_back_to_replay(
+    api, monkeypatch, header, query,
+):
+    client, state = api
+    _enable(monkeypatch, True)
+    monkeypatch.setattr(views, "STREAM_POLL_SECONDS", 0)
+    repo = StreamRepo(_stream_events(), status="completed")
+    state["repo"] = repo
+
+    headers = {"Last-Event-ID": header} if header else {}
+    url = "/ai/autonomous-runs/r1/stream"
+    if query:
+        url += "?after_seq=%s" % query
+    response = client.get(url, headers=headers)
+    frames = _parse_sse_frames(response.get_data(as_text=True))
+    assert len(frames) == 3
+    # 非法游标不产生部分回放：从头完整回放。
+    assert repo.list_events_cursors == [0]
+
+
+def test_stream_delivers_incrementally_until_terminal(api, monkeypatch):
+    client, state = api
+    _enable(monkeypatch, True)
+    monkeypatch.setattr(views, "STREAM_POLL_SECONDS", 0)
+    # 首轮仍在运行：回放事件但不收口；次轮翻终态后补终局快照。
+    # 阈值 2：开流预检消耗一次 get_run，生成器内首轮仍 running。
+    repo = StreamRepo(_stream_events(), status="running", flips_after=2)
+    state["repo"] = repo
+
+    response = client.get("/ai/autonomous-runs/r1/stream")
+    frames = _parse_sse_frames(response.get_data(as_text=True))
+    assert [frame["event"] for frame in frames] == [
+        "run_started", "step_executed", "terminal",
+    ]
+    assert repo.get_run_calls >= 2
+    # 续传游标推进：次轮回放不再重发已交付的事件。
+    assert repo.list_events_cursors == [0, 2]
+
+
+def test_stream_closes_on_max_lifetime_even_when_still_running(
+    api, monkeypatch,
+):
+    client, state = api
+    _enable(monkeypatch, True)
+    monkeypatch.setattr(views, "STREAM_POLL_SECONDS", 0)
+    monkeypatch.setattr(views, "STREAM_MAX_SECONDS", 0)
+    repo = StreamRepo(_stream_events(), status="running")
+    state["repo"] = repo
+
+    response = client.get("/ai/autonomous-runs/r1/stream?after_seq=2")
+    # 连接到期即关流；未终态绝不发终局快照，客户端可携游标重连。
+    assert response.get_data(as_text=True) == ""
+    assert repo.snapshot_calls == 0

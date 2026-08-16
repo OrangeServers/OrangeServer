@@ -4,9 +4,12 @@
 本工作包不实现任何远程副作用：创建/启动只落库与状态转换，
 探针提议只做服务端分类与审批排队，执行器属于 S2。
 """
+import json
 import logging
+import time
+from datetime import datetime
 
-from flask import request
+from flask import Response, request, stream_with_context
 
 from app.ai.autonomy.repository import (
     AutonomyConflict,
@@ -24,6 +27,28 @@ from app.tools.at import get_current_user, get_current_user_role
 
 
 logger = logging.getLogger(__name__)
+
+# M1/S3 切片 5：可续传 SSE 的轮询参数。事件回放靠 MySQL 单调
+# sequence，重连不重复业务转换；连接到期即关闭，客户端携
+# Last-Event-ID 重连续传。测试可调为 0/极小值。
+STREAM_POLL_SECONDS = 1.0
+STREAM_MAX_SECONDS = 300.0
+
+
+def _jsonable(value):
+    """REST 输出统一把 datetime 转 ISO 字符串。
+
+    Flask 默认 JSON 序列化把 datetime 输出为 RFC 1123（http_date），
+    前端 parseLogTime 无法解析；SSE 路径已用 default=str 输出 ISO，
+    这里把 REST 路径对齐为同一格式。
+    """
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 def _identity():
@@ -111,7 +136,9 @@ def create_run():
             system_user_id=payload.get('system_user_id'),
             mode=str(payload.get('mode') or ''),
             budget_payload=payload.get('budget'),
+            profile_payload=payload.get('profile'),
         )
+        run = _jsonable(run)
         return api_response(data=run, run=run)
     except Exception as exc:
         db.session.rollback()
@@ -126,6 +153,7 @@ def start_run(run_id):
     try:
         run = _repo().start_run(owner, role, run_id)
         _dispatch_drive(run_id)
+        run = _jsonable(run)
         return api_response(data=run, run=run)
     except Exception as exc:
         db.session.rollback()
@@ -144,6 +172,7 @@ def cancel_run(run_id):
             status.value for status in TERMINAL_RUN_STATUSES
         }:
             _dispatch_drive(run_id)
+        run = _jsonable(run)
         return api_response(data=run, run=run)
     except Exception as exc:
         db.session.rollback()
@@ -156,7 +185,7 @@ def list_runs():
     if blocked:
         return blocked
     try:
-        runs = _repo().list_runs(owner)
+        runs = _jsonable(_repo().list_runs(owner))
         return api_response(data={'runs': runs}, runs=runs)
     except Exception as exc:
         db.session.rollback()
@@ -169,7 +198,7 @@ def run_detail(run_id):
     if blocked:
         return blocked
     try:
-        run = _repo().snapshot(owner, run_id)
+        run = _jsonable(_repo().snapshot(owner, run_id))
         return api_response(data=run, run=run)
     except Exception as exc:
         db.session.rollback()
@@ -189,6 +218,7 @@ def propose_step(run_id):
             probe_id=str(payload.get('probe_id') or ''),
             params=payload.get('params') or {},
         )
+        step = _jsonable(step)
         return api_response(data=step, step=step)
     except Exception as exc:
         db.session.rollback()
@@ -209,6 +239,7 @@ def decide_step(run_id, step_id):
             expected_revision=payload.get('expected_revision'),
         )
         _dispatch_drive(run_id)
+        step = _jsonable(step)
         return api_response(data=step, step=step)
     except Exception as exc:
         db.session.rollback()
@@ -234,3 +265,151 @@ def set_host_environment(host_id):
     except Exception as exc:
         db.session.rollback()
         return _handle(exc)
+
+
+def list_artifacts(run_id):
+    """GET：Run 内 Artifact 元数据（owner 隔离，正文单条读取）。"""
+    _holder, owner, role = _identity()
+    blocked = _guarded(role)
+    if blocked:
+        return blocked
+    try:
+        artifacts = _jsonable(_repo().list_artifacts(owner, run_id))
+        return api_response(data={'artifacts': artifacts}, artifacts=artifacts)
+    except Exception as exc:
+        db.session.rollback()
+        return _handle(exc)
+
+
+def artifact_content(run_id, artifact_id):
+    """GET：单条 Artifact 解密正文；过期/跨 Run 一律 404。"""
+    _holder, owner, role = _identity()
+    blocked = _guarded(role)
+    if blocked:
+        return blocked
+    try:
+        artifact = _jsonable(_repo().get_artifact(owner, run_id, artifact_id))
+        return api_response(data=artifact, artifact=artifact)
+    except Exception as exc:
+        db.session.rollback()
+        return _handle(exc)
+
+
+def list_evidence(run_id):
+    """GET：Run 内归一化 Evidence（不可信观察的有界索引）。"""
+    _holder, owner, role = _identity()
+    blocked = _guarded(role)
+    if blocked:
+        return blocked
+    try:
+        evidence = _jsonable(_repo().list_evidence(owner, run_id))
+        return api_response(data={'evidence': evidence}, evidence=evidence)
+    except Exception as exc:
+        db.session.rollback()
+        return _handle(exc)
+
+
+# ----------------------------------------------------------------------
+# M1/S3 切片 5：可续传 SSE
+# ----------------------------------------------------------------------
+
+_TERMINAL_STREAM_STATUSES = frozenset(
+    status.value for status in TERMINAL_RUN_STATUSES
+)
+
+
+def _sse_frame(event, data, event_id=None):
+    body = json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
+    lines = []
+    if event_id is not None:
+        lines.append('id: %s' % event_id)
+    lines.append('event: %s' % event)
+    lines.append('data: %s' % body)
+    return '\n'.join(lines) + '\n\n'
+
+
+def _resume_position():
+    """重连位置：Last-Event-ID（SSE 标准重连头）优先于 after_seq。"""
+    for raw in (request.headers.get('Last-Event-ID'),
+                request.args.get('after_seq')):
+        if raw is None or str(raw).strip() == '':
+            continue
+        try:
+            return max(0, int(str(raw).strip()))
+        except ValueError:
+            continue
+    return 0
+
+
+def _drain_db_session():
+    """每轮轮询后归还连接，避免长流独占连接池。"""
+    try:
+        db.session.expire_all()
+        db.session.remove()
+    except Exception:
+        pass
+
+
+def _stream_generator(owner, run_id, after_seq):
+    """从 MySQL 单调 sequence 回放事件；终态后发终局快照并关流。
+
+    重放完全由持久化的 sequence 驱动，重连不重复业务转换；
+    客户端收到 terminal 事件后应重取最终权威快照。
+    """
+    delivered = max(0, int(after_seq))
+    deadline = time.monotonic() + STREAM_MAX_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            repo = _repo()
+            events = repo.list_events(
+                owner, run_id, after_seq=delivered,
+                limit=repo.MAX_EVENT_BATCH,
+            )
+            for item in events:
+                delivered = int(item['sequence'])
+                yield _sse_frame(
+                    str(item['event_type']), item['payload'],
+                    event_id=delivered,
+                )
+            run = repo.get_run(owner, run_id)
+            if (
+                str(run.get('status')) in _TERMINAL_STREAM_STATUSES
+                and delivered >= int(run.get('latest_event_seq') or 0)
+            ):
+                yield _sse_frame('terminal', repo.snapshot(owner, run_id))
+                return
+        except AutonomyNotFound:
+            yield _sse_frame('error', {'reason': 'run not found'})
+            return
+        except Exception:
+            logger.exception('autonomy stream poll failed')
+            yield _sse_frame('error', {'reason': 'stream interrupted'})
+            return
+        finally:
+            _drain_db_session()
+        if STREAM_POLL_SECONDS > 0:
+            time.sleep(STREAM_POLL_SECONDS)
+
+
+def stream_run(run_id):
+    """GET stream?after_seq=：可续传的 Run 事件流（SSE）。"""
+    _holder, owner, role = _identity()
+    blocked = _guarded(role)
+    if blocked:
+        return blocked
+    try:
+        # 开流前先复核存在性与 owner 归属，失败仍是标准 JSON 错误。
+        _repo().get_run(owner, run_id)
+    except Exception as exc:
+        db.session.rollback()
+        return _handle(exc)
+    after_seq = _resume_position()
+    return Response(
+        stream_with_context(_stream_generator(owner, run_id, after_seq)),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache, no-transform',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive',
+        },
+    )

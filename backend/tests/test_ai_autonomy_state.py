@@ -85,6 +85,9 @@ LEGAL_STEP_TRANSITIONS = [
     ("waiting_approval", "failed"),
     ("waiting_approval", "skipped"),
     ("waiting_approval", "cancelled"),
+    # Guardian 复核中的计划与复核中断的回退（S3 切片 3）。
+    ("waiting_approval", "running"),
+    ("running", "waiting_approval"),
     ("approved", "running"),
     ("approved", "failed"),
     ("approved", "cancelled"),
@@ -100,7 +103,6 @@ LEGAL_STEP_TRANSITIONS = [
 ILLEGAL_STEP_TRANSITIONS = [
     # 拒绝不是独立状态：waiting_approval 只能落 failed 并附 note。
     ("waiting_approval", "rejected"),
-    ("waiting_approval", "running"),
     ("waiting_approval", "succeeded"),
     # 终态不可复活。
     ("succeeded", "running"),

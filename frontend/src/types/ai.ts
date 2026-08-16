@@ -52,6 +52,17 @@ export interface AiToolEvent {
   created_at?: string
 }
 
+/** 聊天侧创建的自治任务草稿引用卡（仅草稿，不能从聊天启动）。 */
+export interface AiAutonomyDraft {
+  id?: string
+  run_id?: string
+  goal?: string
+  status?: string
+  mode?: string
+  host_alias?: string
+  created_at?: string
+}
+
 export interface AiConversation {
   id: string
   title: string
@@ -110,6 +121,7 @@ export interface AiActionHistory {
 export interface AiConversationDetail extends AiConversation {
   messages?: AiChatMessage[]
   tool_events?: AiToolEvent[]
+  autonomy_drafts?: AiAutonomyDraft[]
   pending_action?: AiApproval | null
   latest_action?: AiApproval | null
   action_history?: AiActionHistory[]

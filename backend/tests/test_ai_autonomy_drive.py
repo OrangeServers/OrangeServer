@@ -27,6 +27,7 @@ from app.core.db.database import (
     db,
     t_ai_autonomous_artifact,
     t_ai_autonomous_event,
+    t_ai_autonomous_evidence,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
     t_group,
@@ -246,7 +247,8 @@ def env(monkeypatch, tmp_path):
                 t_ai_autonomous_run.__table__,
                 t_ai_autonomous_step.__table__,
                 t_ai_autonomous_event.__table__,
-                t_ai_autonomous_artifact.__table__],
+                t_ai_autonomous_artifact.__table__,
+                t_ai_autonomous_evidence.__table__],
     )
 
     platform_state = {"asset_ok": True}
@@ -597,6 +599,70 @@ def test_no_planner_fails_closed(env):
     types = [e.event_type for e in _events(env, run["id"])]
     assert "planner_unavailable" in types
     assert env["runner"].calls == []
+
+
+def test_planner_proposal_error_fails_run_closed(env):
+    """S3：模型/供应商侧可预期失败一律 fail-closed，不重试。"""
+    from app.ai.autonomy.planner import PlannerProposalError
+
+    def failing_planner(context):
+        raise PlannerProposalError("provider_call_failed")
+
+    run = env["create_queued_run"]()
+    driver = env["make_driver"](planner=failing_planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_FAILED
+    row = _run_row(env, run["id"])
+    assert row.status == "failed"
+    assert row.lease_owner is None
+    assert row.lease_token is None
+    events = _events(env, run["id"])
+    failed = [e for e in events if e.event_type == "planner_failed"]
+    assert len(failed) == 1
+    assert json.loads(failed[0].payload_json)["note"] == (
+        "provider_call_failed"
+    )
+    assert env["runner"].calls == []
+
+
+def test_planner_context_carries_authoritative_budget_and_history(env):
+    """S3：预算余量与观察回灌由服务端从 MySQL 推导，模型只能读。"""
+    observed = {}
+
+    def capturing_planner(context):
+        observed.update(context)
+        return []
+
+    run = env["create_queued_run"]()
+    driver = env["make_driver"](planner=capturing_planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert observed["budget"] == {
+        "remaining_loops": 20,
+        "remaining_actions": 30,
+    }
+    assert observed["history"] == []
+    assert observed["goal"] == "diagnose latency"
+
+
+def test_planner_context_forces_plan_after_three_distinct_probes(env):
+    """The phase handoff is derived from authoritative successful actions."""
+    run = env["create_queued_run"]()
+    for probe_id in ("system.load", "system.memory", "system.disk_usage"):
+        step = env["repo"].propose_probe(
+            "admin", "admin", run["id"], probe_id,
+        )
+        row = _step_row(env, step["id"])
+        row.status = StepStatus.SUCCEEDED.value
+    env["session"].commit()
+
+    driver = env["make_driver"]()
+
+    assert driver._planner_requires_plan(run["id"]) is True
 
 
 def test_no_saver_fails_closed(env):
@@ -1064,3 +1130,559 @@ def test_scan_excludes_healthy_paused_runs(env):
     )
     candidates = env["lease"].scan_recoverable()
     assert [c["run_id"] for c in candidates] == [run["id"]]
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 2：计划级授权——一次批准连续执行，篡改即失效
+# ---------------------------------------------------------------------------
+
+def _plan_planner(actions, summary="restart nginx"):
+    """首轮提议一张计划，之后不再提议（驱动循环应收敛）。"""
+    calls = {"n": 0}
+
+    def planner(context):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            return []
+        step = context["repo"].propose_plan(
+            context["owner"], context["role"], context["run_id"],
+            summary, actions,
+        )
+        return [step["id"]]
+
+    return planner
+
+
+def _plan_step(env, run_id):
+    return env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run_id, kind="plan",
+    ).one()
+
+
+def _approve_plan(env, run_id):
+    run = _run_row(env, run_id)
+    plan = _plan_step(env, run_id)
+    env["repo"].decide(
+        "admin", "admin", run_id, plan.id,
+        operation="approve", expected_revision=int(run.revision),
+    )
+
+
+def test_approved_plan_executes_continuously_without_asking_again(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_PAUSED
+    assert env["runner"].calls == []
+    assert _run_row(env, run["id"]).status == "waiting_approval"
+    assert _plan_step(env, run["id"]).status == "waiting_approval"
+
+    _approve_plan(env, run["id"])
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    # 未变更的动作按快照连续执行，绝不逐条再问。
+    assert len(env["runner"].calls) == 1
+    assert "systemctl restart nginx" in env["runner"].calls[0]["command"]
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "succeeded"
+    action_steps = env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).all()
+    assert len(action_steps) == 1
+    assert action_steps[0].status == "succeeded"
+    snapshot = json.loads(plan.action_json)
+    # 展开的 Step 就是提案时预分配、被 digest 覆盖的那一个。
+    assert action_steps[0].id == snapshot["actions"][0]["step_id"]
+    assert action_steps[0].action_digest == (
+        snapshot["ordered_action_digests"][0]
+    )
+    events = _events(env, run["id"])
+    waiting = [
+        e for e in events if e.event_type == "steps_waiting_approval"
+    ]
+    assert len(waiting) == 1  # 只为计划审批暂停过一次
+    decided = [
+        e for e in events
+        if e.event_type == "step_policy_decided"
+        and json.loads(e.payload_json).get("step_id")
+        == action_steps[0].id
+    ]
+    assert len(decided) == 1
+    assert json.loads(decided[0].payload_json)["decision"] == "allow"
+    completed = [e for e in events if e.event_type == "plan_completed"]
+    assert len(completed) == 1
+    assert json.loads(completed[0].payload_json)["action_count"] == 1
+
+
+def test_probe_only_plan_executes_without_any_pause(env):
+    planner = _plan_planner(
+        [{"kind": "probe", "params": {"probe_id": "system.load"}}],
+        summary="recheck load",
+    )
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    assert _plan_step(env, run["id"]).status == "succeeded"
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "steps_waiting_approval" not in types
+    assert "plan_completed" in types
+
+
+def test_tampered_plan_is_invalidated_before_any_side_effect(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+
+    _approve_plan(env, run["id"])
+    # 批准之后篡改快照：合法审批也必须立即失效。
+    plan = _plan_step(env, run["id"])
+    snapshot = json.loads(plan.action_json)
+    snapshot["actions"][0]["parameters"]["unit"] = "attacker"
+    plan.action_json = json.dumps(snapshot)
+    env["session"].commit()
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert env["runner"].calls == []
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "failed"
+    assert "digest_mismatch" in (plan.note or "")
+    invalidated = [
+        e for e in _events(env, run["id"])
+        if e.event_type == "plan_authorization_invalidated"
+    ]
+    assert len(invalidated) == 1
+    assert json.loads(invalidated[0].payload_json)["reason"] == (
+        "digest_mismatch"
+    )
+    # 半张计划绝不下场：零动作 Step、零远程副作用。
+    assert env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).count() == 0
+
+
+def test_binding_drift_invalidates_an_approved_plan(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+
+    _approve_plan(env, run["id"])
+    # 批准后服务端预算被收紧：展开前的权威复核必须拦下。
+    row = _run_row(env, run["id"])
+    budget = json.loads(row.budget_json)
+    budget["max_actions"] = 0
+    row.budget_json = json.dumps(budget)
+    env["session"].commit()
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert env["runner"].calls == []
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "failed"
+    assert "budget_changed" in (plan.note or "")
+    invalidated = [
+        e for e in _events(env, run["id"])
+        if e.event_type == "plan_authorization_invalidated"
+    ]
+    assert len(invalidated) == 1
+    assert json.loads(invalidated[0].payload_json)["reason"] == (
+        "budget_changed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 3：可选 Guardian——ai_review 稳定计划边界的独立复核
+# ---------------------------------------------------------------------------
+
+class FakeGuardian:
+    """替身复核器：记录调用上下文；可配置决策、异常或瞆形输出。"""
+
+    def __init__(self, decision="approve", reason="bounded", error=None):
+        self.decision = decision
+        self.reason = reason
+        self.error = error
+        self.calls = []
+
+    def __call__(self, context):
+        self.calls.append(context)
+        if self.error is not None:
+            raise self.error
+        return {"decision": self.decision, "reason": self.reason}
+
+
+def _guardian_events(env, run_id):
+    return [
+        e for e in _events(env, run_id)
+        if e.event_type == "guardian_decision"
+    ]
+
+
+def test_guardian_approves_ai_review_plan_without_human_pause(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    guardian = FakeGuardian("approve", "aligned with goal")
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    # approve：无人工暂停，直达展开执行。
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    assert "systemctl restart nginx" in env["runner"].calls[0]["command"]
+    assert _plan_step(env, run["id"]).status == "succeeded"
+    assert len(guardian.calls) == 1
+    context = guardian.calls[0]
+    assert context["goal"] == "diagnose latency"
+    assert context["summary"] == "restart nginx"
+    # 独立上下文：凭据与原始日志绝不进入复核输入。
+    serialized = json.dumps(context, ensure_ascii=False, default=str)
+    for marker in ("password", "secret", "private_key"):
+        assert marker not in serialized.lower()
+    events = _events(env, run["id"])
+    # 提案通知（plan_proposed 时 needs_ask）不算暂停；Run 最终完成
+    # 且零 steps_waiting_approval 暂停事件之外的来源即无人工暂停。
+    paused = [
+        e for e in events if e.event_type == "steps_waiting_approval"
+    ]
+    proposed = [e for e in events if e.event_type == "plan_proposed"]
+    assert len(paused) == len(proposed)  # 仅提案时的一条通知，无驱动暂停
+    decisions = _guardian_events(env, run["id"])
+    assert len(decisions) == 1
+    payload = json.loads(decisions[0].payload_json)
+    assert payload["decision"] == "approve"
+    assert payload["reason"] == "aligned with goal"
+
+
+def test_guardian_reject_fails_plan_and_never_executes(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    guardian = FakeGuardian("reject", "scope drift")
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    # reject：计划落 failed，零副作用；循环回 planner 后收敛收口。
+    assert result == drive_mod.RESULT_COMPLETED
+    assert env["runner"].calls == []
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "failed"
+    assert "guardian rejected" in (plan.note or "")
+    events = _events(env, run["id"])
+    paused = [
+        e for e in events if e.event_type == "steps_waiting_approval"
+    ]
+    proposed = [e for e in events if e.event_type == "plan_proposed"]
+    assert len(paused) == len(proposed)  # 无驱动层的人工暂停
+    decisions = _guardian_events(env, run["id"])
+    assert len(decisions) == 1
+    assert json.loads(decisions[0].payload_json)["decision"] == "reject"
+
+
+def test_guardian_escalate_falls_back_to_human_approval(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    guardian = FakeGuardian("escalate", "not sure")
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    # escalate：照常人工审批，人工批准后才执行。
+    assert result == drive_mod.RESULT_PAUSED
+    assert env["runner"].calls == []
+    assert _run_row(env, run["id"]).status == "waiting_approval"
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "waiting_approval"
+    assert "guardian escalated" in (plan.note or "")
+    decisions = _guardian_events(env, run["id"])
+    assert len(decisions) == 1
+    assert json.loads(decisions[0].payload_json)["decision"] == "escalate"
+
+    result = _approve_and_drive(env, driver, run["id"], "approve")
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    assert len(guardian.calls) == 1  # 人工接管后不再复核
+
+
+@pytest.mark.parametrize("guardian", [
+    FakeGuardian("allow"),            # 词汇表之外的决策
+    FakeGuardian("approve", error=RuntimeError("boom")),  # 复核器自身异常
+])
+def test_guardian_invalid_output_or_error_falls_back_to_human(
+    env, guardian,
+):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_PAUSED
+    assert env["runner"].calls == []
+    assert _plan_step(env, run["id"]).status == "waiting_approval"
+    decisions = _guardian_events(env, run["id"])
+    assert len(decisions) == 1
+    assert json.loads(decisions[0].payload_json)["decision"] == "escalate"
+
+
+def test_ask_mode_plan_makes_zero_guardian_calls(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    guardian = FakeGuardian("approve")
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    # ask 档案：写计划照常人工审批，Guardian 零调用。
+    assert result == drive_mod.RESULT_PAUSED
+    assert guardian.calls == []
+    assert _guardian_events(env, run["id"]) == []
+
+
+def test_probe_only_investigation_makes_zero_guardian_calls(env):
+    guardian = FakeGuardian("approve")
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](guardian=guardian)
+
+    # 默认替身 planner 只提案一个只读探针：普通调查不碰 Guardian。
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    assert guardian.calls == []
+    assert _guardian_events(env, run["id"]) == []
+
+
+def test_guardian_called_at_most_once_per_plan_boundary(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    guardian = FakeGuardian("escalate", "unsure")
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+    assert len(guardian.calls) == 1
+
+    # 重复投递/人为重新入队：同一计划边界绝不二次调用模型。
+    row = _run_row(env, run["id"])
+    row.status = "queued"
+    env["session"].commit()
+
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+    assert len(guardian.calls) == 1
+    assert _plan_step(env, run["id"]).status == "waiting_approval"
+
+
+def test_interrupted_guardian_review_recovers_to_human(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    guardian = FakeGuardian("approve")
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+
+    # 只跑 planner 落计划：人工模拟“复核标记已落库后进程崩溃”。
+    plan_id = planner({
+        "owner": "admin", "role": "admin", "run_id": run["id"],
+        "repo": env["repo"],
+    })[0]
+    plan = _step_row(env, plan_id)
+    plan.status = "running"
+    plan.note = "guardian review pending"
+    # 模拟租约丢失后的重新投递：Run 回到可认领状态。
+    row = _run_row(env, run["id"])
+    row.status = "queued"
+    env["session"].commit()
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    # 回退人工：零模型调用、零副作用，计划可被人工决策。
+    assert result == drive_mod.RESULT_PAUSED
+    assert guardian.calls == []
+    assert env["runner"].calls == []
+    plan = _step_row(env, plan_id)
+    assert plan.status == "waiting_approval"
+    assert "interrupted" in (plan.note or "")
+    decisions = _guardian_events(env, run["id"])
+    assert len(decisions) == 1
+    payload = json.loads(decisions[0].payload_json)
+    assert payload["decision"] == "escalate"
+    assert payload["reason"] == "review_interrupted"
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 4：Evidence 归一 / 全新 Verification / 三态 Outcome
+# ---------------------------------------------------------------------------
+
+def _evidence_rows(env, run_id):
+    return env["session"].query(t_ai_autonomous_evidence).filter_by(
+        run_id=run_id,
+    ).order_by(t_ai_autonomous_evidence.created_at.asc()).all()
+
+
+def test_full_loop_concludes_resolved_with_fresh_verification(env):
+    """Fake Provider 全回路：调查→计划→审批→执行→验证→结论。"""
+    calls = {"n": 0}
+
+    def planner(context):
+        calls["n"] += 1
+        repo = context["repo"]
+        if calls["n"] == 1:
+            step = repo.propose_plan(
+                context["owner"], context["role"], context["run_id"],
+                "restart nginx",
+                [{"kind": "systemd", "params": {
+                    "operation": "restart", "unit": "nginx",
+                }}],
+            )
+            return [step["id"]]
+        if calls["n"] == 2:
+            # 写副作用之后的全新只读观察，不是复用旧输出。
+            step = repo.propose_verification(
+                context["owner"], context["role"],
+                context["run_id"], "system.load",
+            )
+            return [step["id"]]
+        evidence = env["repo"].list_evidence(
+            context["owner"], context["run_id"],
+        )
+        repo.conclude_run(
+            context["owner"], context["role"], context["run_id"],
+            "resolved", [item["id"] for item in evidence],
+        )
+        return []
+
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+    _approve_plan(env, run["id"])
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    # 写动作 + 验证探针各一次远程调用，顺序固定。
+    commands = [call["command"] for call in env["runner"].calls]
+    assert commands == ["systemctl restart nginx", "uptime"]
+
+    row = _run_row(env, run["id"])
+    assert row.status == "completed"
+    assert row.outcome == "resolved"
+
+    # 观察归一化：每个已执行 Step 恰好一条 Evidence（observe 多轮
+    # 重入不重复落），标记不可信，大输出留在加密 Artifact。
+    evidence = _evidence_rows(env, run["id"])
+    assert [item.kind for item in evidence] == [
+        "action_observation", "verification_observation",
+    ]
+    assert all(bool(item.trusted) is False for item in evidence)
+    assert all(item.step_id for item in evidence)
+    assert len({item.step_id for item in evidence}) == 2
+    for item in evidence:
+        assert json.loads(item.artifact_ids_json or "[]")
+
+    concluded = [
+        e for e in _events(env, run["id"])
+        if e.event_type == "run_concluded"
+    ]
+    assert len(concluded) == 1
+    payload = json.loads(concluded[0].payload_json)
+    assert payload["outcome"] == "resolved"
+    assert payload["requested"] == "resolved"
+    assert payload["forced"] == ""
+    assert set(payload["evidence_ids"]) == {item.id for item in evidence}
+
+
+def test_completed_run_without_conclusion_defaults_to_inconclusive(env):
+    """模型没有给出结论：默认 inconclusive，绝不虚构成功。"""
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"]()
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    row = _run_row(env, run["id"])
+    assert row.status == "completed"
+    assert row.outcome == "inconclusive"
+    assert "run_concluded" not in [
+        e.event_type for e in _events(env, run["id"])
+    ]
+    # 观察照常归一化，供后续人工/续传引用。
+    evidence = _evidence_rows(env, run["id"])
+    assert len(evidence) == 1
+    assert evidence[0].kind == "action_observation"
+
+
+def test_resolved_without_verification_observation_is_downgraded(env):
+    """只做过只读调查就想 resolved：服务端强制降为 inconclusive。"""
+    calls = {"n": 0}
+
+    def planner(context):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            step = context["repo"].propose_probe(
+                context["owner"], context["role"],
+                context["run_id"], "system.load",
+            )
+            return [step["id"]]
+        evidence = env["repo"].list_evidence(
+            context["owner"], context["run_id"],
+        )
+        context["repo"].conclude_run(
+            context["owner"], context["role"], context["run_id"],
+            "resolved", [item["id"] for item in evidence],
+        )
+        return []
+
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert _run_row(env, run["id"]).outcome == "inconclusive"
+    concluded = [
+        e for e in _events(env, run["id"])
+        if e.event_type == "run_concluded"
+    ]
+    assert len(concluded) == 1
+    payload = json.loads(concluded[0].payload_json)
+    assert payload["requested"] == "resolved"
+    assert payload["forced"] == "verification_missing"

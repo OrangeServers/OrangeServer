@@ -221,7 +221,7 @@ M1 不承诺通用自动回滚。结构化文件补丁必须有备份并可恢�
 
 ### 规划接口
 
-以下接口在 M1 完成前均不可用：
+以下接口已在集成分支实验性实现，随 feature flag 关闭，正式发布前仍可能变化：
 
 | 方法 | 路径 | 行为 |
 |---|---|---|
@@ -245,7 +245,12 @@ decision 请求只提交 `{operation, expected_revision}`，且 operation 必须
 |---|---|---|
 | S1 安全与审批 | 领域表、资产环境、结构化动作、服务端只读探针、权限复核、不可变动作快照和 revision/digest 审批 | 全新安装/升级 schema 一致；伪装写入、越权、篡改、旧 revision 和重复审批失败 |
 | S2 执行与恢复 | 专用 Redis、Celery、LangGraph `allow/ask/deny` 路由、数据库租约、checkpoint fail-closed、可取消 SSH、写意图和未知结果 | 真实 MySQL/Redis/Worker 下通过重复投递、强杀、取消和 checkpoint 丢失测试 |
-| S3 规划、证据与产品闭环 | Planner、一次计划授权、可选 Guardian、脱敏 Evidence、独立 Verification、三态 Outcome、REST/SSE、工作台和聊天引用 | 隔离测试机完成调查、变更、重启、独立验证闭环；完整本地测试和视觉验收通过 |
+| S3 规划、证据与产品闭环 | Planner、一次计划授权、可选 Guardian、脱敏 Evidence、独立 Verification、三态 Outcome、REST/SSE、工作台和聊天引用 | 已通过完成门；能力仍默认关闭，发布部署另行审批 |
+
+S3 完成门状态（2026-08-14）：已在隔离测试机完成真实模型驱动的调查、计划审批、
+文件变更、服务重启、两次独立验证和 Evidence 结论闭环；本地后端测试、前端类型检查、
+生产构建、前端测试、文档检查和桌面/窄屏视觉抽查均已通过。该结果证明未发布实现
+满足当前完成门，不等于打开 feature flag 或进入发布部署。
 
 依赖顺序：
 

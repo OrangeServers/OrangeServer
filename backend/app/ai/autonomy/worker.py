@@ -133,21 +133,26 @@ def _register_tasks(app):
 
 
 def build_default_executor(session):
-    """生产默认执行器：AutonomyDriver 驱动循环。
+    """生产默认执行器：AutonomyDriver 驱动循环 + Tool Calling 规划器。
 
-    规划器尚未接线的切片里，驱动循环会把 Run 落 failed +
-    planner_unavailable 事件（fail-closed），绝不伪造执行结果。
+    规划器基于现有 Provider 接线（S3）；Provider 未配置或模型提议
+    非法时，驱动循环会把 Run 落 failed + planner_failed 事件
+    （fail-closed），绝不伪造执行结果。
     """
     from app.ai.autonomy.drive import (
         AutonomyDriver,
         make_autonomy_heartbeat_session_factory,
         make_autonomy_saver_factory,
     )
+    from app.ai.autonomy.guardian import make_default_guardian
+    from app.ai.autonomy.planner import make_default_planner
     from app.core.config import FLASK_SECRET_KEY
 
     def executor(run_id, claimed):
         driver = AutonomyDriver(
             session, FLASK_SECRET_KEY,
+            planner=make_default_planner(),
+            guardian=make_default_guardian(),
             saver_factory=make_autonomy_saver_factory(),
             heartbeat_session_factory=(
                 make_autonomy_heartbeat_session_factory()

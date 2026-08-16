@@ -22,6 +22,7 @@ import datetime
 import json
 import logging
 import threading
+import time
 from contextlib import contextmanager
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -29,12 +30,28 @@ from langgraph.types import Command
 
 from app.ai.autonomy.actions import (
     ActionValidationError,
+    WRITE_KINDS,
     action_from_dict,
     verify_action_digest,
 )
 from app.ai.autonomy.executor import AutonomyExecutor
 from app.ai.autonomy.graph import AutonomyGraphError, build_graph
+from app.ai.autonomy.guardian import (
+    GUARDIAN_APPROVE,
+    GUARDIAN_REJECT,
+)
 from app.ai.autonomy.lease import RunLeaseService
+from app.ai.autonomy.planner import (
+    PlannerProposalError,
+    summarize_evidence,
+    summarize_step_history,
+)
+from app.ai.autonomy.plans import (
+    PlanAuthorizationError,
+    canonical_plan_json,
+    parse_plan_snapshot,
+    verify_plan_authorization,
+)
 from app.ai.autonomy.policy import Budget, PolicyDecision, classify_action
 from app.ai.autonomy.recovery import (
     MODE_BOUNDARY,
@@ -44,13 +61,15 @@ from app.ai.autonomy.recovery import (
     MODE_RESUME,
     RecoveryService,
 )
-from app.ai.autonomy.repository import sanitize_text
+from app.ai.autonomy.repository import redacted_summary, sanitize_text
 from app.ai.autonomy.state import (
+    RunMode,
     RunStatus,
     StepKind,
     StepStatus,
     assert_run_transition,
     assert_step_transition,
+    normalize_run_mode,
 )
 from app.core import config
 
@@ -73,6 +92,12 @@ RESUME_CONTINUE = 'continue'
 # 单次 drive 内自动恢复次数上限：防止 decide 不收敛时无限自恢复；
 # 正常循环每轮最多一次自动恢复，上限已含充分余量。
 MAX_RESUMES_PER_DRIVE = 64
+
+# DeepSeek 等 OpenAI-compatible planner 可能在调查已经充分后继续选择
+# propose_probe。完成三类成功的只读探针且尚未出现写动作时，服务端把
+# 下一轮阶段收束到 propose_plan；这只是工具阶段约束，不替模型生成
+# 计划，也不绕过后续计划审批。
+MIN_DISTINCT_PROBES_BEFORE_PLAN = 3
 
 
 class DriveAbort(Exception):
@@ -97,6 +122,38 @@ class _ClaimFencedPlannerRepository:
             self._lock_claim(run_id)
             return self._repo.propose_probe(
                 owner, role, run_id, probe_id, params,
+            )
+        except Exception:
+            self._repo.session.rollback()
+            raise
+
+    def propose_plan(self, owner, role, run_id, summary, actions):
+        try:
+            self._lock_claim(run_id)
+            return self._repo.propose_plan(
+                owner, role, run_id, summary, actions,
+            )
+        except Exception:
+            self._repo.session.rollback()
+            raise
+
+    def propose_verification(
+        self, owner, role, run_id, probe_id, params=None,
+    ):
+        try:
+            self._lock_claim(run_id)
+            return self._repo.propose_verification(
+                owner, role, run_id, probe_id, params,
+            )
+        except Exception:
+            self._repo.session.rollback()
+            raise
+
+    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+        try:
+            self._lock_claim(run_id)
+            return self._repo.conclude_run(
+                owner, role, run_id, outcome, evidence_ids,
             )
         except Exception:
             self._repo.session.rollback()
@@ -186,6 +243,7 @@ class AutonomyDriver:
     def __init__(
         self, session, secret_key, *,
         planner=None,
+        guardian=None,
         runner=None,
         platform_factory=None,
         saver_factory=None,
@@ -198,6 +256,7 @@ class AutonomyDriver:
         self.session = session
         self.role = role
         self.planner = planner
+        self.guardian = guardian
         self.saver_factory = saver_factory
         self.executor = AutonomyExecutor(
             session, secret_key, runner=runner,
@@ -371,6 +430,38 @@ class AutonomyDriver:
     # 节点 handlers
     # ------------------------------------------------------------------
 
+    def _planner_requires_plan(self, run_id):
+        """Return whether the next planner turn must hand off to a plan.
+
+        This is derived only from successful server-owned probe actions and
+        the presence of any structured write action. It is intentionally a
+        bounded phase guard for providers that keep selecting a read tool;
+        it never creates a plan or changes the action/approval policy.
+        """
+        from app.core.db.database import t_ai_autonomous_step
+
+        rows = self.session.query(t_ai_autonomous_step).filter(
+            t_ai_autonomous_step.run_id == run_id,
+            t_ai_autonomous_step.kind == StepKind.ACTION.value,
+        ).all()
+        probe_ids = set()
+        for row in rows:
+            try:
+                action = action_from_dict(json.loads(row.action_json or ''))
+            except (ActionValidationError, TypeError, ValueError):
+                continue
+            kind = str(action.kind)
+            if kind in WRITE_KINDS:
+                return False
+            if (
+                kind == 'probe'
+                and row.status == StepStatus.SUCCEEDED.value
+            ):
+                probe_id = str(action.parameters.get('probe_id') or '')
+                if probe_id:
+                    probe_ids.add(probe_id)
+        return len(probe_ids) >= MIN_DISTINCT_PROBES_BEFORE_PLAN
+
     def _build_handlers(self, run_id):
         planner_repo = _ClaimFencedPlannerRepository(
             self.repo, self._lock_current_claim,
@@ -384,6 +475,14 @@ class AutonomyDriver:
             # State/checkpoints, where user-supplied secrets would persist in
             # Redis AOF. The planner receives it only at the call boundary.
             current_run = self._run_row(run_id)
+            from app.core.db.database import t_ai_autonomous_step
+
+            budget = Budget(**json.loads(current_run.budget_json or '{}'))
+            action_count = self.session.query(
+                t_ai_autonomous_step,
+            ).filter_by(
+                run_id=run_id, kind=StepKind.ACTION.value,
+            ).count()
             context = {
                 'run_id': run_id,
                 'owner': str(state.get('owner') or ''),
@@ -391,6 +490,21 @@ class AutonomyDriver:
                 'goal': str(current_run.goal or ''),
                 'loops': int(state.get('loops', 0)),
                 'repo': planner_repo,
+                # 服务端权威的预算余量与有界脱敏观察；模型只能读，
+                # 不能以此改写预算或绕过白名单。
+                'budget': {
+                    'remaining_loops': max(
+                        0, int(budget.max_loops) - int(state.get('loops', 0)),
+                    ),
+                    'remaining_actions': max(
+                        0, int(budget.max_actions) - int(action_count),
+                    ),
+                },
+                'history': summarize_step_history(self.session, run_id),
+                # 大输出留在加密 Artifact；模型只读得到有界脱敏
+                # 的 Evidence 摘要（切片 4）。
+                'evidence': summarize_evidence(self.session, run_id),
+                'require_plan': self._planner_requires_plan(run_id),
             }
             proposed = list(self.planner(context) or [])
             return {
@@ -405,9 +519,14 @@ class AutonomyDriver:
             def proposed_steps():
                 return (
                     self.session.query(t_ai_autonomous_step)
-                    .filter_by(
-                        run_id=run_id, kind=StepKind.ACTION.value,
-                        status=StepStatus.PROPOSED.value,
+                    .filter(
+                        t_ai_autonomous_step.run_id == run_id,
+                        t_ai_autonomous_step.kind.in_([
+                            StepKind.ACTION.value,
+                            StepKind.VERIFICATION.value,
+                        ]),
+                        t_ai_autonomous_step.status
+                        == StepStatus.PROPOSED.value,
                     )
                     .order_by(t_ai_autonomous_step.seq.asc())
                     .all()
@@ -415,20 +534,13 @@ class AutonomyDriver:
 
             steps = proposed_steps()
             if not steps:
-                return {
-                    'pending_step_id': '',
-                    'policy_decision': PolicyDecision.ALLOW.value,
-                    'decision': '',
-                }
+                return self._policy_plan_pending(run_id)
             run = self._lock_current_claim(run_id)
             steps = proposed_steps()
             if not steps:
+                pending = self._policy_plan_pending(run_id)
                 self.repo._commit()
-                return {
-                    'pending_step_id': '',
-                    'policy_decision': PolicyDecision.ALLOW.value,
-                    'decision': '',
-                }
+                return pending
             if str(run.graph_version or '') != 'v2':
                 for step in steps:
                     assert_step_transition(
@@ -516,6 +628,16 @@ class AutonomyDriver:
             step = self._step_row(run_id, step_id)
             if step is None:
                 return {'summary': 'step vanished'}
+            if step.kind == StepKind.PLAN.value:
+                # 已授权计划：展开前权威复核，未变更动作连续执行，
+                # 不再逐个询问；崩溃后 running 计划可重新进入。
+                if step.status not in {
+                    StepStatus.APPROVED.value, StepStatus.RUNNING.value,
+                }:
+                    return {
+                        'summary': 'step skipped: %s' % (step.status,),
+                    }
+                return self._execute_approved_plan(run_id, step)
             if step.status != StepStatus.APPROVED.value:
                 # 被拒绝（或已被其他路径处理）：绝不执行。
                 return {
@@ -536,6 +658,9 @@ class AutonomyDriver:
 
         def observe(state):
             self._guard()
+            # 执行观察归一化成有界脱敏 Evidence（幂等，恢复重入
+            # 不重复落）；大输出本体仍在加密 Artifact。
+            self._record_run_evidence(run_id)
             step_id = str(state.get('pending_step_id') or '')
             if not step_id:
                 return {}
@@ -574,6 +699,483 @@ class AutonomyDriver:
             'verify': verify,
             'decide': decide,
         }
+
+    # ------------------------------------------------------------------
+    # 观察归一化：Evidence 引用（S3 切片 4）
+    # ------------------------------------------------------------------
+
+    def _record_run_evidence(self, run_id):
+        """把已执行的观察归一化成有界脱敏 Evidence。
+
+        幂等：每个 Step 至多一条 Evidence，恢复重入不重复落。
+        Evidence 只是不可信观察的索引，大输出本体仍在加密
+        Artifact；模型后续只能读到这里的有界摘要。
+        """
+        from app.core.db.database import (
+            t_ai_autonomous_artifact,
+            t_ai_autonomous_evidence,
+            t_ai_autonomous_step,
+        )
+
+        executed = (
+            StepStatus.SUCCEEDED.value,
+            StepStatus.FAILED.value,
+            StepStatus.OUTCOME_UNKNOWN.value,
+        )
+        steps = self.session.query(t_ai_autonomous_step).filter(
+            t_ai_autonomous_step.run_id == run_id,
+            t_ai_autonomous_step.kind.in_([
+                StepKind.ACTION.value, StepKind.VERIFICATION.value,
+            ]),
+            t_ai_autonomous_step.status.in_(executed),
+        ).order_by(t_ai_autonomous_step.seq.asc()).all()
+        if not steps:
+            return
+        recorded = {
+            row.step_id for row in self.session.query(
+                t_ai_autonomous_evidence.step_id,
+            ).filter_by(run_id=run_id).all() if row.step_id
+        }
+        run = None
+        for step in steps:
+            if step.id in recorded:
+                continue
+            artifact_ids = [
+                row.id for row in self.session.query(
+                    t_ai_autonomous_artifact.id,
+                ).filter_by(run_id=run_id, step_id=step.id).all()
+            ]
+            if run is None:
+                run = self._run_row(run_id)
+            kind = (
+                'verification_observation'
+                if step.kind == StepKind.VERIFICATION.value
+                else 'action_observation'
+            )
+            summary = sanitize_text(
+                '%s: %s%s' % (
+                    step.status,
+                    step.summary or '',
+                    ' | %s' % step.note if step.note else '',
+                ),
+            )[:500]
+            self.repo.record_evidence(
+                str(run.owner), run_id,
+                kind=kind,
+                summary=summary,
+                step_id=step.id,
+                artifact_ids=artifact_ids,
+            )
+
+    # ------------------------------------------------------------------
+    # 计划级授权：一次授权一个稳定计划（S3 切片 2）
+    # ------------------------------------------------------------------
+
+    def _policy_plan_pending(self, run_id):
+        """无待批动作时查未决计划：waiting→ask 暂停，approved→直接执行。
+
+        ai_review 档案且接线了 Guardian 时，waiting 计划先交给独立
+        复核（每个计划边界至多一次）；其余情况照常人工审批。运行中
+        计划：复核中断的回退人工，其余按 S2 契约重入展开执行。
+        """
+        from app.core.db.database import t_ai_autonomous_step
+
+        plan_step = (
+            self.session.query(t_ai_autonomous_step)
+            .filter_by(run_id=run_id, kind=StepKind.PLAN.value)
+            .filter(
+                t_ai_autonomous_step.status.in_([
+                    StepStatus.WAITING_APPROVAL.value,
+                    StepStatus.APPROVED.value,
+                    StepStatus.RUNNING.value,
+                ]),
+            )
+            .order_by(t_ai_autonomous_step.seq.desc())
+            .first()
+        )
+        if plan_step is None:
+            return {
+                'pending_step_id': '',
+                'policy_decision': PolicyDecision.ALLOW.value,
+                'decision': '',
+            }
+        if plan_step.status == StepStatus.RUNNING.value:
+            note = str(plan_step.note or '')
+            if not note.startswith('guardian review pending'):
+                # 展开执行中崩溃的计划：重入执行器继续（S2 契约）。
+                return {
+                    'pending_step_id': plan_step.id,
+                    'policy_decision': PolicyDecision.ALLOW.value,
+                    'decision': '',
+                }
+            self._recover_interrupted_guardian_review(run_id, plan_step.id)
+            plan_step = self._step_row(run_id, plan_step.id)
+        if plan_step.status == StepStatus.WAITING_APPROVAL.value:
+            review = self._maybe_guardian_review(run_id, plan_step.id)
+            if review is not None:
+                return review
+            decision = PolicyDecision.ASK.value
+        else:
+            decision = PolicyDecision.ALLOW.value
+        return {
+            'pending_step_id': plan_step.id,
+            'policy_decision': decision,
+            'decision': '',
+        }
+
+    # ------------------------------------------------------------------
+    # Guardian：稳定计划边界的可选独立复核（S3 切片 3）
+    # ------------------------------------------------------------------
+
+    def _maybe_guardian_review(self, run_id, plan_step_id):
+        """ai_review + 已接线 Guardian 时复核 waiting 计划。
+
+        返回 policy 节点结果表示复核已处置该计划；返回 None 表示
+        照常 ask 暂停（非 ai_review、未接线或 escalate 兜底）。每个
+        计划边界至多一次模型调用：认领标记先落库，重入不再复核。
+        """
+        run = self._run_row(run_id)
+        try:
+            canonical_mode = normalize_run_mode(str(run.mode or ''))
+        except Exception:
+            return None
+        if canonical_mode != RunMode.AI_REVIEW or self.guardian is None:
+            return None
+        if not self._claim_guardian_review(run_id, plan_step_id):
+            return None
+
+        plan_step = self._step_row(run_id, plan_step_id)
+        try:
+            snapshot = parse_plan_snapshot(plan_step.action_json or '')
+        except PlanAuthorizationError:
+            snapshot = {'summary': '', 'actions': []}
+        host = self.repo._get_host_row(run.host_id)
+        try:
+            result = self.guardian({
+                'goal': str(run.goal or ''),
+                'host_alias': str(host.alias or ''),
+                'environment': str(host.ai_environment or ''),
+                'summary': str(snapshot.get('summary') or ''),
+                'snapshot': snapshot,
+            })
+        except Exception as exc:
+            # Guardian 是可选增强：复核器自身异常也一律回退人工。
+            logger.warning('autonomy guardian raised: %s', exc)
+            result = None
+        decision = str((result or {}).get('decision') or '')
+        reason = sanitize_text(
+            str((result or {}).get('reason') or ''),
+        )[:64]
+
+        if decision == GUARDIAN_APPROVE:
+            return self._guardian_approve(run_id, plan_step_id, reason)
+        if decision == GUARDIAN_REJECT:
+            return self._guardian_reject(run_id, plan_step_id, reason)
+        return self._guardian_escalate(run_id, plan_step_id, reason)
+
+    def _claim_guardian_review(self, run_id, plan_step_id):
+        """把 waiting 计划标记为复核中并先落库；不可复核时返回 False。
+
+        标记落库后才调用模型：进程在调用中途崩溃时，重入看到的是
+        已复核标记，绝不对同一计划边界发起第二次模型调用。
+        """
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step_id)
+        if plan_step is None:
+            self.repo._commit()
+            return False
+        note = str(plan_step.note or '')
+        if (
+            plan_step.status != StepStatus.WAITING_APPROVAL.value
+            or note.startswith('guardian ')
+        ):
+            self.repo._commit()
+            return False
+        assert_step_transition(plan_step.status, StepStatus.RUNNING.value)
+        plan_step.status = StepStatus.RUNNING.value
+        plan_step.note = 'guardian review pending'
+        self.repo._bump(run)
+        self.repo._commit()
+        return True
+
+    def _recover_interrupted_guardian_review(self, run_id, plan_step_id):
+        """复核中进程崩溃：计划回 waiting 交人工，绝不二次调用模型。"""
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step_id)
+        if (
+            plan_step is None
+            or plan_step.status != StepStatus.RUNNING.value
+            or not str(plan_step.note or '').startswith(
+                'guardian review pending',
+            )
+        ):
+            self.repo._commit()
+            return
+        assert_step_transition(
+            plan_step.status, StepStatus.WAITING_APPROVAL.value,
+        )
+        plan_step.status = StepStatus.WAITING_APPROVAL.value
+        plan_step.note = 'guardian review interrupted'
+        self.repo._bump(run)
+        self.repo.append_event(run, 'guardian_decision', {
+            'step_id': plan_step.id,
+            'decision': 'escalate',
+            'reason': 'review_interrupted',
+        })
+        self.repo._commit()
+
+    def _guardian_result_lock(self, run_id, plan_step_id):
+        """复核落库前重新锁定并复核状态；已被人工处置时返回 (None, None)。"""
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step_id)
+        if (
+            plan_step is None
+            or plan_step.status != StepStatus.RUNNING.value
+        ):
+            self.repo._commit()
+            return None, None
+        return run, plan_step
+
+    def _guardian_approve(self, run_id, plan_step_id, reason):
+        """approve：计划转 approved，Run 回 queued，直达展开执行。
+
+        放行只到状态层：展开前的 digest/绑定/预算复核照旧独立完成，
+        Guardian 从不授予权限。
+        """
+        run, plan_step = self._guardian_result_lock(run_id, plan_step_id)
+        if run is None:
+            return None
+        assert_step_transition(plan_step.status, StepStatus.APPROVED.value)
+        plan_step.status = StepStatus.APPROVED.value
+        plan_step.note = ('guardian approved: %s' % reason)[:255]
+        assert_run_transition(run.status, RunStatus.QUEUED.value)
+        run.status = RunStatus.QUEUED.value
+        self.repo._bump(run)
+        self.repo.append_event(run, 'guardian_decision', {
+            'step_id': plan_step.id,
+            'decision': GUARDIAN_APPROVE,
+            'reason': reason,
+        })
+        self.repo._commit()
+        return {
+            'pending_step_id': plan_step.id,
+            'policy_decision': PolicyDecision.ALLOW.value,
+            'decision': '',
+        }
+
+    def _guardian_reject(self, run_id, plan_step_id, reason):
+        """reject：计划落 failed，Run 回 queued，下一轮重新提议。"""
+        run, plan_step = self._guardian_result_lock(run_id, plan_step_id)
+        if run is None:
+            return None
+        assert_step_transition(plan_step.status, StepStatus.FAILED.value)
+        plan_step.status = StepStatus.FAILED.value
+        plan_step.note = ('guardian rejected: %s' % reason)[:255]
+        assert_run_transition(run.status, RunStatus.QUEUED.value)
+        run.status = RunStatus.QUEUED.value
+        self.repo._bump(run)
+        self.repo.append_event(run, 'guardian_decision', {
+            'step_id': plan_step.id,
+            'decision': GUARDIAN_REJECT,
+            'reason': reason,
+        })
+        self.repo._commit()
+        return {
+            'pending_step_id': '',
+            'policy_decision': PolicyDecision.ALLOW.value,
+            'decision': '',
+        }
+
+    def _guardian_escalate(self, run_id, plan_step_id, reason):
+        """escalate/任何不确定：计划回 waiting，照常人工审批。"""
+        run, plan_step = self._guardian_result_lock(run_id, plan_step_id)
+        if run is None:
+            return None
+        assert_step_transition(
+            plan_step.status, StepStatus.WAITING_APPROVAL.value,
+        )
+        plan_step.status = StepStatus.WAITING_APPROVAL.value
+        plan_step.note = ('guardian escalated: %s' % reason)[:255]
+        self.repo._bump(run)
+        self.repo.append_event(run, 'guardian_decision', {
+            'step_id': plan_step.id,
+            'decision': 'escalate',
+            'reason': reason or 'uncertain',
+        })
+        self.repo.append_event(run, 'steps_waiting_approval', {
+            'step_ids': [plan_step.id],
+        })
+        self.repo._commit()
+        return {
+            'pending_step_id': plan_step.id,
+            'policy_decision': PolicyDecision.ASK.value,
+            'decision': '',
+        }
+
+    def _execute_approved_plan(self, run_id, plan_step):
+        """展开已授权计划：复核→按序执行→落终态。
+
+        任何前置失效（digest/过期/目标/凭据/策略/预算/图版本漂移）
+        都把计划落 failed 并回 ask（下一轮重新提议与决策），绝不
+        放行部分动作；单个动作失败即停止展开，剩余动作不执行。
+        """
+        from app.core.db.database import t_ai_autonomous_step
+
+        try:
+            snapshot = parse_plan_snapshot(plan_step.action_json or '')
+            actions = verify_plan_authorization(
+                snapshot, plan_step.action_digest,
+                self.repo._plan_binding(self._run_row(run_id)),
+                self.repo.secret_key, int(time.time()),
+            )
+        except PlanAuthorizationError as exc:
+            self._invalidate_plan(run_id, plan_step, exc.reason)
+            return {'summary': 'plan invalidated: %s' % exc.reason}
+
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step.id)
+        budget = Budget(**json.loads(run.budget_json or '{}'))
+        action_count = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id, kind=StepKind.ACTION.value,
+        ).count()
+        if action_count + len(actions) > int(budget.max_actions):
+            self.repo._commit()
+            self._invalidate_plan(run_id, plan_step, 'budget_changed')
+            return {'summary': 'plan invalidated: budget_changed'}
+        if plan_step.status == StepStatus.APPROVED.value:
+            assert_step_transition(plan_step.status, StepStatus.RUNNING.value)
+            plan_step.status = StepStatus.RUNNING.value
+            self.repo._bump(run)
+            self.repo._commit()
+
+        canonical_actions = list(snapshot['actions'])
+        executed = 0
+        for index, action in enumerate(actions):
+            current = self._run_row(run_id)
+            if bool(current.cancel_requested):
+                self._fail_plan(
+                    run_id, plan_step, 'plan halted: cancel requested',
+                )
+                return {'summary': 'plan halted: cancel requested'}
+            canonical = canonical_actions[index]
+            step_row = self._ensure_plan_action_step(
+                run_id, plan_step, canonical, action, index,
+                action_digest=str(snapshot['ordered_action_digests'][index]),
+            )
+            if step_row.status in {
+                StepStatus.SUCCEEDED.value, StepStatus.SKIPPED.value,
+            }:
+                if step_row.status == StepStatus.SUCCEEDED.value:
+                    executed += 1
+                continue
+            if step_row.status in {
+                StepStatus.FAILED.value,
+                StepStatus.OUTCOME_UNKNOWN.value,
+                StepStatus.CANCELLED.value,
+            }:
+                self._fail_plan(
+                    run_id, plan_step,
+                    'plan halted: action %s' % step_row.status,
+                )
+                return {'summary': 'plan halted: action %s' % step_row.status}
+            result = self.executor.execute_step(
+                str(current.owner), self.role, run_id, step_row.id,
+                timeout_seconds=self._remaining_duration_seconds(),
+                control_probe=self._execution_control_probe,
+                control_session_factory=self._heartbeat_session_factory,
+                lease_owner=self._identity(),
+                lease_token=self._active_lease_token,
+            )
+            self._revision_state['revision'] = int(result['revision'])
+            if result.get('termination') == 'lease_lost':
+                raise DriveAbort('lease lost during plan execution')
+            if str(result['step_status']) != StepStatus.SUCCEEDED.value:
+                self._fail_plan(
+                    run_id, plan_step,
+                    'plan halted: action %s' % result['step_status'],
+                )
+                return {
+                    'summary': 'plan halted: action %s'
+                    % result['step_status'],
+                }
+            executed += 1
+
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step.id)
+        assert_step_transition(plan_step.status, StepStatus.SUCCEEDED.value)
+        plan_step.status = StepStatus.SUCCEEDED.value
+        plan_step.note = '%d action(s) succeeded' % executed
+        self.repo._bump(run)
+        self.repo.append_event(run, 'plan_completed', {
+            'step_id': plan_step.id, 'action_count': executed,
+        })
+        self.repo._commit()
+        return {'summary': 'plan succeeded: %d action(s)' % executed}
+
+    def _invalidate_plan(self, run_id, plan_step, reason):
+        """授权失效：计划落 failed + 事件，回 ask 重新提议与决策。"""
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step.id)
+        assert_step_transition(plan_step.status, StepStatus.FAILED.value)
+        plan_step.status = StepStatus.FAILED.value
+        plan_step.note = ('plan authorization invalidated: %s' % reason)[:255]
+        self.repo._bump(run)
+        self.repo.append_event(run, 'plan_authorization_invalidated', {
+            'step_id': plan_step.id, 'reason': str(reason)[:64],
+        })
+        self.repo._commit()
+
+    def _fail_plan(self, run_id, plan_step, note):
+        """执行期失败：计划落 failed，剩余动作绝不继续。"""
+        run = self._lock_current_claim(run_id)
+        plan_step = self._step_row(run_id, plan_step.id)
+        if plan_step.status not in {
+            StepStatus.FAILED.value, StepStatus.SUCCEEDED.value,
+        }:
+            assert_step_transition(plan_step.status, StepStatus.FAILED.value)
+            plan_step.status = StepStatus.FAILED.value
+            plan_step.note = str(note)[:255]
+            self.repo._bump(run)
+            self.repo._commit()
+
+    def _ensure_plan_action_step(
+        self, run_id, plan_step, canonical, action, index, *, action_digest,
+    ):
+        """按计划快照展开一个动作 Step（幂等：崩溃重入不重复建）。
+
+        digest 直接取计划快照的有序动作 digest：展开的动作与授权
+        时签名的动作逐字节一致，执行器还会独立复核一次。
+        """
+        from app.core.db.database import t_ai_autonomous_step
+
+        step_id = str(canonical.get('step_id') or '')
+        existing = self._step_row(run_id, step_id)
+        if existing is not None:
+            return existing
+        run = self._lock_current_claim(run_id)
+        seq = self.session.query(t_ai_autonomous_step).filter_by(
+            run_id=run_id,
+        ).count() + 1
+        step = t_ai_autonomous_step(
+            id=step_id,
+            run_id=run_id,
+            kind=StepKind.ACTION.value,
+            status=StepStatus.APPROVED.value,
+            seq=seq,
+            summary=redacted_summary(action),
+            action_json=canonical_plan_json(canonical),
+            action_digest=action_digest,
+            note=('authorized by plan %s' % plan_step.id)[:255],
+        )
+        self.session.add(step)
+        self.repo._bump(run)
+        self.repo.append_event(run, 'step_policy_decided', {
+            'step_id': step_id,
+            'decision': PolicyDecision.ALLOW.value,
+            'reason': 'authorized by approved plan',
+        })
+        self.repo._commit()
+        return step
 
     # ------------------------------------------------------------------
     # 心跳
@@ -820,6 +1422,11 @@ class AutonomyDriver:
             except PlannerUnavailable:
                 self._fail_run(run, 'planner_unavailable', 'planner not wired')
                 return RESULT_FAILED
+            except PlannerProposalError as exc:
+                # Planner 内部的一次协议修复仍未收敛：fail-closed 落
+                # 终态，驱动层不再重试或留下半执行 Step。
+                self._fail_run(run, 'planner_failed', exc.reason)
+                return RESULT_FAILED
             except DurationBudgetExhausted:
                 self.session.expire_all()
                 current = self._run_row(run_id)
@@ -886,6 +1493,13 @@ class AutonomyDriver:
             assert_run_transition(run.status, RunStatus.FAILED.value)
             run.status = RunStatus.FAILED.value
             event = 'budget_exhausted'
+        elif run.status == RunStatus.QUEUED.value:
+            # Guardian reject 后 Run 已回 queued 等下一轮重新提议：
+            # 本驱动已收敛，保持 queued 释放租约交给扫描认领，绝
+            # 不把仍在队列里的 Run 误标 completed，也不落终态时间。
+            self._clear_claim(run)
+            self.repo._commit()
+            return RESULT_COMPLETED
         else:
             result = RESULT_COMPLETED
             assert_run_transition(run.status, RunStatus.COMPLETED.value)

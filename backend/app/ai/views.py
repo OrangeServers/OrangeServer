@@ -98,6 +98,24 @@ def _project_tool_events(events):
     return [projected[key] for key in order]
 
 
+def _project_autonomy_drafts(events):
+    """M1/S3 切片 7：投影聊天侧创建的自治任务草稿引用卡（历史恢复用）。"""
+    drafts = []
+    for event in events or []:
+        if event.get("type") != "autonomy.draft_created":
+            continue
+        drafts.append({
+            "id": str(event.get("id") or ""),
+            "run_id": str(event.get("run_id") or ""),
+            "goal": str(event.get("goal") or ""),
+            "status": str(event.get("status") or "draft"),
+            "mode": str(event.get("mode") or ""),
+            "host_alias": str(event.get("host_alias") or ""),
+            "created_at": _iso(event.get("created_at")),
+        })
+    return drafts
+
+
 def _project_execution_items(items, *, max_output_chars: int = 8192):
     """Return the UI execution contract without host IDs/IPs or unbounded output."""
     projected = []
@@ -546,6 +564,9 @@ def conversation_detail(conversation_id: str):
             "has_pending_action": pending_action is not None,
             "messages": display_messages,
             "tool_events": display_events,
+            "autonomy_drafts": _project_autonomy_drafts(
+                conversation.get("events")
+            ),
             "pending_action": project_action(pending_action),
             "latest_action": project_action(latest_action),
             "action_history": action_history,

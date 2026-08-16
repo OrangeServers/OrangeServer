@@ -32,6 +32,7 @@ from app.core.db.database import (
     db,
     t_ai_autonomous_artifact,
     t_ai_autonomous_event,
+    t_ai_autonomous_evidence,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
     t_group,
@@ -94,7 +95,8 @@ def env(monkeypatch, tmp_path):
                 t_ai_autonomous_run.__table__,
                 t_ai_autonomous_step.__table__,
                 t_ai_autonomous_event.__table__,
-                t_ai_autonomous_artifact.__table__],
+                t_ai_autonomous_artifact.__table__,
+                t_ai_autonomous_evidence.__table__],
     )
 
     repo = AutonomyRepository(
@@ -798,3 +800,65 @@ def test_recovering_scan_excludes_healthy_paused_and_attention(env):
     row.lease_expires_at = None
     env["session"].commit()
     assert env["lease"].scan_recoverable() == []
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 4：恢复重入绝不重放已成功的验证
+# ---------------------------------------------------------------------------
+
+def test_recovery_never_replays_succeeded_verification(env):
+    """写与验证都已成功但结论未落库：恢复保 needs_attention，
+    绝不重放验证，也绝不在人工核对前虚构终局结论。"""
+    run = env["create_queued_run"]()
+    # 成功写动作是验证的前置：模拟崩溃前已落库。
+    run_row = _run_row(env, run["id"])
+    write_id = uuid.uuid4().hex
+    action = StructuredAction(
+        kind="systemd",
+        target_id=int(run_row.host_id),
+        system_user_id=int(run_row.system_user_id),
+        parameters={"operation": "restart", "unit": "nginx"},
+        timeout_seconds=30,
+        step_id=write_id,
+    )
+    env["session"].add(t_ai_autonomous_step(
+        id=write_id, run_id=run["id"], kind="action", status="succeeded",
+        seq=1, summary="restart nginx",
+        action_json=json.dumps(
+            action.to_canonical_dict(), sort_keys=True,
+        ),
+        action_digest=build_action_digest(action, SECRET_KEY),
+        note="",
+    ))
+    env["session"].commit()
+    verification = env["repo"].propose_verification(
+        "admin", "admin", run["id"], "system.load",
+    )
+    # 模拟验证已执行成功、结论落库前进程被杀（checkpoint 一并丢失）。
+    step = _step_row(env, verification["id"])
+    step.status = "succeeded"
+    env["session"].commit()
+    env["simulate_kill"](run["id"])
+
+    driver = env["make_driver"](planner=lambda context: [])
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_NEEDS_ATTENTION
+    # 已成功的写与验证绝不重放：零远程调用。
+    assert env["runner"].calls == []
+    row = _run_row(env, run["id"])
+    assert row.status == "needs_attention"
+    # 人工核对前不落任何终局 Outcome，也不伪造 Evidence。
+    assert str(row.outcome or "") == ""
+    assert env["session"].query(t_ai_autonomous_evidence).filter_by(
+        run_id=run["id"],
+    ).count() == 0
+    assert "recovery_cursor_unresolved" in _event_types(env, run["id"])
+
+    # 重复投递：仍然 needs_attention，验证永不被重放。
+    again = driver.drive(run["id"], {"revision": int(row.revision)})
+    assert again == drive_mod.RESULT_NEEDS_ATTENTION
+    assert env["runner"].calls == []
+    assert env["lease"].claim_run(
+        run["id"], "recovery-test-worker", TTL,
+    ) is None

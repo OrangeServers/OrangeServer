@@ -28,6 +28,13 @@ from urllib.parse import urlsplit
 # 递增，避免旧审批被复用到新语义。
 ACTION_VERSION = 1
 
+# 需要“写意图先落库”的动作类别。shell 是通用写入口（永远精确
+# 审批）；systemd/package_install 是服务端模板的结构化写动作；
+# file_patch/file_restore 是带备份与恢复承诺的文件写动作。
+WRITE_KINDS = frozenset({
+    'shell', 'systemd', 'package_install', 'file_patch', 'file_restore',
+})
+
 # 参数值里出现任何 Shell 元字符即拒绝。探针参数只允许纯标量，
 # 管道/重定向/命令替换在参数层就被堵死。
 _PARAM_FORBIDDEN_RE = re.compile(r"[|&;<>()`$\\\"'\n\r\t]")
