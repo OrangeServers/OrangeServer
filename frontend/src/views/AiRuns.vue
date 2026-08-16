@@ -33,8 +33,15 @@
       :title="t('aiRuns.notReady', { reason: reasonText(readiness.reason) })"
     />
 
-    <!-- 过滤条：状态 / 结论 -->
+    <!-- 过滤条：搜索 / 状态 / 结论 -->
     <div class="runs-filter">
+      <el-input
+        v-model="searchText"
+        class="runs-search"
+        clearable
+        :placeholder="t('aiRuns.filter.searchPlaceholder')"
+        :aria-label="t('aiRuns.filter.search')"
+      />
       <el-select v-model="statusFilter" class="runs-filter-item" size="default">
         <el-option :label="`${t('aiRuns.filter.status')}: ${t('aiRuns.filter.all')}`" value="all" />
         <el-option
@@ -51,7 +58,9 @@
           :value="outcome"
         />
       </el-select>
-      <span class="runs-count">{{ filteredRuns.length }} / {{ runs.length }}</span>
+      <span class="runs-count">
+        {{ t('aiRuns.filter.count', { visible: filteredRuns.length, total: runs.length }) }}
+      </span>
     </div>
 
     <!-- 列表主体：loading / error / empty / table 四态 -->
@@ -75,12 +84,22 @@
         v-else
         :data="filteredRuns"
         class="runs-table"
-        @row-click="(row: AutonomyRun) => router.push(`/ai-runs/${row.id}`)"
+        @row-click="openRun"
       >
         <el-table-column :label="t('aiRuns.table.goal')" min-width="260">
           <template #default="{ row }">
-            <div class="runs-goal">{{ row.goal }}</div>
-            <div class="runs-goal-id">{{ row.id }}</div>
+            <div class="runs-goal" :title="row.goal">{{ summarizeAutonomyGoal(row.goal) }}</div>
+            <div class="runs-goal-id" :title="row.id">#{{ row.id.slice(0, 8) }}</div>
+            <div class="runs-narrow-meta">
+              <span class="runs-narrow-asset" :title="row.host_alias">{{ row.host_alias }}</span>
+              <span>{{ modeLabel(row.mode) }}</span>
+              <el-tag size="small" :type="statusTagType(row.status)" effect="light" round>
+                {{ t(`aiRuns.status.${row.status}`) }}
+              </el-tag>
+              <el-tag v-if="row.outcome" size="small" :type="outcomeTagType(row.outcome)" effect="plain" round>
+                {{ t(`aiRuns.outcome.${row.outcome}`) }}
+              </el-tag>
+            </div>
           </template>
         </el-table-column>
         <el-table-column :label="t('aiRuns.table.host')" min-width="150">
@@ -120,6 +139,14 @@
         <el-table-column :label="t('aiRuns.table.updated')" min-width="110">
           <template #default="{ row }">
             <span class="runs-time">{{ lastActivity(row) }}</span>
+            <span class="runs-time-abs">{{ lastActivityAbsolute(row) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column :label="t('aiRuns.table.open')" width="112" fixed="right">
+          <template #default="{ row }">
+            <el-button text type="primary" @click.stop="openRun(row)">
+              {{ t('aiRuns.table.open') }}
+            </el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -159,12 +186,18 @@
           </el-form-item>
         </div>
         <el-form-item :label="t('aiRuns.dialog.mode')" prop="mode">
-          <el-radio-group v-model="form.mode">
-            <el-radio v-for="mode in CREATE_MODES" :key="mode" :value="mode">
-              {{ t(`aiRuns.mode.${mode}`) }}
-            </el-radio>
+          <el-radio-group v-model="form.mode" class="runs-mode-options">
+            <div
+              v-for="mode in CREATE_MODES"
+              :key="mode"
+              class="runs-mode-card"
+              :class="{ active: form.mode === mode }"
+              @click="form.mode = mode"
+            >
+              <el-radio :value="mode">{{ t(`aiRuns.mode.${mode}`) }}</el-radio>
+              <span>{{ t(`aiRuns.dialog.modeHint.${mode}`) }}</span>
+            </div>
           </el-radio-group>
-          <div class="runs-mode-hint">{{ t(`aiRuns.dialog.modeHint.${form.mode}`) }}</div>
         </el-form-item>
         <el-form-item v-if="form.mode === 'custom'" :label="t('aiRuns.dialog.categories')" prop="categories">
           <el-checkbox-group v-model="form.categories">
@@ -177,8 +210,13 @@
           </el-checkbox-group>
         </el-form-item>
         <el-form-item :label="t('aiRuns.dialog.budget')">
-          <div class="runs-mode-hint runs-budget-hint">{{ t('aiRuns.dialog.budgetHint') }}</div>
-          <div class="runs-budget-grid">
+          <div class="runs-budget-head">
+            <div class="runs-mode-hint">{{ t('aiRuns.dialog.budgetHint') }}</div>
+            <el-button text size="small" @click="budgetExpanded = !budgetExpanded">
+              {{ budgetExpanded ? t('aiRuns.dialog.budgetAdvancedClose') : t('aiRuns.dialog.budgetAdvanced') }}
+            </el-button>
+          </div>
+          <div v-if="budgetExpanded" class="runs-budget-grid">
             <div v-for="field in BUDGET_FIELDS" :key="field" class="runs-budget-cell">
               <div class="runs-budget-label">{{ t(`aiRuns.dialog.budgetField.${field}`) }}</div>
               <el-input-number
@@ -213,7 +251,8 @@ import { isTerminalRunStatus, AUTONOMY_ACTION_CATEGORIES } from '@/types/autonom
 import type {
   AutonomyBudget, AutonomyReadiness, AutonomyRun, AutonomyRunOutcome, AutonomyRunStatus,
 } from '@/types/autonomy'
-import { formatTimeRel } from '@/utils/datetime'
+import { formatTimeAbs, formatTimeRel } from '@/utils/datetime'
+import { summarizeAutonomyGoal } from '@/utils/autonomyPresentation'
 
 const router = useRouter()
 
@@ -224,6 +263,7 @@ const loadError = ref('')
 const readiness = ref<AutonomyReadiness | null>(null)
 const statusFilter = ref<string>('all')
 const outcomeFilter = ref<string>('all')
+const searchText = ref('')
 
 const RUN_STATUSES: readonly AutonomyRunStatus[] = [
   'draft', 'queued', 'running', 'waiting_approval', 'recovering',
@@ -243,6 +283,13 @@ const KNOWN_MODES = new Set([
 const filteredRuns = computed<AutonomyRun[]>(() => runs.value.filter((run) => {
   if (statusFilter.value !== 'all' && run.status !== statusFilter.value) return false
   if (outcomeFilter.value !== 'all' && run.outcome !== outcomeFilter.value) return false
+  const query = searchText.value.trim().toLocaleLowerCase()
+  if (query) {
+    const haystack = [run.goal, run.id, run.host_alias, run.system_user_alias]
+      .join(' ')
+      .toLocaleLowerCase()
+    if (!haystack.includes(query)) return false
+  }
   return true
 }))
 
@@ -276,6 +323,15 @@ function outcomeTagType(outcome: string): '' | 'success' | 'warning' | 'info' | 
 function lastActivity(run: AutonomyRun): string {
   const stamp = run.completed_at || run.started_at || run.created_at
   return stamp ? formatTimeRel(stamp) : '—'
+}
+
+function lastActivityAbsolute(run: AutonomyRun): string {
+  const stamp = run.completed_at || run.started_at || run.created_at
+  return stamp ? formatTimeAbs(stamp) || '—' : '—'
+}
+
+function openRun(run: AutonomyRun): void {
+  router.push(`/ai-runs/${run.id}`)
 }
 
 async function loadRuns(): Promise<void> {
@@ -320,6 +376,7 @@ const formRef = ref<FormInstance>()
 const hostOptions = ref<OptionItem[]>([])
 const sysUserOptions = ref<OptionItem[]>([])
 const optionsLoaded = ref(false)
+const budgetExpanded = ref(false)
 
 const form = reactive<DraftForm>({
   goal: '',
@@ -348,6 +405,7 @@ const rules: FormRules = {
 
 async function openCreate(): Promise<void> {
   dialogVisible.value = true
+  budgetExpanded.value = false
   if (optionsLoaded.value) return
   try {
     const [hostRes, userRes] = await Promise.all([
@@ -416,10 +474,10 @@ async function submitCreate(): Promise<void> {
   gap: 10px;
   flex-wrap: wrap;
 }
+.runs-search { width: min(360px, 100%); }
 .runs-filter-item { width: 220px; }
 .runs-count {
   margin-left: auto;
-  font-family: var(--ogs-mono);
   font-size: 12px;
   color: var(--ogs-text-tertiary);
 }
@@ -430,8 +488,11 @@ async function submitCreate(): Promise<void> {
   color: var(--ogs-text);
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   max-width: 420px;
+  line-height: 1.45;
 }
 .runs-goal-id, .runs-cell-sub {
   font-family: var(--ogs-mono);
@@ -439,6 +500,7 @@ async function submitCreate(): Promise<void> {
   color: var(--ogs-text-tertiary);
   margin-top: 2px;
 }
+.runs-narrow-meta { display: none; }
 .runs-mode {
   font-family: var(--ogs-mono);
   font-size: 12px;
@@ -447,6 +509,14 @@ async function submitCreate(): Promise<void> {
 .runs-time {
   font-size: 12px;
   color: var(--ogs-text-secondary);
+  white-space: nowrap;
+}
+.runs-time-abs {
+  display: block;
+  margin-top: 2px;
+  color: var(--ogs-text-tertiary);
+  font-family: var(--ogs-mono);
+  font-size: 10px;
   white-space: nowrap;
 }
 .runs-dialog-grid {
@@ -460,7 +530,42 @@ async function submitCreate(): Promise<void> {
   margin-top: 4px;
   line-height: 1.5;
 }
-.runs-budget-hint { margin-bottom: 8px; }
+.runs-mode-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  width: 100%;
+}
+.runs-mode-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid var(--ogs-border);
+  border-radius: 4px;
+  background: var(--ogs-bg);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.runs-mode-card:hover,
+.runs-mode-card.active {
+  border-color: var(--ogs-primary);
+  background: var(--ogs-primary-soft);
+}
+.runs-mode-card :deep(.el-radio) { margin-right: 0; }
+.runs-mode-card > span {
+  padding-left: 24px;
+  color: var(--ogs-text-tertiary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.runs-budget-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.runs-budget-head .runs-mode-hint { margin-top: 0; }
 .runs-budget-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -475,7 +580,26 @@ async function submitCreate(): Promise<void> {
 }
 @media (max-width: 900px) {
   .runs-dialog-grid { grid-template-columns: 1fr; }
+  .runs-mode-options { grid-template-columns: 1fr; }
   .runs-budget-grid { grid-template-columns: repeat(2, 1fr); }
   .runs-goal { max-width: 220px; }
+  .runs-narrow-meta {
+    min-width: 0;
+    margin-top: 7px;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 5px 7px;
+    color: var(--ogs-text-secondary);
+    font-size: 11px;
+  }
+  .runs-narrow-asset {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--ogs-mono);
+  }
+  .runs-narrow-meta :deep(.el-tag) { font-size: 10px; }
 }
 </style>

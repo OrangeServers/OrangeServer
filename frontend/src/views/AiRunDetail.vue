@@ -16,7 +16,13 @@
             <span class="run-detail-id">{{ runId }}</span>
           </div>
           <span class="page-eyebrow">{{ t('aiRuns.eyebrow') }}</span>
-          <h2 class="run-detail-goal">{{ snapshot?.goal || '—' }}</h2>
+          <h2 class="run-detail-goal" :title="snapshot?.goal || undefined">
+            {{ snapshot ? goalSummary : '—' }}
+          </h2>
+          <details v-if="snapshot && snapshot.goal.length > goalSummary.length" class="run-goal-details">
+            <summary>{{ t('aiRuns.detail.goalDetails') }}</summary>
+            <p>{{ snapshot.goal }}</p>
+          </details>
           <p class="page-subtitle run-detail-statusline">
             <el-tag
               v-if="snapshot" size="small" effect="light" round
@@ -80,11 +86,44 @@
         :description="t('aiRuns.detail.expiredHint')"
       />
 
+      <!-- 结论摘要：先给人读，再把原始事件和 Artifact 放到审计层。 -->
+      <section
+        v-if="snapshot.outcome || terminal"
+        class="panel run-conclusion"
+        :class="`is-${conclusionTone}`"
+      >
+        <div class="run-conclusion-head">
+          <div>
+            <div class="run-section-kicker">{{ t('aiRuns.detail.conclusion.eyebrow') }}</div>
+            <h3 class="run-conclusion-title">{{ conclusionTitle }}</h3>
+          </div>
+          <el-tag size="small" effect="light" round :type="conclusionTagType">
+            {{ conclusionTag }}
+          </el-tag>
+        </div>
+        <p class="run-conclusion-summary">{{ conclusionSummary }}</p>
+        <div class="run-conclusion-facts">
+          <span>
+            <strong>{{ stepCounts.succeeded }}/{{ stepCounts.total }}</strong>
+            {{ t('aiRuns.detail.conclusion.stepFact') }}
+          </span>
+          <span>
+            <strong>{{ stepCounts.verificationSucceeded }}/{{ stepCounts.verificationTotal }}</strong>
+            {{ t('aiRuns.detail.conclusion.verificationFact') }}
+          </span>
+          <span>
+            <strong>{{ evidence.length }}</strong>
+            {{ t('aiRuns.detail.conclusion.evidenceFact') }}
+          </span>
+        </div>
+      </section>
+
       <!-- 流程光标轨：六阶段完全由服务端快照推导 -->
-      <ol class="phase-rail" aria-label="phase rail">
+      <ol class="phase-rail" :aria-label="t('aiRuns.detail.phaseRail')">
         <li
           v-for="phase in phases" :key="phase.key"
           class="phase-node" :class="`is-${phase.state}`"
+          :aria-current="phase.state === 'active' ? 'step' : undefined"
         >
           <span class="phase-dot"><span class="phase-dot-core" /></span>
           <span class="phase-label">{{ t(`aiRuns.detail.phases.${phase.key}`) }}</span>
@@ -182,24 +221,49 @@
                       {{ stepStatusLabel(step.status) }}
                     </el-tag>
                   </div>
-                  <div class="run-step-summary">{{ step.summary }}</div>
-                  <div v-if="step.action_digest" class="run-step-digest run-mono">
-                    sha256:{{ step.action_digest }}
+                  <div class="run-step-title">{{ t(presentAutonomyStep(step).labelKey) }}</div>
+                  <div class="run-step-command">
+                    <span class="run-step-label">{{ t('aiRuns.detail.execution.action') }}</span>
+                    <code>{{ presentAutonomyStep(step).command }}</code>
                   </div>
-                  <div v-if="step.note" class="run-step-note">{{ step.note }}</div>
+                  <div class="run-step-result">
+                    <span class="run-step-label">{{ t('aiRuns.detail.execution.result') }}</span>
+                    <span>{{ stepExecutionText(step) }}</span>
+                  </div>
+                  <div v-if="stepArtifacts(step).length" class="run-step-artifacts">
+                    <span class="run-step-label">{{ t('aiRuns.detail.execution.evidence') }}</span>
+                    <button
+                      v-for="artifact in stepArtifacts(step)"
+                      :key="artifact.id"
+                      class="run-result-link"
+                      :disabled="artifact.expired"
+                      type="button"
+                      @click="openArtifact(artifact)"
+                    >
+                      {{ artifactActionLabel(artifact.kind) }}
+                    </button>
+                  </div>
+                  <details v-if="step.action_digest || step.note" class="run-audit-details">
+                    <summary>{{ t('aiRuns.detail.execution.auditDetails') }}</summary>
+                    <div v-if="step.note" class="run-step-note run-mono">{{ step.note }}</div>
+                    <div v-if="step.action_digest" class="run-step-digest run-mono">
+                      sha256:{{ step.action_digest }}
+                    </div>
+                  </details>
                 </div>
               </li>
             </ol>
           </section>
 
-          <section class="panel">
-            <div class="panel-head">
-              {{ t('aiRuns.detail.eventsTitle') }}
+          <details class="panel run-collapsible-panel" :open="snapshot.status === 'needs_attention'">
+            <summary class="panel-head run-collapsible-head">
+              <span>{{ t('aiRuns.detail.eventsTitle') }}</span>
+              <span class="run-collapsible-count run-mono">{{ events.length }}</span>
               <span class="run-stream-cursor run-mono">seq {{ lastSeq }}</span>
               <span class="run-stream-state" :class="`is-${streamState}`">
                 {{ streamStateText }}
               </span>
-            </div>
+            </summary>
             <div v-if="events.length === 0" class="run-empty">
               {{ t('aiRuns.detail.eventsEmpty') }}
             </div>
@@ -212,37 +276,58 @@
                 </div>
               </div>
             </div>
-          </section>
+          </details>
         </div>
 
         <!-- 右列：证据索引 + 产物 -->
         <aside class="run-detail-side">
-          <section class="panel">
-            <div class="panel-head">
-              {{ t('aiRuns.detail.evidenceTitle') }}
+          <details class="panel run-collapsible-panel" :open="evidence.length === 0">
+            <summary class="panel-head run-collapsible-head">
+              <span>{{ t('aiRuns.detail.evidenceTitle') }}</span>
+              <span class="run-collapsible-count run-mono">{{ evidence.length }}</span>
               <el-tooltip :content="t('aiRuns.detail.evidenceUntrusted')" placement="top">
                 <el-icon class="run-side-info"><InfoFilled /></el-icon>
               </el-tooltip>
-            </div>
+            </summary>
             <div v-if="evidence.length === 0" class="run-empty">
               {{ t('aiRuns.detail.evidenceEmpty') }}
             </div>
             <ul v-else class="run-evidence">
               <li v-for="item in evidence" :key="item.id" class="run-evidence-item">
                 <div class="run-evidence-line">
-                  <span class="run-evidence-kind run-mono">{{ item.kind }}</span>
+                  <span class="run-evidence-kind">{{ evidenceKindLabel(item.kind) }}</span>
                   <span class="run-evidence-time">{{ absTime(item.created_at) }}</span>
                 </div>
-                <div class="run-evidence-summary">{{ item.summary }}</div>
-                <div v-if="item.artifact_ids.length" class="run-evidence-refs run-mono">
+                <div class="run-evidence-meaning">{{ evidenceMeaning(item) }}</div>
+                <div class="run-evidence-result">{{ evidenceResult(item) }}</div>
+                <div v-if="evidenceArtifacts(item).length" class="run-evidence-actions">
+                  <button
+                    v-for="artifact in evidenceArtifacts(item)"
+                    :key="artifact.id"
+                    class="run-result-link"
+                    :disabled="artifact.expired"
+                    type="button"
+                    @click="openArtifact(artifact)"
+                  >
+                    {{ artifactActionLabel(artifact.kind) }}
+                  </button>
+                </div>
+                <div v-else-if="item.artifact_ids.length" class="run-evidence-refs">
                   {{ t('aiRuns.detail.evidenceRefs', { n: item.artifact_ids.length }) }}
                 </div>
+                <details class="run-audit-details">
+                  <summary>{{ t('aiRuns.detail.execution.rawEvidence') }}</summary>
+                  <div class="run-evidence-summary run-mono">{{ item.summary }}</div>
+                </details>
               </li>
             </ul>
-          </section>
+          </details>
 
-          <section class="panel">
-            <div class="panel-head">{{ t('aiRuns.detail.artifactsTitle') }}</div>
+          <details class="panel run-collapsible-panel">
+            <summary class="panel-head run-collapsible-head">
+              <span>{{ t('aiRuns.detail.artifactsTitle') }}</span>
+              <span class="run-collapsible-count run-mono">{{ artifacts.length }}</span>
+            </summary>
             <div v-if="artifacts.length === 0" class="run-empty">
               {{ t('aiRuns.detail.artifactsEmpty') }}
             </div>
@@ -252,8 +337,8 @@
                   class="run-artifact-open" :disabled="artifact.expired"
                   @click="openArtifact(artifact)"
                 >
-                  <span class="run-artifact-title">{{ artifact.title }}</span>
-                  <span class="run-artifact-kind run-mono">{{ artifact.kind }}</span>
+                  <span class="run-artifact-title">{{ artifactDisplayTitle(artifact) }}</span>
+                  <span class="run-artifact-kind">{{ artifactKindLabel(artifact.kind) }}</span>
                 </button>
                 <div class="run-artifact-meta">
                   <span class="run-mono">{{ formatBytes(artifact.size_bytes) }}</span>
@@ -266,7 +351,7 @@
                 </div>
               </li>
             </ul>
-          </section>
+          </details>
         </aside>
       </div>
     </template>
@@ -274,8 +359,8 @@
     <!-- 产物正文对话框（单条按需解密读取） -->
     <el-dialog
       v-model="artifactDialog.visible"
-      :title="t('aiRuns.detail.artifactContent')"
-      width="720px" destroy-on-close
+      :title="artifactDialog.title || t('aiRuns.detail.artifactContent')"
+      width="720px" append-to-body destroy-on-close
     >
       <div v-loading="artifactDialog.loading">
         <pre class="run-artifact-content run-mono">{{ artifactDialog.content }}</pre>
@@ -299,6 +384,14 @@ import type {
   AutonomyArtifact, AutonomyEvent, AutonomyEvidence, AutonomySnapshot, AutonomyStep,
 } from '@/types/autonomy'
 import { formatTimeAbs } from '@/utils/datetime'
+import {
+  artifactsForAutonomyStep,
+  autonomyArtifactLabelKey,
+  countAutonomySteps,
+  parseAutonomyStepExecutionNote,
+  presentAutonomyStep,
+  summarizeAutonomyGoal,
+} from '@/utils/autonomyPresentation'
 
 const route = useRoute()
 const router = useRouter()
@@ -419,7 +512,144 @@ function stopStream(): void {
 // ===== 证据 / 产物 =====
 const evidence = ref<AutonomyEvidence[]>([])
 const artifacts = ref<AutonomyArtifact[]>([])
-const artifactDialog = reactive({ visible: false, loading: false, content: '' })
+const artifactDialog = reactive({
+  visible: false,
+  loading: false,
+  content: '',
+  title: '',
+})
+
+const stepCounts = computed(() => countAutonomySteps(snapshot.value?.steps || []))
+const goalSummary = computed(() => summarizeAutonomyGoal(snapshot.value?.goal || '', 112))
+
+const conclusionTag = computed(() => {
+  const current = snapshot.value
+  if (!current) return '—'
+  return current.outcome
+    ? t(`aiRuns.outcome.${current.outcome}`)
+    : t(`aiRuns.status.${current.status}`)
+})
+
+const conclusionTagType = computed(() => {
+  const current = snapshot.value
+  return current?.outcome
+    ? outcomeTagType(current.outcome)
+    : statusTagType(current?.status || '')
+})
+
+const conclusionTone = computed<'success' | 'danger' | 'warning' | 'info'>(() => {
+  switch (snapshot.value?.outcome) {
+    case 'resolved': return 'success'
+    case 'not_resolved': return 'danger'
+    case 'inconclusive': return 'warning'
+    default: return 'info'
+  }
+})
+
+const conclusionTitle = computed(() => {
+  switch (snapshot.value?.outcome) {
+    case 'resolved': return t('aiRuns.detail.conclusion.resolvedTitle')
+    case 'not_resolved': return t('aiRuns.detail.conclusion.notResolvedTitle')
+    case 'inconclusive': return t('aiRuns.detail.conclusion.inconclusiveTitle')
+    default: return t('aiRuns.detail.conclusion.pendingTitle')
+  }
+})
+
+const conclusionSummary = computed(() => {
+  const current = snapshot.value
+  const counts = stepCounts.value
+  const params = {
+    succeeded: counts.succeeded,
+    total: counts.total,
+    failed: counts.failed,
+    verificationSucceeded: counts.verificationSucceeded,
+    verificationTotal: counts.verificationTotal,
+    status: current ? t(`aiRuns.status.${current.status}`) : '—',
+  }
+  switch (current?.outcome) {
+    case 'resolved': return t('aiRuns.detail.conclusion.resolvedSummary', params)
+    case 'not_resolved': return t('aiRuns.detail.conclusion.notResolvedSummary', params)
+    case 'inconclusive': return t('aiRuns.detail.conclusion.inconclusiveSummary', params)
+    default: return t('aiRuns.detail.conclusion.pendingSummary', params)
+  }
+})
+
+function stepForId(stepId: string | null): AutonomyStep | null {
+  if (!stepId) return null
+  return snapshot.value?.steps.find((step) => step.id === stepId) || null
+}
+
+function stepArtifacts(step: AutonomyStep): AutonomyArtifact[] {
+  return artifactsForAutonomyStep(artifacts.value, step.id)
+}
+
+function stepExecutionText(step: AutonomyStep): string {
+  const parsed = parseAutonomyStepExecutionNote(step.note || '')
+  let result: string
+  if (parsed.exitCode !== null) {
+    const code = t('aiRuns.detail.execution.exitCode', { code: parsed.exitCode })
+    result = parsed.exitCode === 0
+      ? `${t('aiRuns.detail.execution.completed')} · ${code}`
+      : `${t('aiRuns.detail.execution.failed')} · ${code}`
+  } else if (step.status === 'succeeded') {
+    result = t('aiRuns.detail.execution.completed')
+  } else if (step.status === 'failed') {
+    result = t('aiRuns.detail.execution.failed')
+  } else if (step.status === 'outcome_unknown') {
+    result = t('aiRuns.detail.execution.unknown')
+  } else if (['skipped', 'cancelled'].includes(step.status)) {
+    result = stepStatusLabel(step.status)
+  } else if (['proposed', 'waiting_approval', 'approved', 'running'].includes(step.status)) {
+    result = step.status === 'running'
+      ? t('aiRuns.detail.execution.running')
+      : t('aiRuns.detail.execution.pending')
+  } else {
+    result = stepStatusLabel(step.status)
+  }
+  return parsed.outputTruncated
+    ? `${result} · ${t('aiRuns.detail.execution.truncated')}`
+    : result
+}
+
+function evidenceKindLabel(kind: string): string {
+  if (kind === 'action_observation') return t('aiRuns.detail.evidenceKind.action')
+  if (kind === 'verification_observation') return t('aiRuns.detail.evidenceKind.verification')
+  return t('aiRuns.detail.evidenceKind.generic')
+}
+
+function evidenceMeaning(item: AutonomyEvidence): string {
+  const step = stepForId(item.step_id)
+  return step
+    ? t(presentAutonomyStep(step).labelKey)
+    : t('aiRuns.detail.evidenceKind.generic')
+}
+
+function evidenceResult(item: AutonomyEvidence): string {
+  const step = stepForId(item.step_id)
+  return step
+    ? stepExecutionText(step)
+    : t('aiRuns.detail.execution.evidenceObserved')
+}
+
+function evidenceArtifacts(item: AutonomyEvidence): AutonomyArtifact[] {
+  const ids = new Set(item.artifact_ids)
+  return artifacts.value.filter((artifact) => ids.has(artifact.id))
+}
+
+function artifactKindLabel(kind: string): string {
+  return t(`aiRuns.detail.artifactKind.${autonomyArtifactLabelKey(kind)}`)
+}
+
+function artifactActionLabel(kind: string): string {
+  return t(`aiRuns.detail.artifactAction.${autonomyArtifactLabelKey(kind)}`)
+}
+
+function artifactDisplayTitle(artifact: AutonomyArtifact): string {
+  const step = stepForId(artifact.step_id)
+  const action = step ? t(presentAutonomyStep(step).labelKey) : ''
+  const kind = artifactKindLabel(artifact.kind)
+  return action ? `${action} · ${kind}` : kind
+}
 
 async function reloadSidePanels(): Promise<void> {
   try {
@@ -438,6 +668,7 @@ async function openArtifact(artifact: AutonomyArtifact): Promise<void> {
   artifactDialog.visible = true
   artifactDialog.loading = true
   artifactDialog.content = ''
+  artifactDialog.title = artifactDisplayTitle(artifact)
   try {
     const detail = await getAutonomyArtifact(runId, artifact.id)
     artifactDialog.content = detail.content
@@ -683,6 +914,26 @@ onBeforeUnmount(() => {
 }
 .run-detail-goal {
   max-width: 760px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.run-goal-details {
+  max-width: 760px;
+  margin-top: 6px;
+  color: var(--ogs-text-secondary);
+  font-size: 12px;
+}
+.run-goal-details summary {
+  display: inline-block;
+  color: var(--ogs-primary);
+  cursor: pointer;
+}
+.run-goal-details p {
+  margin: 6px 0 0;
+  line-height: 1.55;
   overflow-wrap: anywhere;
 }
 .run-detail-statusline {
@@ -700,6 +951,59 @@ onBeforeUnmount(() => {
 
 /* ---- 横幅 ---- */
 .run-banner { border-radius: 4px; }
+
+/* ---- 结论：先回答“这次到底怎么样”，再展开审计细节 ---- */
+.run-conclusion {
+  padding: 16px 18px;
+  border-left: 4px solid var(--ogs-primary);
+  background: color-mix(in srgb, var(--ogs-primary) 4%, var(--ogs-surface));
+}
+.run-conclusion.is-success {
+  border-left-color: var(--ogs-success);
+  background: color-mix(in srgb, var(--ogs-success) 5%, var(--ogs-surface));
+}
+.run-conclusion.is-danger {
+  border-left-color: var(--ogs-danger);
+  background: color-mix(in srgb, var(--ogs-danger) 5%, var(--ogs-surface));
+}
+.run-conclusion.is-warning {
+  border-left-color: var(--ogs-warning);
+  background: color-mix(in srgb, var(--ogs-warning) 5%, var(--ogs-surface));
+}
+.run-conclusion-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.run-section-kicker {
+  font-size: 11px;
+  color: var(--ogs-text-tertiary);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.run-conclusion-title {
+  margin: 2px 0 0;
+  font-size: 18px;
+  line-height: 1.35;
+  color: var(--ogs-text);
+}
+.run-conclusion-summary {
+  margin: 10px 0 0;
+  max-width: 860px;
+  color: var(--ogs-text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.run-conclusion-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  margin-top: 12px;
+  color: var(--ogs-text-tertiary);
+  font-size: 12px;
+}
+.run-conclusion-facts strong { color: var(--ogs-text); font-family: var(--ogs-mono); }
 
 /* ---- 流程光标轨（signature）：六阶段服务端推导，活动阶段脉冲 ---- */
 .phase-rail {
@@ -847,6 +1151,19 @@ onBeforeUnmount(() => {
 }
 .run-detail-main { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 .run-detail-side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.run-collapsible-panel { overflow: hidden; }
+.run-collapsible-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+.run-collapsible-head::-webkit-details-marker { display: none; }
+.run-collapsible-count {
+  color: var(--ogs-text-tertiary);
+  font-size: 11px;
+}
 @media (max-width: 1100px) {
   .run-detail-columns { grid-template-columns: 1fr; }
   .run-meta-grid { grid-template-columns: repeat(2, 1fr); }
@@ -877,7 +1194,68 @@ onBeforeUnmount(() => {
 }
 .run-step-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .run-step-line { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.run-step-summary { font-size: 13px; color: var(--ogs-text); overflow-wrap: anywhere; }
+.run-step-title { font-size: 14px; font-weight: 700; color: var(--ogs-text); line-height: 1.4; }
+.run-step-command,
+.run-step-result {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.run-step-command {
+  padding: 7px 9px;
+  background: var(--ogs-bg);
+  border: 1px solid var(--ogs-border-subtle);
+  border-radius: 4px;
+}
+.run-step-command code {
+  min-width: 0;
+  color: var(--ogs-text);
+  font-family: var(--ogs-mono);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.run-step-result { color: var(--ogs-text-secondary); }
+.run-step-label {
+  color: var(--ogs-text-tertiary);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.run-step-artifacts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.run-result-link {
+  border: 1px solid color-mix(in srgb, var(--ogs-primary) 35%, var(--ogs-border));
+  border-radius: 4px;
+  padding: 2px 7px;
+  background: var(--ogs-surface);
+  color: var(--ogs-primary);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.run-result-link:hover { background: var(--ogs-primary-soft); }
+.run-result-link:disabled { cursor: not-allowed; opacity: 0.55; }
+.run-result-link:focus-visible {
+  outline: 2px solid var(--ogs-primary);
+  outline-offset: 2px;
+}
+.run-audit-details {
+  color: var(--ogs-text-tertiary);
+  font-size: 11px;
+}
+.run-audit-details summary {
+  cursor: pointer;
+  display: inline-block;
+  padding: 2px 0;
+}
+.run-audit-details summary:hover { color: var(--ogs-primary); }
 .run-step-digest {
   font-size: 11px;
   color: var(--ogs-text-tertiary);
@@ -915,8 +1293,6 @@ onBeforeUnmount(() => {
   background: color-mix(in srgb, var(--ogs-danger) 8%, transparent);
 }
 .run-timeline {
-  max-height: 420px;
-  overflow-y: auto;
   padding: 6px 0;
 }
 .run-event {
@@ -955,7 +1331,10 @@ onBeforeUnmount(() => {
   padding: 0 6px;
 }
 .run-evidence-time { font-size: 11px; color: var(--ogs-text-tertiary); }
-.run-evidence-summary { font-size: 12px; color: var(--ogs-text); overflow-wrap: anywhere; }
+.run-evidence-meaning { font-size: 12px; font-weight: 700; color: var(--ogs-text); }
+.run-evidence-result { font-size: 12px; color: var(--ogs-text-secondary); overflow-wrap: anywhere; }
+.run-evidence-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+.run-evidence-summary { font-size: 12px; color: var(--ogs-text); overflow-wrap: anywhere; padding-top: 4px; }
 .run-evidence-refs { font-size: 11px; color: var(--ogs-text-tertiary); }
 
 /* ---- 产物 ---- */
@@ -1004,5 +1383,15 @@ onBeforeUnmount(() => {
   font-size: 12px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .run-conclusion { padding: 14px; }
+  .run-conclusion-head { flex-direction: column; gap: 8px; }
+  .run-conclusion-title { font-size: 16px; }
+  .run-step { padding: 10px 12px; gap: 8px; }
+  .run-step-command,
+  .run-step-result { grid-template-columns: 1fr; gap: 2px; }
+  .run-artifact-open { align-items: flex-start; flex-direction: column; }
 }
 </style>

@@ -54,6 +54,19 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and `deny` can never be elevated by a model. Persisted v1 runs retain their
   original graph and legacy mode semantics for recovery.
 
+- The disabled-by-default autonomy workbench now leads with a server-authoritative
+  conclusion and presents each step as a readable action, command result, and
+  linked bounded Artifact. Raw Evidence summaries and action digests remain
+  available under audit disclosures; execution, authorization, and Evidence
+  trust semantics are unchanged.
+
+- AI operations pages now make the primary path easier to scan: the Run list has
+  search and an explicit details action, creation modes show their guidance
+  together, advanced limits are opt-in, and detail-page evidence, artifacts, and
+  audit events are collapsed until needed. Conversation technical identifiers
+  and backend error details are likewise disclosed on demand; the shared header
+  also stays legible on narrow screens.
+
 - The unreleased M1/S2 worker path now fences every claim, checkpoint write,
   and final write with a one-time lease token, continuously rescans
   recoverable runs, and fails closed when its Redis checkpoint store or a
