@@ -55,6 +55,7 @@ OrangeServer keeps day-to-day Linux operations inside one permission boundary:
 | Authorization | Map platform users/groups to assets/groups and system accounts |
 | Audit | Query login, command, and platform operation trails |
 | AI operations | Query authorized data, run fixed read-only diagnostics, and prepare batch actions that require human approval |
+| M1 controlled autonomy | In an isolated test environment, investigate, execute bounded changes, verify independently, and produce cited conclusions; disabled by default |
 | Bilingual UI | Full Chinese/English interface; switch instantly under Settings → Appearance & Language, persisted server-side |
 
 ## AI operations is not "handing the shell to a model"
@@ -86,6 +87,17 @@ diagnostic shell. Evidence is redacted, size-limited, and stored encrypted, and
 rule findings must cite evidence IDs from the current run. Any fix that changes
 host state still requires a separate approval-gated action. See
 [controlled read-only diagnostics](docs/ai/DIAGNOSTICS.md).
+
+M1/S3 also provides an administrator-only autonomy workbench (`/ai-runs`) for a
+single-host, recoverable Run: investigation, bounded changes, service operations,
+independent verification, and a cited conclusion. This is not a model-owned
+shell. The server fixes the target asset, system account, permission profile,
+budget, and action allowlist; write actions still follow `ask`/Guardian/human
+approval rules, and `auto` is restricted to assets marked `lab`. M1 is a
+disabled-by-default release candidate: the standard Compose release does not
+start its dedicated Redis 8 and Worker. Use the [AI operations guide](docs/ai/USER_GUIDE.md)
+and [release validation guide](docs/operations/BACKEND_IMAGE_RELEASE.md) for the
+isolated acceptance path.
 
 ## Quick start
 
@@ -164,6 +176,7 @@ flowchart LR
 - [Documentation index](docs/README.md)
 - [Deployment guide](DEPLOY.md)
 - [Upgrade procedure](docs/operations/UPGRADE.md)
+- [Backend image and deployment bundle release](docs/operations/BACKEND_IMAGE_RELEASE.md)
 - [Batch commands and scripts](docs/operations/BATCH_OPERATIONS.md)
 - [Configuration reference](CONFIG.md)
 - [AI operations guide](docs/ai/USER_GUIDE.md)
@@ -175,8 +188,10 @@ flowchart LR
 
 OrangeServer is under active development. The current AI capability covers
 permission-filtered platform queries, evidence-backed read-only Linux/Docker
-diagnostics, and approval-gated batch commands. External diagnostic adapters
-remain future work; see the [changelog](CHANGELOG.md) for released capabilities.
+diagnostics, approval-gated batch commands, and the disabled-by-default M1
+controlled-autonomy release candidate. External diagnostic adapters remain
+future work; see the [changelog](CHANGELOG.md) and [AI roadmap](docs/ai/ROADMAP.md)
+for the released/unreleased boundary.
 
 ## Security and support
 

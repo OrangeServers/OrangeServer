@@ -149,7 +149,7 @@ zh-CN，存量行为不变），rev52 增加由管理界面维护的 SMTP 配置
 保存 Fernet 密文，rev53 为 AI 自治（M1/S1）增加资产环境列与 Run/Step/事件/
 产物四张表；rev54 为自治 Run 表追加 Worker 租约、一次性 fencing token、心跳与
 图版本列（M1/S2），rev55 为自治 Run 表追加可选的自定义权限档案列，rev56 增加
-脱敏 Evidence 引用表（M1/S3，均未发布，集成分支预置）；自治功能默认关闭
+脱敏 Evidence 引用表（M1/S3，发布候选，默认关闭）；自治功能默认关闭
 （`OGS_AI_AUTONOMY_ENABLED` 不设置即无行为变化）。
 各脚本针对其自身变更设计了重复执行保护，但重复运行前仍应
 确认输出和目标数据库正确。
@@ -199,6 +199,8 @@ SHOW TABLES LIKE 't_ai_diagnostic_report';
 SHOW COLUMNS FROM t_ai_autonomous_run LIKE 'active_host_id';
 SHOW INDEX FROM t_ai_autonomous_run
 WHERE Key_name = 'uq_ai_auto_run_active_host';
+SHOW COLUMNS FROM t_ai_autonomous_run LIKE 'custom_profile_json';
+SHOW TABLES LIKE 't_ai_autonomous_evidence';
 
 SELECT
     provider_code,
@@ -219,6 +221,8 @@ ORDER BY provider_code;
 - 存在 4 张 `t_ai_diagnostic_*` 表及其外键；
 - `t_ai_autonomous_run.active_host_id` 是生成列，且存在
   `uq_ai_auto_run_active_host` 唯一索引；
+- `t_ai_autonomous_run.custom_profile_json` 和
+  `t_ai_autonomous_evidence` 存在；Evidence 的 `trusted` 默认值为 `0`；
 - 查询结果中不应出现明文 API Key。
 
 ## 5. 启动和冒烟验证

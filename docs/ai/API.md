@@ -1,6 +1,6 @@
 # AI REST 与 SSE 契约
 
-本文描述当前已经实现的 Provider、会话、只读诊断、聊天和动作接口。
+本文描述当前已经实现的 Provider、会话、只读诊断、自治任务、聊天和动作接口。
 
 ## 通用约定
 
@@ -9,7 +9,8 @@
 - JSON 请求使用 `Content-Type: application/json`。
 - JSON 成功响应沿用平台统一信封，业务数据同时可能出现在具名字段和 `data` 中。
 - 错误使用统一 `code`、`msg` 和相应 HTTP 状态。
-- SSE 接口使用 POST，因此浏览器通过 `fetch` 读取流，而不是 `EventSource`。
+- 聊天 SSE 使用 POST，因此浏览器通过 `fetch` 读取流；自治 Run 事件流使用 GET，
+  通过 `Last-Event-ID` 或 `after_seq` 续传。
 
 示例成功信封：
 
@@ -116,6 +117,105 @@ Run 的权威状态为 `queued`、`running`、`completed`、`partial`、`failed`
 `evidence_ids` 只能引用同一 Run 的证据。
 
 详情见 [受控只读诊断](DIAGNOSTICS.md)。
+
+## M1 自治任务 API（已实现，默认关闭）
+
+自治接口只对管理员开放，并且还受 `OGS_AI_AUTONOMY_ENABLED` 二次门控。标准发布
+Compose 栈不启动自治 Worker 或专用 Redis 8；未同时满足 feature flag、checkpoint
+和 Worker 就绪条件时，Run 不能启动。聊天只拥有创建草稿引用卡的能力，不能启动、
+审批或取消 Run。
+
+### 就绪状态与生命周期
+
+| 方法 | 路径 | 角色 | 说明 |
+|---|---|---|---|
+| GET | `/ai/autonomy/status` | admin/user | 返回 `enabled`、专用 Redis 配置、checkpoint、Worker 和 `ready` 布尔值，以及固定 `reason` 码 |
+| POST | `/ai/autonomous-runs` | admin | 校验目标资产、系统用户、模式和预算，创建 `draft` |
+| GET | `/ai/autonomous-runs` | admin | 当前管理员的 Run 列表 |
+| GET | `/ai/autonomous-runs/{run_id}` | admin | 当前管理员的权威快照、步骤和 `allowed_operations` |
+| POST | `/ai/autonomous-runs/{run_id}/start` | admin | 重新校验边界后将 `draft` 排入执行 |
+| POST | `/ai/autonomous-runs/{run_id}/cancel` | admin | 请求取消；远端停止被确认前不会虚报 `cancelled` |
+| POST | `/ai/autonomous-runs/{run_id}/steps` | admin | 提议服务端固定探针，不接受任意 Shell 作为探针参数 |
+| POST | `/ai/autonomous-runs/{run_id}/steps/{step_id}/decision` | admin | 对服务端返回的待审批 Step 作 `approve` 或 `reject` 决策 |
+| GET | `/ai/autonomous-runs/{run_id}/artifacts` | admin | 获取本 Run 的脱敏 Artifact 元数据 |
+| GET | `/ai/autonomous-runs/{run_id}/artifacts/{artifact_id}` | admin | 读取单条未过期 Artifact 的解密正文 |
+| GET | `/ai/autonomous-runs/{run_id}/evidence` | admin | 获取本 Run 的不可信 Evidence 引用 |
+| GET | `/ai/autonomous-runs/{run_id}/stream` | admin | 按事件序号续传 SSE；支持 `after_seq` 或 `Last-Event-ID` |
+| POST | `/ai/autonomy/hosts/{host_id}/environment` | admin | 设置资产的 `production`、`staging` 或 `lab` 环境 |
+
+创建草稿：
+
+```json
+{
+  "goal": "检查示例资产上的磁盘使用率并在确认后修复服务配置",
+  "host_id": 12,
+  "system_user_id": 7,
+  "mode": "ask",
+  "budget": {
+    "duration_seconds": 3600,
+    "max_loops": 20,
+    "max_actions": 30,
+    "command_timeout_seconds": 60,
+    "step_output_bytes": 65536,
+    "run_artifact_bytes": 2097152
+  }
+}
+```
+
+`mode` 可用 `ask`、`ai_review`、`auto`、`custom`。`custom` 还必须提交服务端白名单
+动作类别组成的 `profile`；`auto` 只有资产环境为 `lab` 时允许。服务端会重新解析
+和限制预算，调用方不能用请求体抬高硬上限。
+
+步骤决策请求严格只有两个业务字段，`operation` 必须来自当前快照的
+`allowed_operations`，不能使用旧快照或客户端自定义动作：
+
+```json
+{
+  "operation": "approve",
+  "expected_revision": 4
+}
+```
+
+### 快照、事件和结论
+
+Run 快照包含目标和凭据的服务端绑定、权限模式、预算、状态、三态结论、`revision`、
+`graph_version`、最新事件序号、取消请求和时间戳；每个 Step 包含 `kind`、状态、顺序、
+人类可读摘要、动作 digest 和受限备注。`GET /ai/autonomous-runs/{run_id}` 返回的
+`steps` 按 `seq` 排序，`allowed_operations` 为空表示当前没有待决策操作。
+
+状态集合：
+
+- Run：`draft | queued | running | waiting_approval | recovering | needs_attention | completed | failed | cancelled | expired`
+- Outcome：`resolved | not_resolved | inconclusive`
+- Step：`proposed | waiting_approval | approved | running | succeeded | failed | skipped | outcome_unknown | cancelled`
+- Step kind：`plan | action | verification`
+
+SSE 事件使用 MySQL 内的 Run 级单调 `sequence`。客户端断线后应先重新获取权威快照，
+再从最后一个已处理序号续传；收到 `terminal` 事件后仍应重新获取最终快照。快照比
+聊天文本、SSE 增量和 Redis checkpoint 更权威。
+
+结论由服务端 Planner/Worker 写入，不提供客户端直接改写结论的接口。`resolved` 必须
+至少引用同一 Run 的 `verification_observation`；存在 `outcome_unknown` 写动作或缺少
+独立验证时，服务端会降级为 `inconclusive`，绝不自动重放写动作。
+
+### M1 持久化数据结构
+
+全新安装由 `backend/mysqldir/orange.sql` 一次创建；已有实例按
+[统一升级流程](../operations/UPGRADE.md) 依次执行 rev53、rev54、rev55、rev56。表是
+业务事实源，Redis 8 只保存 LangGraph checkpoint 和 Celery broker 数据。
+
+| 表/字段 | 用途 | 关键约束 |
+|---|---|---|
+| `t_host.ai_environment` | 资产环境 | `production\|staging\|lab`，默认 `production`，仅管理员维护 |
+| `t_ai_autonomous_run` | Run 权威快照 | 目标资产/系统用户、`mode`/`custom_profile_json`、状态/结论、预算、`revision`/事件游标、租约 fencing、心跳和 `graph_version`；活动状态按 `active_host_id` 唯一约束封住同资产并行 Run |
+| `t_ai_autonomous_step` | 有序计划、动作和验证 | `(run_id, seq)` 唯一；保存不可变动作摘要/digest、审批状态和有限备注 |
+| `t_ai_autonomous_event` | Run 内追加式事件 | `(run_id, sequence)` 唯一且单调；payload 不保存凭据 |
+| `t_ai_autonomous_artifact` | 加密执行产物 | 输出清洗、脱敏、限长后以 Fernet 密文保存；正文单条读取并按 `expires_at` 过期 |
+| `t_ai_autonomous_evidence` | 观察索引 | 只保存有界摘要和同 Run Artifact ID 列表；`trusted` 恒为 `0`，不是结论凭据 |
+
+凭据、完整 Prompt、完整远端输出和可复用的授权不会写入 Graph State、Event payload
+或 Evidence 摘要。所有读取接口都会重新检查当前管理员和 Run 所有权；跨 Run 的
+Artifact/Evidence ID 不能成为访问凭证。
 
 ## 聊天 SSE
 

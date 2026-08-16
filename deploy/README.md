@@ -46,7 +46,8 @@ make docker-dev-reset
 make docker-dev-up
 ```
 
-M1 自治能力尚未发布且默认关闭。仅在隔离开发/验收环境中，将 `.env.dev` 的
+M1 自治能力是默认关闭的发布候选。标准 bundled/host 发布路径不启动自治 Worker
+或专用 Redis 8；仅在隔离开发/验收环境中，将 `.env.dev` 的
 `OGS_AI_AUTONOMY_ENABLED` 显式改为 `true` 后运行：
 
 ```bash
@@ -58,7 +59,8 @@ Celery Worker；backend 与 Worker 使用同一个由当前源码构建的本地
 保持不变。初始化脚本会生成独立的 `OGS_AI_AUTONOMY_REDIS_PASSWORD`；旧的
 `.env.dev` 若缺少该项，启动目标会拒绝继续并提示补齐。启动后用
 `make docker-dev-autonomy-ps` 查看 Worker 和 Redis 8。不要在普通用户部署中启用
-这个覆盖层。
+这个覆盖层。完整的从零发布和 M1 验收命令见
+[`docs/operations/BACKEND_IMAGE_RELEASE.md`](../docs/operations/BACKEND_IMAGE_RELEASE.md)。
 
 开发默认入口为 `http://127.0.0.1:8081`，后端调试端口为 `28001`。源码目录
 分别 bind mount 到 backend 与 Vite frontend；数据库、Redis、后端运行时数据和

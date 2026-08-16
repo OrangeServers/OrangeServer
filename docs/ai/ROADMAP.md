@@ -1,8 +1,9 @@
 # AI 运维路线图
 
-> 本文描述 OrangeServer AI 运维的规划方向和后续工作包，不代表这些能力已经发布。
-> 当前可用行为以 [AI 运维使用指南](USER_GUIDE.md)、
-> [受控只读诊断](DIAGNOSTICS.md) 和 [AI REST/SSE 契约](API.md) 为准。
+> 本文同时记录已实现的 M1/S3 受控自治和后续规划。M1/S3 当前是默认关闭的发布候选
+> 能力，尚未在标准发布部署中启用；当前可用行为以
+> [AI 运维使用指南](USER_GUIDE.md)、[受控只读诊断](DIAGNOSTICS.md) 和
+> [AI REST/SSE 契约](API.md) 为准。
 
 ## 目标与边界
 
@@ -29,8 +30,9 @@ M0 是已经发布的能力：
 - 批量命令预览、人工审批、执行结果和审计；
 - 256K 标准上下文与 Provider 声明支持时可选的 1M 深度诊断档。
 
-当前诊断不能提交自由 Shell，修复也不会由诊断流程自动执行。后文中的自治接口、
-页面、状态和数据表均处于规划状态。
+当前诊断不能提交自由 Shell，修复也不会由诊断流程自动执行。M1/S3 另提供独立的
+自治任务工作台，但必须显式打开 feature flag，并配置专用 Redis 8 与 Worker；标准
+发布栈保持关闭时，现有聊天、诊断和批量审批行为不变。
 
 ## 长期里程碑
 
@@ -88,8 +90,8 @@ M0 是已经发布的能力：
 
 ### 产品形态
 
-M1 增加独立的自治任务工作台，前端规划路由为 `/ai-runs` 和
-`/ai-runs/:runId`。现有 AI 对话最终只增加“创建自治任务草稿”和“打开任务”的引用卡；
+M1 增加独立的自治任务工作台，已实现路由为 `/ai-runs` 和
+`/ai-runs/:runId`。现有 AI 对话只增加“创建自治任务草稿”和“打开任务”的引用卡；
 模型不能从聊天直接启动任务。
 
 v1 仅管理员可用，一次 Run 固定一个目标资产、一个系统用户和一个 Agent。Run 启动后，
@@ -115,12 +117,13 @@ WP0 优先验证官方 shallow Redis saver 是否满足 interrupt、resume 和�
 
 ### 最小领域模型
 
-新增四张表：
+新增五张表：
 
 - `t_ai_autonomous_run`
 - `t_ai_autonomous_step`
 - `t_ai_autonomous_event`
 - `t_ai_autonomous_artifact`
+- `t_ai_autonomous_evidence`
 
 资产增加服务端管理的 `ai_environment=production|staging|lab`，默认 `production`，
 只有管理员可以修改。审批字段保存在对应 Step 中，不再拆分 Action、Approval 或
@@ -219,9 +222,11 @@ M1 不承诺通用自动回滚。结构化文件补丁必须有备份并可恢�
 - 长日志始终外置为 Artifact，通过 Evidence 检索和分层摘要按需进入上下文；
 - 记录模型 usage、finish reason、耗时和截断原因，但不保存完整敏感 Prompt。
 
-### 规划接口
+### 已实现接口（默认关闭）
 
-以下接口已在集成分支实验性实现，随 feature flag 关闭，正式发布前仍可能变化：
+以下接口已实现，但只有管理员且在 `OGS_AI_AUTONOMY_ENABLED` 显式打开时才允许创建、
+启动或推进 Run。`GET /ai/autonomy/status` 始终可用于区分 feature flag、专用 Redis
+checkpoint 和 Worker 是否就绪；接口字段以 [AI REST/SSE 契约](API.md) 为准。
 
 | 方法 | 路径 | 行为 |
 |---|---|---|
@@ -247,10 +252,11 @@ decision 请求只提交 `{operation, expected_revision}`，且 operation 必须
 | S2 执行与恢复 | 专用 Redis、Celery、LangGraph `allow/ask/deny` 路由、数据库租约、checkpoint fail-closed、可取消 SSH、写意图和未知结果 | 真实 MySQL/Redis/Worker 下通过重复投递、强杀、取消和 checkpoint 丢失测试 |
 | S3 规划、证据与产品闭环 | Planner、一次计划授权、可选 Guardian、脱敏 Evidence、独立 Verification、三态 Outcome、REST/SSE、工作台和聊天引用 | 已通过完成门；能力仍默认关闭，发布部署另行审批 |
 
-S3 完成门状态（2026-08-14）：已在隔离测试机完成真实模型驱动的调查、计划审批、
-文件变更、服务重启、两次独立验证和 Evidence 结论闭环；本地后端测试、前端类型检查、
-生产构建、前端测试、文档检查和桌面/窄屏视觉抽查均已通过。该结果证明未发布实现
-满足当前完成门，不等于打开 feature flag 或进入发布部署。
+S3 实现状态（发布收口）：Planner、计划审批、受控动作、服务重启、独立验证、Evidence
+结论、REST/SSE 和工作台已合入 M1 集成分支。最终 PR 还必须分别完成本地代码门禁、
+全新 schema/部署包门禁、隔离 Compose 自治 smoke 和浏览器验收；这些证据不能由旧的
+CI 结果、普通聊天 draft 或“容器已启动”替代。feature flag 仍默认关闭，真实发布与
+生产启用是后续独立操作。
 
 依赖顺序：
 
@@ -267,6 +273,11 @@ S3 完成门状态（2026-08-14）：已在隔离测试机完成真实模型驱�
 MySQL/LangGraph/Redis/Celery 的职责、审批规则或恢复语义；需要改变时另开设计复核。
 
 ## M1 最终验收
+
+发布前验收按两层记录：标准发布路径验证从零安装、schema、镜像和前端静态产物；M1
+自治路径在独立的 Redis 8、Worker 和测试资产上验证执行、恢复、审批和结论。可复制的
+命令入口见[后端镜像与部署包发布](../operations/BACKEND_IMAGE_RELEASE.md)和
+[部署手册](../../DEPLOY.md)。
 
 每个阶段运行相关后端或前端测试；S3 在本地运行完整后端测试、前端类型检查、生产
 构建、新增的最小 Vitest 和 Compose 集成测试，不依赖远端 CI 额度。

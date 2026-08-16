@@ -24,7 +24,8 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and resumable SSE contracts for runs, an administrator workbench
   (`/ai-runs`), and chat draft reference cards that can never start, approve
   or cancel runs. The feature remains gated behind
-  `OGS_AI_AUTONOMY_ENABLED` and is not part of a release deployment.
+  `OGS_AI_AUTONOMY_ENABLED`; the standard release deployment keeps it off and
+  does not start the dedicated Redis 8/Worker pair.
 
 ### Fixed
 

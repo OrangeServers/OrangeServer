@@ -282,6 +282,10 @@ AI 运维会话默认使用 256K；只有能力标记为 1M 的 Provider 才能�
 | `OGS_AI_AUTONOMY_LEASE_TTL_SECONDS` | `120` | ❌ | Worker 租约有效期，服务端硬下限 10 秒 |
 | `OGS_AI_AUTONOMY_APPROVAL_TTL_SECONDS` | `86400` | ❌ | draft 和待审批步骤有效期，服务端硬下限 60 秒 |
 
+M1 自治相关变量只在隔离开发/验收栈中成组设置；标准发布 Compose 不提供自治 Redis 8
+和 Worker，保持 `OGS_AI_AUTONOMY_ENABLED` 为空。启动覆盖层、就绪状态和从零验收命令
+见[部署手册](DEPLOY.md)与[发布验收说明](docs/operations/BACKEND_IMAGE_RELEASE.md)。
+
 默认支持 OpenAI、Anthropic、xAI、DeepSeek、MiniMax、Kimi、Qwen、GLM 和硅基流动。一个 Provider
 配置一个模型；管理员可以读取厂商模型列表，也可以直接填写模型 ID。Anthropic 原生 API 非
 OpenAI 兼容，需通过中转代理（如 OpenRouter）接入；xAI 原生兼容。

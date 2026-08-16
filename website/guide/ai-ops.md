@@ -18,6 +18,20 @@ diagnostics, and prepares batch actions that always require human approval.
   approval card; nothing executes until a human approves it.
 - **Answer in your language** — replies follow the interface language setting.
 
+## M1 controlled autonomy (release candidate)
+
+M1 adds an administrator-only workbench at `/ai-runs` for a single-host,
+recoverable Run: investigate, perform bounded changes, restart a service when
+approved, verify independently, and produce a cited conclusion. The server
+fixes the target, system account, permission profile, budget, and action
+allowlist; the model never receives an unrestricted shell. `auto` is restricted
+to assets explicitly marked `lab`.
+
+This capability is disabled by default. The standard release Compose stack does
+not start the dedicated Redis 8 and Worker; enable it only in an isolated
+development or acceptance environment with the setup described in the
+[repository AI guide](https://github.com/OrangeServers/OrangeServer/blob/main/docs/ai/USER_GUIDE.md).
+
 ## What it cannot do
 
 - It cannot run SQL or open a shell.
