@@ -6,7 +6,8 @@ service-manager paths are advanced references for operators who need them.
 
 ## Docker Compose (recommended)
 
-Four containers (frontend, backend, MySQL, and Redis) start with one command.
+Six containers (frontend, backend, autonomy worker, autonomy Redis, MySQL, and
+Redis) start with one command.
 This is the path described in [Getting started](/guide/getting-started).
 
 For a new installation, run the version-pinned launcher from the stable
@@ -15,13 +16,13 @@ GitHub Release:
 ```bash
 set -o pipefail
 curl -fsSL \
-  https://github.com/OrangeServers/OrangeServer/releases/download/v1.0.4/bootstrap-compose.sh \
-  | sudo bash -s -- --version v1.0.4
+  https://github.com/OrangeServers/OrangeServer/releases/download/v1.1.1/bootstrap-compose.sh \
+  | sudo bash -s -- --version v1.1.1
 ```
 
 The launcher downloads and verifies the matching deployment bundle, generates
 the MySQL and Redis infrastructure passwords, and starts the published
-`ghcr.io/orangeservers/orangeserver-backend:v1.0.4` image. Application
+`ghcr.io/orangeservers/orangeserver-backend:v1.1.1` image. Application
 settings—including the administrator, SMTP, and AI providers—remain in the
 browser-based `/setup` wizard. Review the launcher first if your environment
 does not permit piping downloaded scripts to a shell.
@@ -30,8 +31,8 @@ For mainland China, use the fixed-tag Gitee launcher available from v1.0.3:
 
 ```bash
 set -o pipefail
-curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.0.4/ops/bootstrap-compose-cn.sh \
-  | sudo bash -s -- --version v1.0.4
+curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.1.1/ops/bootstrap-compose-cn.sh \
+  | sudo bash -s -- --version v1.1.1
 ```
 
 This route uses the Tencent Cloud TCR backend image and digest-pinned DaoCloud
