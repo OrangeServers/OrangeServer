@@ -95,7 +95,37 @@ chmod 600 "${next_dir}/.env" "${next_dir}/backend/.env" \
 rm -rf -- "${work_dir}"
 ```
 
-目标 bundle 包含 `CHANGELOG.md`、本文和数据库迁移 SQL。先比较当前
+
+从 v1.1.1 起，标准 bundled 栈新增专用自治 Redis 与 Worker 服务，Compose 对
+`OGS_AI_AUTONOMY_REDIS_PASSWORD` 做强校验。从更早版本升级时，复制过来的旧
+`.env` 不含这些键，直接启动会报 `Set OGS_AI_AUTONOMY_REDIS_PASSWORD` 并中止。
+启动前必须为新目录补齐（幂等，可重复执行）：
+
+```bash
+autonomy_redis_password="$(openssl rand -hex 24)"
+for env_file in "${next_dir}/.env" "${next_dir}/backend/.env"; do
+    grep -q '^OGS_AI_AUTONOMY_ENABLED=' "$env_file" \
+        || printf 'OGS_AI_AUTONOMY_ENABLED=true
+' >> "$env_file"
+    grep -q '^OGS_AI_AUTONOMY_REDIS_HOST=' "$env_file" \
+        || printf 'OGS_AI_AUTONOMY_REDIS_HOST=autonomy-redis
+' >> "$env_file"
+    grep -q '^OGS_AI_AUTONOMY_REDIS_PORT=' "$env_file" \
+        || printf 'OGS_AI_AUTONOMY_REDIS_PORT=6379
+' >> "$env_file"
+    grep -q '^OGS_AI_AUTONOMY_REDIS_PASSWORD=' "$env_file" \
+        || printf 'OGS_AI_AUTONOMY_REDIS_PASSWORD=%s
+' "$autonomy_redis_password" >> "$env_file"
+done
+chmod 600 "${next_dir}/.env" "${next_dir}/backend/.env"
+```
+
+自治 Redis 镜像默认为 `redis/redis-stack-server:7.4.0-v3`（Docker Hub 引用，
+由 `daemon.json` 的 `registry-mirrors` 加速直拉）。无加速器且无法访问
+Docker Hub 的网络，先把该镜像转存到内部仓库，再在根 `.env` 设置
+`OGS_AUTONOMY_REDIS_IMAGE` 指向转存地址。
+
+目标 bundle 目标 bundle 包含 `CHANGELOG.md`、本文和数据库迁移 SQL。先比较当前
 `.orangeserver-version` 与目标版本说明，只执行跨越版本所要求的迁移。
 
 不要先删除旧镜像。保留一个已验证的应用镜像作为回滚点；具体标签和环境路径只
@@ -149,8 +179,8 @@ zh-CN，存量行为不变），rev52 增加由管理界面维护的 SMTP 配置
 保存 Fernet 密文，rev53 为 AI 自治（M1/S1）增加资产环境列与 Run/Step/事件/
 产物四张表；rev54 为自治 Run 表追加 Worker 租约、一次性 fencing token、心跳与
 图版本列（M1/S2），rev55 为自治 Run 表追加可选的自定义权限档案列，rev56 增加
-脱敏 Evidence 引用表（M1/S3，发布候选，默认关闭）；自治功能默认关闭
-（`OGS_AI_AUTONOMY_ENABLED` 不设置即无行为变化）。
+  脱敏 Evidence 引用表（M1/S3）。标准 bundled 栈会启动专用 Redis Stack 与
+  Worker，自治能力默认可用。
 各脚本针对其自身变更设计了重复执行保护，但重复运行前仍应
 确认输出和目标数据库正确。
 

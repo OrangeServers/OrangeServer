@@ -67,6 +67,7 @@ from app.ai.autonomy.state import (
     RunStatus,
     StepKind,
     StepStatus,
+    TERMINAL_RUN_STATUSES,
     assert_run_transition,
     assert_step_transition,
     normalize_run_mode,
@@ -400,8 +401,16 @@ class AutonomyDriver:
         return self.worker_id or worker_identity()
 
     def _fail_run(self, run, event_type, note):
-        """前置条件失败：Run 落终态 failed + 事件，释放租约。"""
+        """前置条件失败：Run 落终态 failed + 事件，释放租约。
+
+        幂等：若 Run 已被其他路径推到终态（cancel/complete/expire），
+        直接释放租约返回，不再重复写状态。
+        """
         run = self._lock_current_claim(run.id)
+        if run.status in {s.value for s in TERMINAL_RUN_STATUSES}:
+            self._clear_claim(run)
+            self.repo._commit()
+            return
         assert_run_transition(run.status, RunStatus.FAILED.value)
         run.status = RunStatus.FAILED.value
         run.completed_at = run.completed_at or _utcnow()

@@ -13,6 +13,7 @@ BACKEND_IMAGE="ghcr.io/orangeservers/orangeserver-backend"
 NGINX_IMAGE="nginx:1.25-alpine"
 REDIS_IMAGE="redis:7.4-alpine"
 MYSQL_IMAGE="mysql:8.0.42"
+AUTONOMY_REDIS_IMAGE="redis/redis-stack-server:7.4.0-v3"
 
 usage() {
     cat <<'EOF'
@@ -26,6 +27,7 @@ runs the repository preflight, and calls make docker-up-image.
 
 Advanced registry overrides:
   --nginx-image REF --redis-image REF --mysql-image REF
+  --autonomy-redis-image REF
 EOF
 }
 
@@ -76,6 +78,10 @@ while [ "$#" -gt 0 ]; do
             MYSQL_IMAGE="${2:-}"
             shift 2
             ;;
+        --autonomy-redis-image)
+            AUTONOMY_REDIS_IMAGE="${2:-}"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -119,6 +125,7 @@ validate_image_ref() {
 validate_image_ref --nginx-image "$NGINX_IMAGE"
 validate_image_ref --redis-image "$REDIS_IMAGE"
 validate_image_ref --mysql-image "$MYSQL_IMAGE"
+validate_image_ref --autonomy-redis-image "$AUTONOMY_REDIS_IMAGE"
 [ "$(id -u)" -eq 0 ] || fail "run this installer as root (for example through sudo)"
 
 for command in docker find make openssl sed tar sha256sum mktemp; do
@@ -198,6 +205,7 @@ set_key() {
 mysql_root_password="$(openssl rand -hex 24)"
 mysql_app_password="$(openssl rand -hex 24)"
 redis_password="$(openssl rand -hex 24)"
+autonomy_redis_password="$(openssl rand -hex 24)"
 
 set_key .env COMPOSE_PROJECT_NAME "$PROJECT_NAME"
 set_key .env OGS_BACKEND_IMAGE "$BACKEND_IMAGE"
@@ -205,6 +213,7 @@ set_key .env OGS_BACKEND_TAG "$VERSION"
 set_key .env OGS_NGINX_IMAGE "$NGINX_IMAGE"
 set_key .env OGS_REDIS_IMAGE "$REDIS_IMAGE"
 set_key .env OGS_MYSQL_IMAGE "$MYSQL_IMAGE"
+set_key .env OGS_AUTONOMY_REDIS_IMAGE "$AUTONOMY_REDIS_IMAGE"
 set_key .env OGS_HTTP_PORT "$HTTP_PORT"
 set_key .env MYSQL_ROOT_PASSWORD "$mysql_root_password"
 set_key .env OGS_MYSQL_HOST mysql
@@ -215,6 +224,10 @@ set_key .env OGS_MYSQL_PASSWORD "$mysql_app_password"
 set_key .env OGS_REDIS_HOST redis
 set_key .env OGS_REDIS_PORT 6379
 set_key .env OGS_REDIS_PASSWORD "$redis_password"
+set_key .env OGS_AI_AUTONOMY_ENABLED true
+set_key .env OGS_AI_AUTONOMY_REDIS_HOST autonomy-redis
+set_key .env OGS_AI_AUTONOMY_REDIS_PORT 6379
+set_key .env OGS_AI_AUTONOMY_REDIS_PASSWORD "$autonomy_redis_password"
 set_key .env OGS_HTTPS false
 
 set_key backend/.env OGS_ENV prod
@@ -228,6 +241,10 @@ set_key backend/.env OGS_MYSQL_PASSWORD "$mysql_app_password"
 set_key backend/.env OGS_REDIS_HOST redis
 set_key backend/.env OGS_REDIS_PORT 6379
 set_key backend/.env OGS_REDIS_PASSWORD "$redis_password"
+set_key backend/.env OGS_AI_AUTONOMY_ENABLED true
+set_key backend/.env OGS_AI_AUTONOMY_REDIS_HOST autonomy-redis
+set_key backend/.env OGS_AI_AUTONOMY_REDIS_PORT 6379
+set_key backend/.env OGS_AI_AUTONOMY_REDIS_PASSWORD "$autonomy_redis_password"
 set_key backend/.env OGS_CSRF_ALLOWED_ORIGINS ""
 set_key backend/.env OGS_CORS_ORIGINS ""
 set_key backend/.env OGS_HTTPS false

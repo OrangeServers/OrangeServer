@@ -125,6 +125,7 @@ run_canonical() {
     expect_file_contains "$record" "OGS_NGINX_IMAGE=nginx:1.25-alpine"
     expect_file_contains "$record" "OGS_REDIS_IMAGE=redis:7.4-alpine"
     expect_file_contains "$record" "OGS_MYSQL_IMAGE=mysql:8.0.42"
+    expect_file_contains "$record" "OGS_AUTONOMY_REDIS_IMAGE=redis/redis-stack-server:7.4.0-v3"
 }
 
 run_canonical "canonical-default" \
@@ -144,11 +145,13 @@ TEST_RECORD="$custom_record" PATH="${FAKE_BIN}:${PATH}" "$CANONICAL_INSTALLER" \
     --nginx-image "mirror.example.test/nginx:1.25" \
     --redis-image "mirror.example.test/redis@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
     --mysql-image "registry.example.test:5000/mysql:8.0" \
+    --autonomy-redis-image "mirror.example.test/redis-stack-server:7.4.0-v3" \
     >"${TEST_ROOT}/canonical-images.out" 2>&1 \
     || fail "canonical installer failed for image overrides"
 expect_file_contains "$custom_record" "OGS_NGINX_IMAGE=mirror.example.test/nginx:1.25"
 expect_file_contains "$custom_record" "OGS_REDIS_IMAGE=mirror.example.test/redis@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 expect_file_contains "$custom_record" "OGS_MYSQL_IMAGE=registry.example.test:5000/mysql:8.0"
+expect_file_contains "$custom_record" "OGS_AUTONOMY_REDIS_IMAGE=mirror.example.test/redis-stack-server:7.4.0-v3"
 
 expect_failure "--backend-image must be an untagged lowercase container image path" \
     "$CANONICAL_INSTALLER" \
@@ -170,6 +173,10 @@ expect_failure "--mysql-image must be a lowercase tagged or digest-pinned contai
     "$CANONICAL_INSTALLER" \
     --version "$VERSION" \
     --mysql-image "registry.example.test:5000/mysql"
+expect_failure "--autonomy-redis-image must be a lowercase tagged or digest-pinned container image reference" \
+    "$CANONICAL_INSTALLER" \
+    --version "$VERSION" \
+    --autonomy-redis-image "https://example.invalid/redis-stack-server:latest"
 
 cat > "${FAKE_BIN}/git" <<'EOF'
 #!/bin/bash
@@ -241,6 +248,8 @@ expect_file_contains "$CN_INSTALL_ARGS" "--redis-image"
 expect_file_contains "$CN_INSTALL_ARGS" "m.daocloud.io/docker.io/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2"
 expect_file_contains "$CN_INSTALL_ARGS" "--mysql-image"
 expect_file_contains "$CN_INSTALL_ARGS" "m.daocloud.io/docker.io/library/mysql@sha256:63823b8e2cbe4ae0c558155e02d00beba56130fbc3d147efccbdb328ae2dbb9e"
+expect_file_contains "$CN_INSTALL_ARGS" "--autonomy-redis-image"
+expect_file_contains "$CN_INSTALL_ARGS" "m.daocloud.io/docker.io/redis/redis-stack-server@sha256:7d8e657d60d525534d6abe96e7645ab30ef1b4f1ffedc6eeb2d4d4283b3a49b9"
 expect_file_contains "$CN_INSTALL_ARGS" "--bundle-file"
 expect_file_contains "$CN_INSTALL_ARGS" "--checksum-file"
 expect_file_contains "$CN_INSTALL_ARGS" "--install-dir"
@@ -256,6 +265,7 @@ TEST_INSTALL_ARGS="${TEST_ROOT}/cn-override-installer-args" \
 OGS_CN_NGINX_IMAGE="mirror.example.test/nginx:1.25" \
 OGS_CN_REDIS_IMAGE="mirror.example.test/redis:7.4" \
 OGS_CN_MYSQL_IMAGE="mirror.example.test/mysql:8.0" \
+OGS_CN_AUTONOMY_REDIS_IMAGE="mirror.example.test/redis-stack-server:7.4.0-v3" \
 PATH="${FAKE_BIN}:${PATH}" \
 "$CN_INSTALLER" \
     --version "$VERSION" \
@@ -264,6 +274,7 @@ PATH="${FAKE_BIN}:${PATH}" \
 expect_file_contains "${TEST_ROOT}/cn-override-installer-args" "mirror.example.test/nginx:1.25"
 expect_file_contains "${TEST_ROOT}/cn-override-installer-args" "mirror.example.test/redis:7.4"
 expect_file_contains "${TEST_ROOT}/cn-override-installer-args" "mirror.example.test/mysql:8.0"
+expect_file_contains "${TEST_ROOT}/cn-override-installer-args" "mirror.example.test/redis-stack-server:7.4.0-v3"
 
 expect_failure "unknown argument: --backend-image" \
     "$CN_INSTALLER" --version "$VERSION" --backend-image example.invalid/image

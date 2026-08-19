@@ -35,8 +35,8 @@ tar -tzf "release-assets/orangeserver-deploy-vX.Y.Z.tar.gz" \
 ```
 
 M1 自治还要单独使用隔离的 MySQL、业务 Redis 7、自治 Redis 8、Worker 和 SSH 测试
-资产验证；标准发布栈只验证 feature flag 默认关闭，不把普通 Compose 启动误报为
-自治闭环。源码 exact-HEAD smoke 的入口是：
+资产验证。标准发布栈现在包含专用 Redis 与 Worker；从零安装应能直接使用自治
+工作台并看到就绪状态，不要把“容器已启动”单独当成自治闭环。源码 exact-HEAD smoke 的入口是：
 
 ```powershell
 pwsh -File ops/smoke-ai-autonomy-s2.ps1 -ExpectedHead <40-hex-commit>

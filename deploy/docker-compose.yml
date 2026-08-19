@@ -1,15 +1,17 @@
 # =============================================================================
 # OrangeServer docker-compose — 生产编排
 # =============================================================================
-# 服务（4 个, 2 模式）:
-#   - backend    Flask + gunicorn（gevent worker）
-#   - frontend   nginx serve dist/
-#   - redis      会话缓存 / CSRF token / 速率限制  [profile: bundled]
-#   - mysql      业务数据库                          [profile: bundled]
+# 服务（bundled 6 个）:
+#   - backend          Flask + gunicorn（gevent worker）
+#   - frontend         nginx serve dist/
+#   - redis            业务 Redis 7（会话/CSRF）     [profile: bundled]
+#   - mysql            业务数据库                      [profile: bundled]
+#   - autonomy-redis   自治 Redis Stack（checkpoint） [profile: bundled]
+#   - autonomy-worker  同一后端镜像的 Celery Worker   [profile: bundled]
 #
 # 用法（两种部署模式）:
 #
-# 模式 A: bundled 模式（容器化自包含, 4 服务全起）
+# 模式 A: bundled 模式（容器化自包含, 6 服务全起）
 #   docker compose --env-file .env -f deploy/docker-compose.yml --profile bundled up -d --build
 #
 # 模式 B: 外部 MySQL/Redis（只起 backend + frontend）
@@ -47,6 +49,10 @@ services:
       OGS_REDIS_HOST: ${OGS_REDIS_HOST:-redis}
       OGS_REDIS_PORT: ${OGS_REDIS_PORT:-6379}
       OGS_REDIS_PASSWORD: ${OGS_REDIS_PASSWORD:-}
+      OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-true}
+      OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-autonomy-redis}
+      OGS_AI_AUTONOMY_REDIS_PORT: ${OGS_AI_AUTONOMY_REDIS_PORT:-6379}
+      OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_AI_AUTONOMY_REDIS_PASSWORD:-}
       # REV48 (P1-12): 试运行改 false, Secure cookie 不被写入 HTTP; 正式生产用 LB/nginx 终止 TLS 后改回 true
       OGS_HTTPS: "${OGS_HTTPS:-false}"
     depends_on:
@@ -56,6 +62,9 @@ services:
         condition: service_healthy
         required: false
       mysql:
+        condition: service_healthy
+        required: false
+      autonomy-redis:
         condition: service_healthy
         required: false
     healthcheck:
@@ -159,6 +168,83 @@ services:
       timeout: 5s
       retries: 10
 
+  autonomy-redis:
+    image: ${OGS_AUTONOMY_REDIS_IMAGE:-redis/redis-stack-server:7.4.0-v3}
+    profiles: ["bundled"]
+    restart: unless-stopped
+    networks:
+      - ogs-internal
+    environment:
+      OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_AI_AUTONOMY_REDIS_PASSWORD:?Set OGS_AI_AUTONOMY_REDIS_PASSWORD}
+      REDIS_ARGS: >-
+        --requirepass ${OGS_AI_AUTONOMY_REDIS_PASSWORD:?Set OGS_AI_AUTONOMY_REDIS_PASSWORD}
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory-policy noeviction
+    volumes:
+      - autonomy-redis-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - sh
+        - -c
+        - redis-cli -a "$$OGS_AI_AUTONOMY_REDIS_PASSWORD" ping | grep -q PONG
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  autonomy-worker:
+    image: ${OGS_BACKEND_IMAGE:-orangeserver-backend}:${OGS_BACKEND_TAG:-latest}
+    profiles: ["bundled"]
+    restart: unless-stopped
+    working_dir: /app
+    networks:
+      - ogs-internal
+    env_file:
+      - ../backend/.env
+    environment:
+      OGS_ENV: prod
+      OGS_MYSQL_HOST: ${OGS_MYSQL_HOST:-mysql}
+      OGS_MYSQL_PORT: ${OGS_MYSQL_PORT:-3306}
+      OGS_MYSQL_DBNAME: ${OGS_MYSQL_DBNAME:-orange}
+      OGS_MYSQL_USER: ${OGS_MYSQL_USER:-app_user}
+      OGS_MYSQL_PASSWORD: ${OGS_MYSQL_PASSWORD}
+      OGS_REDIS_HOST: ${OGS_REDIS_HOST:-redis}
+      OGS_REDIS_PORT: ${OGS_REDIS_PORT:-6379}
+      OGS_REDIS_PASSWORD: ${OGS_REDIS_PASSWORD:-}
+      OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-true}
+      OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-autonomy-redis}
+      OGS_AI_AUTONOMY_REDIS_PORT: ${OGS_AI_AUTONOMY_REDIS_PORT:-6379}
+      OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_AI_AUTONOMY_REDIS_PASSWORD:-}
+    command:
+      - celery
+      - -A
+      - app.ai.autonomy.celery_entry:celery_app
+      - worker
+      - --loglevel=INFO
+      - --concurrency=1
+    volumes:
+      - backend-data:/app/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+        required: false
+      redis:
+        condition: service_healthy
+        required: false
+      autonomy-redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          celery -A app.ai.autonomy.celery_entry:celery_app inspect ping
+          --destination "celery@$$HOSTNAME" --timeout 2 | grep -q pong
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
 networks:
   ogs-internal:
     driver: bridge
@@ -168,4 +254,6 @@ volumes:
     driver: local
   # REV48 (P1-6): backend 运行时数据 (SSH 私钥 / 头像 / 上传 / 日志) 持久化
   backend-data:
+    driver: local
+  autonomy-redis-data:
     driver: local

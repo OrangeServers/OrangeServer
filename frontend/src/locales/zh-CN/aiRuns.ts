@@ -5,7 +5,7 @@ export default {
   eyebrow: 'AUTONOMY',
   subtitle: '以服务端权威状态监督 AI 在资产上的每次自治运行',
   create: '新建任务草稿',
-  featureDisabled: '自治任务功能未启用：请在服务端配置 OGS_AI_AUTONOMY_ENABLED 后重启服务。',
+  featureDisabled: '自治任务当前不可用。标准安装默认启用；请确认专用 Redis 与 Worker 已启动。',
   notReady: '基础设施未就绪（{reason}），任务启动后不会被执行；草稿仍可创建。',
   reason: {
     ready: '就绪',

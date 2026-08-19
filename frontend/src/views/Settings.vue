@@ -917,7 +917,7 @@ async function loadSettings(): Promise<void> {
 
 async function reloadActiveTab(): Promise<void> {
   if (activeTab.value === 'ai') {
-    await loadAiProviders()
+    await Promise.all([loadSettings(), loadAiProviders()])
     return
   }
   if (activeTab.value === 'notification') {

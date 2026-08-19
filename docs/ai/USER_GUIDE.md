@@ -87,14 +87,12 @@ Agent 只创建待审批动作。执行卡会展示命令、目标数量、系�
 
 ![诊断证据抽屉（脱敏示例数据）](../images/ai-diagnostic-evidence.png)
 
-## 自治任务工作台（M1/S3，发布候选，默认关闭）
+## 自治任务工作台
 
 启用 M1 自治功能后，管理员可以在 `/ai-runs` 创建和查看单资产自治任务，
 并在 `/ai-runs/:runId` 查看服务端权威的计划、执行、审批、证据、验证和结论。
-该能力已实现但默认关闭，标准发布 Compose 栈不会启动自治 Worker 或专用 Redis 8。
-只应在隔离的开发/验收环境中，同时配置 `OGS_AI_AUTONOMY_ENABLED=true`、专用 Redis 8
-和自治 Worker；任一基础设施未就绪时，服务端会阻止启动。启动隔离开发栈的命令见
-[部署手册](../../DEPLOY.md)和[后端镜像与部署包发布](../operations/BACKEND_IMAGE_RELEASE.md)。
+标准 bundled 安装会启动专用 Redis Stack 与 Worker，自治任务默认可用。
+基础设施未就绪时服务端会阻止启动。
 
 开始前确认：管理员账号、已通过 Tool Calling 测试的 Provider、一个明确标记为
 `production`、`staging` 或 `lab` 的测试资产、已授权系统用户，以及与业务 Redis 7

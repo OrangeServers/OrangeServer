@@ -106,6 +106,13 @@ def test_compose_bootstrap_is_a_versioned_checksumming_thin_wrapper():
     assert "openssl rand -hex" in bootstrap
     assert "OGS_FLASK_SECRET_KEY \"\"" in bootstrap
     assert "OGS_FERNET_KEYS \"\"" in bootstrap
+    assert 'autonomy_redis_password="$(openssl rand -hex 24)"' in bootstrap
+    assert 'set_key .env OGS_AI_AUTONOMY_ENABLED true' in bootstrap
+    assert 'set_key .env OGS_AI_AUTONOMY_REDIS_HOST autonomy-redis' in bootstrap
+    assert (
+        'set_key .env OGS_AI_AUTONOMY_REDIS_PASSWORD '
+        '"$autonomy_redis_password"'
+    ) in bootstrap
     assert "docker volume inspect" in bootstrap
     assert "docker build" not in bootstrap
     assert "down -v" not in bootstrap
@@ -119,6 +126,26 @@ def test_compose_bootstrap_is_a_versioned_checksumming_thin_wrapper():
 def test_compose_does_not_force_global_container_names():
     compose = (DEPLOY / "docker-compose.yml").read_text(encoding="utf-8")
     assert "container_name:" not in compose
+
+
+def test_standard_compose_starts_autonomy_redis_and_worker():
+    compose = (DEPLOY / "docker-compose.yml").read_text(encoding="utf-8")
+    env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+    backend_env = (REPO_ROOT / "backend" / ".env.example").read_text(
+        encoding="utf-8",
+    )
+    assert "  autonomy-redis:" in compose
+    assert "  autonomy-worker:" in compose
+    assert "redis/redis-stack-server:7.4.0-v3" in compose
+    assert "app.ai.autonomy.celery_entry:celery_app" in compose
+    assert compose.count(
+        "OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-true}",
+    ) == 2
+    assert "OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-autonomy-redis}" in compose
+    assert "autonomy-redis-data:" in compose
+    assert "OGS_AI_AUTONOMY_ENABLED=" in env_example
+    assert "OGS_AI_AUTONOMY_REDIS_PASSWORD=" in env_example
+    assert "OGS_AI_AUTONOMY_ENABLED=" in backend_env
 
 
 def test_release_bundle_contains_all_compose_runtime_inputs():

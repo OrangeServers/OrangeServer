@@ -55,7 +55,7 @@ OrangeServer keeps day-to-day Linux operations inside one permission boundary:
 | Authorization | Map platform users/groups to assets/groups and system accounts |
 | Audit | Query login, command, and platform operation trails |
 | AI operations | Query authorized data, run fixed read-only diagnostics, and prepare batch actions that require human approval |
-| M1 controlled autonomy | In an isolated test environment, investigate, execute bounded changes, verify independently, and produce cited conclusions; disabled by default |
+| M1 controlled autonomy | Investigate, execute bounded changes, verify independently, and produce cited conclusions |
 | Bilingual UI | Full Chinese/English interface; switch instantly under Settings → Appearance & Language, persisted server-side |
 
 ## AI operations is not "handing the shell to a model"
@@ -93,11 +93,10 @@ single-host, recoverable Run: investigation, bounded changes, service operations
 independent verification, and a cited conclusion. This is not a model-owned
 shell. The server fixes the target asset, system account, permission profile,
 budget, and action allowlist; write actions still follow `ask`/Guardian/human
-approval rules, and `auto` is restricted to assets marked `lab`. M1 is a
-disabled-by-default release candidate: the standard Compose release does not
-start its dedicated Redis 8 and Worker. Use the [AI operations guide](docs/ai/USER_GUIDE.md)
-and [release validation guide](docs/operations/BACKEND_IMAGE_RELEASE.md) for the
-isolated acceptance path.
+  approval rules, and `auto` is restricted to assets marked `lab`. The standard
+  bundled install starts the dedicated Redis and Worker; autonomous runs are
+  available by default. See the
+  [AI operations guide](docs/ai/USER_GUIDE.md).
 
 ## Quick start
 
