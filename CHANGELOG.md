@@ -3,7 +3,14 @@
 Notable user-visible changes are recorded here. This project follows the
 principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## [1.1.1] - 2026-08-19
+
+### Added
+
+- `bootstrap-compose.sh --autonomy-redis-image` registry override; the China
+  entry point mirrors the autonomy Redis Stack image by default.
+- UPGRADE.md documents the `OGS_AI_AUTONOMY_*` environment keys required
+  when upgrading an existing bundled installation.
 
 ### Changed
 
@@ -11,6 +18,13 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Celery Worker using the same backend image. Autonomous runs are on by
   default; `OGS_AI_AUTONOMY_ENABLED=false` remains an emergency process
   kill switch.
+
+### Fixed
+
+- Run detail cancel button: the v1.1.0 dist was built from sources missing
+  the `doCancel` handler, so the button rendered but did nothing.
+- Cancelling a run whose worker lease has expired now releases the host
+  lock immediately; terminal-state run failure handling is idempotent.
 
 ## [1.1.0] - 2026-08-19
 
