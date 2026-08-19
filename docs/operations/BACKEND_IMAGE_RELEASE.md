@@ -1,14 +1,25 @@
-# 后端容器镜像发布
+# 发布流程（Release runbook）
 
-正式版本的后端镜像由 `.github/workflows/publish-backend-image.yml` 从稳定标签
-构建。`publish` job 仅在公开的规范仓库中运行；私有归档或 Fork 即使手动触发也
-不会发布镜像。
+本文是 OrangeServer 从「代码就绪」到「版本公开发布」的权威流程。发布者必须按顺序
+执行每一节，在每节末尾确认对应验证门通过后再进入下一步。任何偏离（例如跳过全新
+安装验证、直接改 main）都应在 Release 说明中显式记录原因。
 
-## 发布前收口门
+核心约束（先记住这几条）：
 
-在创建稳定 tag 前，先在目标 commit 的干净工作树执行以下门禁。`vX.Y.Z` 只是待
-发布版本占位符，不要把它替换成已经发布过的 tag；稳定 tag 和 Release 资产均不可
-覆盖。
+- **双 registry 分离**：GHCR（国际）由 CI 推送，TCR（国内）由发布者本地 WSL 推送。
+  境外 CI 无法推送到境内 TCR（实测 `PROTOCOL_ERROR` 空转超时），两者 digest 独立构建、
+  **不强制一致**。
+- **稳定 tag 与资产不可覆盖**：tag、GHCR 版本标签、Release 资产一旦存在就不删除、不
+  移动；出问题改用新的补丁版本。
+- **版本号不是单一来源**：散落在多处，发布时必须用 `ops/bump-release-version.sh` 统一
+  刷新（见「版本号收敛」）。
+- **隐私边界**：内网 IP、部署机账号、SSH 凭据绝不出现在仓库、文档、日志或提交中，
+  示例一律用 `<deploy-host>` 这类占位符。
+
+## 1. 发布前收口门
+
+在目标 commit 的干净工作树执行以下门禁（`vX.Y.Z` 是待发布版本占位符，不要替换成已
+发布过的 tag）：
 
 ```bash
 git status --short --branch
@@ -22,139 +33,146 @@ cd ../frontend
 npm ci --no-audit --no-fund
 npm run build
 cd ..
-
-# 生成与正式工作流相同的版本化部署包，并在发布前校验包名和摘要。
-rm -rf release-assets
-bash ops/build-deploy-bundle.sh --version vX.Y.Z --output-dir release-assets
-(
-  cd release-assets
-  sha256sum -c "orangeserver-deploy-vX.Y.Z.tar.gz.sha256"
-)
-tar -tzf "release-assets/orangeserver-deploy-vX.Y.Z.tar.gz" \
-  | grep -E '^(orangeserver/)?(backend/mysqldir/orange.sql|frontend/dist/index.html|ops/bootstrap-compose.sh)$'
 ```
 
-M1 自治还要单独使用隔离的 MySQL、业务 Redis 7、自治 Redis 8、Worker 和 SSH 测试
-资产验证。标准发布栈现在包含专用 Redis 与 Worker；从零安装应能直接使用自治
-工作台并看到就绪状态，不要把“容器已启动”单独当成自治闭环。源码 exact-HEAD smoke 的入口是：
+M1 自治还要用隔离的 MySQL、业务 Redis、自治 Redis Stack、Worker 和 SSH 测试资产做
+smoke；从零安装必须能直接使用自治工作台并看到就绪状态，不要把「容器已启动」当成
+自治闭环。入口：
 
 ```powershell
 pwsh -File ops/smoke-ai-autonomy-s2.ps1 -ExpectedHead <40-hex-commit>
 pwsh -File ops/smoke-ai-autonomy-s3.ps1 -ExpectedHead <40-hex-commit>
 ```
 
-两个脚本都会从 Git archive 构造 disposable 栈，并在成功后清理专属容器、网络、
-卷和临时镜像；执行前工作树必须干净。它们验证的是 M1 隔离执行/恢复和聊天草稿边界，
-不替代真实 Provider 凭据下的人工 Run 验收。
+**全新安装的 setup 前状态必须专项验证**：未走 `/setup` 向导前，autonomy-worker 应
+保持 `Up` 且日志为「等待配置就绪」，而不是 crash-loop。这是 v1.1.1 修复过的问题，
+回归时最容易漏。
 
-## 首次公开发布
+## 2. 版本号收敛
 
-1. 确认仓库已经公开，并完成发布前的全量验收。
-2. 创建并推送稳定 SemVer 标签，再为同一标签创建 **Draft Release**，例如
-   `v1.0.0`，暂时不要发布。工作流会在构建镜像前验证 Draft Release 已存在。
-3. 手动运行 `Publish backend image`，输入该 tag。工作流从 tag 重新构建前端、
-   构建 `linux/amd64` 后端镜像，并推送
-   `ghcr.io/orangeservers/orangeserver-backend:v1.0.0`。配置国内镜像发布后，同一次
-   构建还会推送
-   `ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend:v1.0.0`，并验证两个
-   registry 的 digest 完全一致。项目不发布 `latest`；如果 GHCR 已存在同名版本
-   标签，工作流会在构建前拒绝覆盖。
-4. 工作流把国际版和中国大陆版引导器（`bootstrap-compose.sh`、
-   `bootstrap-compose-cn.sh`）以及带 SHA256 的 Compose 部署包附加到
-   Draft Release。已存在的同名资产不会被覆盖；SHA256 用于发现下载损坏，发布者
-   真实性仍依赖固定 tag、GitHub 仓库权限和 Release 管理权限。
-5. 首次推送后，在 GitHub Packages 中把 package 设为 **Public**，从未登录 GHCR
-   的机器验证镜像匿名拉取，并下载部署包复核 SHA256。
-6. 上述验证全部完成后才把 Draft Release 发布，避免用户看到尚未就绪的下载入口。
-7. 将部署 `.env` 中的 `OGS_BACKEND_IMAGE` 和 `OGS_BACKEND_TAG` 指向已验证的
-   版本，然后执行 `make docker-up-image`。
+版本号硬编码在以下文件中，发布时必须全部刷新（`ops/bump-release-version.sh` 一键
+完成）：
 
-## 发布命令
-
-合并到 `main` 并完成收口门后，使用同一个稳定版本号完成 tag、Draft Release、镜像
-和部署包发布。以下命令需要有仓库写权限；不会自动发布 Draft Release：
+- `website/.vitepress/theme/installCommands.ts`（global + china 两处安装命令）
+- `website/guide/deployment.md`
+- `website/guide/getting-started.md`
+- `website/zh/guide/deployment.md`
+- `website/zh/guide/getting-started.md`
+- `README.md`
+- `README.zh-CN.md`
+- `backend/Dockerfile`（`org.opencontainers.image.version` LABEL，不带 `v` 前缀）
 
 ```bash
-release_version=vX.Y.Z
-git switch main
-git pull --ff-only origin main
-git tag -a "$release_version" -m "Release $release_version"
-git push origin "$release_version"
-# 大陆一键安装读取 Gitee 同名 tag；把同一 annotated tag 推到
-# https://gitee.com/orangeservers/OrangeServer 后再发布该线路。
-gh release create "$release_version" --draft --title "OrangeServer $release_version" \
-  --generate-notes
-gh workflow run "Publish backend image" --ref main \
-  -f tag="$release_version"
-gh run watch
-gh release view "$release_version" --json isDraft,assets,tagName
+bash ops/bump-release-version.sh <旧版本> <新版本>
+# 例：bash ops/bump-release-version.sh v1.1.1 v1.2.0
 ```
 
-确认 GHCR/TCR（若启用）镜像 digest、部署包 SHA256、Gitee 同名 tag、全新安装和
-浏览器健康检查均通过后，再显式发布 Release。随后把 README 与官网中英
-getting-started/deployment 里的安装版本钉从旧稳定版改到该 tag；未打 tag 前不要
-改这些入口。合入 `main` 后确认 GitHub Pages 工作流已发布官网。
+注意：`v1.0.3` 这类「功能自某版本起提供」的历史标记不要动，脚本只替换当前稳定
+版本号。刷新后跑一次 check-docs 确认无残留旧版本引用（`.playwright-mcp/`、`dist/`、
+`node_modules/` 属于构建/测试产物，不在检查范围）。
 
-确认上述检查通过后，再显式发布 Release：
+## 3. 双 registry 发布
+
+### 3.1 GHCR（国际，CI 推送）
+
+`ghcr.io/orangeservers/orangeserver-backend` 由
+`.github/workflows/publish-backend-image.yml` 从稳定 tag 构建并推送。该 workflow 校验
+GitHub Release 存在（draft 或已发布均可）且 GHCR 同名 tag 不存在（不可覆盖）。
+
+### 3.2 TCR（国内，本地 WSL 推送）
+
+`ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend` 由发布者本地 WSL 构建并推送。
+境外 CI 无法推送到境内 TCR，因此不要依赖 CI 完成这一步：
 
 ```bash
-gh release edit "$release_version" --draft=false
+wsl -d <wsl-发行版> -u root -e bash -c '
+  rm -rf /root/ogs-build && mkdir -p /root/ogs-build
+  cp -r /mnt/<源码路径>/backend /root/ogs-build/
+  cd /root/ogs-build
+  docker build -t ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend:vX.Y.Z backend/
+  docker push ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend:vX.Y.Z
+'
 ```
 
-如果 GHCR 已成功而 TCR 或 Release 附件阶段中断，使用工作流的恢复输入重新运行，
-不要移动稳定 tag、删除 GHCR 镜像或覆盖同名资产：
+要点：
 
-```bash
-gh workflow run "Publish backend image" --ref main \
-  -f tag="$release_version" -f tcr_sync_only=true
-```
+- 用 `wsl -u root`（root 有 docker socket 和 TCR 登录；普通用户可能在 docker 组之外）。
+- 源码先 `cp` 进 Linux 文件系统再 build（`/mnt/...` 9p 挂载读得慢）。
+- 两个 registry 是独立构建环境，digest 会不同，**这是预期，不是错误**。
+
+### 3.3 发布后验证
+
+两个 registry 都从未 `docker login` 的环境各做一次匿名拉取，确认平台为 `linux/amd64`、
+镜像能启动到 healthy。国内链路再跑一次「从零安装验证」（见第 4 节）。
+
+## 4. 发布步骤 checklist
+
+假设代码已合并到 main 且收口门全绿，`vX.Y.Z` 为待发布版本：
+
+1. **刷版本号**：`bash ops/bump-release-version.sh <旧> vX.Y.Z`，提交推 PR 合入 main。
+2. **打 tag + Draft Release**：
+   ```bash
+   git switch main && git pull --ff-only origin main
+   git tag -a vX.Y.Z -m "Release vX.Y.Z"
+   git push origin vX.Y.Z
+   # 大陆线路读 Gitee 同名 tag，需同步到 Gitee 镜像
+   gh release create vX.Y.Z --draft --title "OrangeServer vX.Y.Z" --generate-notes
+   ```
+3. **CI 推 GHCR**：`gh workflow run "Publish backend image" --ref main -f tag=vX.Y.Z`，
+   watch 到成功，确认 GHCR 匿名拉取成功。
+4. **本地 WSL 推 TCR**（见 3.2），确认 TCR 匿名拉取成功。
+5. **构建部署包并附加到 Release**：workflow 生成 `bootstrap-compose.sh`、
+   `bootstrap-compose-cn.sh`、deploy tarball 和 sha256 并挂到 Draft Release。
+6. **从零安装验证**（见下）——这一步不可跳过。
+7. **发布**：`gh release edit vX.Y.Z --draft=false`。
+8. **确认官网**：合入 main 后 GitHub Pages workflow 重新发布官网，核对安装命令已是
+   新版本。
 
 ### 从零安装验证
 
-发布后在一次性主机或独立 Compose project 使用固定版本引导器；不要在已有实例上
-用这条命令覆盖安装目录：
+在一次性主机（或独立 Compose project）用固定版本引导器，不要覆盖已有实例。
+
+国内线路（大陆机器，走 Gitee + TCR + DaoCloud）：
 
 ```bash
 set -o pipefail
-curl -fsSL \
-  "https://github.com/OrangeServers/OrangeServer/releases/download/${release_version}/bootstrap-compose.sh" \
-  | sudo bash -s -- \
-      --version "$release_version" \
-      --project-name orangeserver_release_check \
-      --install-dir /opt/orangeserver-release-check \
-      --port 18082
+curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/vX.Y.Z/ops/bootstrap-compose-cn.sh \
+  | sudo bash -s -- --version vX.Y.Z
 ```
 
-安装完成后，先确认 `/local/health` 返回 HTTP 200，再完成 `/setup`，检查登录、
-资产、审计、AI Provider 和固定只读诊断。M1 自治的标准发布验证仍应保持
-`OGS_AI_AUTONOMY_ENABLED` 为空；要验收自治，请回到隔离 smoke 或开发覆盖层。
+国际线路（境外机器，走 GitHub + GHCR）：
 
-## 启用腾讯云 TCR 同步发布
+```bash
+set -o pipefail
+curl -fsSL https://github.com/OrangeServers/OrangeServer/releases/download/vX.Y.Z/bootstrap-compose.sh \
+  | sudo bash -s -- --version vX.Y.Z
+```
 
-在规范 GitHub 仓库中配置以下 Actions Secrets：
+安装后验证：6 容器全部 `Up`，backend/mysql/redis/autonomy-redis healthy；setup 完成
+前 worker 保持等待、不 crash-loop（见第 1 节）；`/local/health` 返回 200；完成
+`/setup` 后登录、资产、审计、AI Provider、只读诊断正常。
 
-- `TCR_USERNAME`：腾讯云账号 ID（UIN）。
-- `TCR_PASSWORD`：TCR 个人版实例的访问密码。
+## 5. 已知坑（踩过，别重蹈）
 
-确认目标仓库
-`ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend` 为公有仓库后，再设置
-Actions Variable `TCR_ENABLED=true`。未设置该变量时，发布工作流只推送 GHCR；
-因此 Fork 和尚未配置 TCR 凭据的仓库不会意外尝试国内发布。
+- **交接不可信**：接手发布时先跑收口门和合同测试验证「已提交/已通过」的说法，别
+  直接往下走。历史上出现过「声称全完成但 6 文件未提交、PR 挂自带测试」。
+- **CI 推不了 TCR**：境外 runner 连境内 registry 网络不通，TCR 只能本地 WSL 推。
+- **升级路径 env 增补**：新增服务引入 `:?` 强校验的 env 键时，必须同步更新
+  `docs/operations/UPGRADE.md`，否则旧实例升级 `docker compose up` 会硬失败。
+- **合同测试与 CI 耦合**：`test_clean_deploy_contract.py` 断言 workflow 的守卫字符串，
+  改 workflow 时同步改该测试，否则 CI 红。
+- **全新安装 setup 前状态**：worker 不能 crash-loop，要等待配置就绪。
 
-每次发布后必须从未执行 `docker login` 的环境拉取 TCR 版本，并确认匿名拉取
-成功、平台为 `linux/amd64`、digest 与 GHCR 相同。Secrets 只用于推送，不能写入
-仓库、Release 附件、日志或部署文档。
+## 6. 隐私边界
 
-不要在仓库仍私有时手工公开镜像：Python 镜像包含应用源码，公开镜像基本等同于
-提前公开后端代码。
+- 内网 IP、部署机账号、SSH 私钥、数据库密码、API Key、Fernet/Flask secret **绝不**
+  进入仓库、文档、日志、Release 说明或提交。示例一律用 `<deploy-host>` 占位。
+- TCR 公开镜像地址（`ccr.ccs.tencentyun.com/xuwei777/...`）是 CN 安装的功能必需项，
+  公开仓库可见、只能匿名拉取不能推送，允许出现在安装脚本和文档中；推送凭据只放
+  本地或 CI secrets。
 
-## 发布失败
+## 发布失败恢复
 
-工作流会 checkout 输入的稳定标签，而不是用默认分支内容冒充版本。如果失败发生在
-上传资产之前，可以排除故障后重试；一旦 Draft Release 已包含任何同名资产，不要
-覆盖或移动该标签，修复后改用新的补丁版本。已经发布的 Release 会被工作流拒绝。
-
-如果 GHCR 版本标签已经成功发布，但腾讯云 TCR 同步或 Release 附件阶段中断，不要
-删除 GHCR 镜像或移动稳定标签。重新运行 `Publish backend image`，输入原版本并启用
-`tcr_sync_only`；工作流会复用现有 GHCR manifest，通过 registry-to-registry 复制
-恢复 TCR，并继续生成 Release 附件，不重新构建或覆盖 GHCR。
+workflow checkout 输入的稳定 tag。若 GHCR 已成功而资产上传中断，重跑 workflow（原
+tag）即可，不要删除 GHCR 镜像或移动 tag；若 tag 已存在且内容有误，改用新补丁版本，
+绝不覆盖。

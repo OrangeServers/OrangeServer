@@ -62,9 +62,6 @@ def test_backend_image_publish_is_guarded_while_repository_is_private():
     assert "packages/container/orangeserver-backend/versions" in workflow
     assert "GHCR tag $RELEASE_TAG already exists" in workflow
     assert "could not verify GHCR tag immutability" in workflow
-    assert "tcr_sync_only:" in workflow
-    assert "docker buildx imagetools create" in workflow
-    assert "Copy GHCR image to Tencent Cloud TCR" in workflow
     assert '"release-assets/bootstrap-compose.sh"' in workflow
     assert "--clobber" not in workflow
     assert ":latest" not in workflow
