@@ -5,6 +5,8 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+## [1.1.0] - 2026-08-19
+
 ### Added
 
 - AI autonomy M1/S1 safety and approval baseline (disabled by default):
@@ -33,11 +35,11 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   when restoring history, so refreshing a conversation does not change their
   display order.
 
-- The unreleased autonomy SSH runner now remains compatible with older Linux
+- The disabled-by-default autonomy SSH runner now remains compatible with older Linux
   `setsid` implementations that do not support `--wait`, while the development
   Worker inherits the configured host-key policy from the backend.
 
-- The unreleased autonomy Planner now gives OpenAI-compatible reasoning models
+- The disabled-by-default autonomy Planner now gives OpenAI-compatible reasoning models
   such as DeepSeek one bounded, server-selected tool-contract repair after a
   phase or parameter mismatch; rejected first proposals remain side-effect
   free and all repaired plans still pass the server action fences. Finish
@@ -68,7 +70,7 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and backend error details are likewise disclosed on demand; the shared header
   also stays legible on narrow screens.
 
-- The unreleased M1/S2 worker path now fences every claim, checkpoint write,
+- The disabled-by-default M1/S2 worker path now fences every claim, checkpoint write,
   and final write with a one-time lease token, continuously rescans
   recoverable runs, and fails closed when its Redis checkpoint store or a
   safe MySQL recovery cursor is unavailable. The feature remains disabled by
