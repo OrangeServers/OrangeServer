@@ -124,7 +124,7 @@ LABEL org.opencontainers.image.title="OrangeServer Backend" \
       org.opencontainers.image.source="https://github.com/OrangeServers/OrangeServer" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.vendor="OrangeServer" \
-      org.opencontainers.image.version="1.0.4"
+      org.opencontainers.image.version="1.1.1"
 
 # ti3-DOCKER (2026-07-02): SIGTERM 让 gunicorn 走 graceful shutdown
 #   gunicorn 默认收到 SIGTERM 后等 worker 处理完当前请求 (--graceful-timeout=30s)

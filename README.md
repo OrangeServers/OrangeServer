@@ -107,13 +107,13 @@ through `sudo`).
 ```bash
 set -o pipefail
 curl -fsSL \
-  https://github.com/OrangeServers/OrangeServer/releases/download/v1.0.4/bootstrap-compose.sh \
-  | sudo bash -s -- --version v1.0.4
+  https://github.com/OrangeServers/OrangeServer/releases/download/v1.1.1/bootstrap-compose.sh \
+  | sudo bash -s -- --version v1.1.1
 ```
 
 This version-pinned launcher downloads and verifies the matching deployment
 bundle, generates the MySQL and Redis infrastructure passwords, and starts the
-published `ghcr.io/orangeservers/orangeserver-backend:v1.0.4` image. Review the
+published `ghcr.io/orangeservers/orangeserver-backend:v1.1.1` image. Review the
 launcher first if your environment does not permit piping downloaded scripts to
 a shell.
 
@@ -123,8 +123,8 @@ The mainland route is available from v1.0.3 and also requires Git.
 
 ```bash
 set -o pipefail
-curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.0.4/ops/bootstrap-compose-cn.sh \
-  | sudo bash -s -- --version v1.0.4
+curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.1.1/ops/bootstrap-compose-cn.sh \
+  | sudo bash -s -- --version v1.1.1
 ```
 
 The mainland route uses digest-pinned DaoCloud public mirrors for the official
@@ -187,8 +187,9 @@ flowchart LR
 
 OrangeServer is under active development. The current AI capability covers
 permission-filtered platform queries, evidence-backed read-only Linux/Docker
-diagnostics, approval-gated batch commands, and the disabled-by-default M1
-controlled-autonomy release candidate. External diagnostic adapters remain
+diagnostics, approval-gated batch commands, and M1 controlled autonomy
+(enabled by default in the standard bundled install). External diagnostic
+adapters remain
 future work; see the [changelog](CHANGELOG.md) and [AI roadmap](docs/ai/ROADMAP.md)
 for the released/unreleased boundary.
 

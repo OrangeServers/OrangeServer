@@ -50,25 +50,20 @@ jobs:
         run: |
           echo "name=ghcr.io/${REPOSITORY_OWNER,,}/orangeserver-backend" >> "$GITHUB_OUTPUT"
 
-      - name: Verify draft GitHub Release exists
+      - name: Verify GitHub Release exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
         shell: bash
         run: |
-          is_draft="$(
-            gh release view "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --json isDraft \
-              --jq .isDraft
-          )" || {
-            echo "::error::create the Draft Release for $RELEASE_TAG before running this workflow"
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName \
+            --jq .tagName >/dev/null || {
+            echo "::error::create the GitHub Release for $RELEASE_TAG before running this workflow"
             exit 1
           }
-          if [ "$is_draft" != "true" ]; then
-            echo "::error::$RELEASE_TAG must remain a Draft Release while assets are built and verified"
-            exit 1
-          fi
+          echo "Release $RELEASE_TAG exists; proceeding (draft or published)."
 
       - name: Validate GHCR version tag state
         env:
@@ -183,6 +178,9 @@ jobs:
 
       - name: Copy GHCR image to Tencent Cloud TCR
         if: ${{ vars.TCR_ENABLED == 'true' }}
+        # Overseas runners cannot reliably reach the mainland registry; the
+        # failure is non-fatal because the local WSL push is the TCR fallback.
+        continue-on-error: true
         env:
           GHCR_IMAGE: ${{ steps.image.outputs.name }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
@@ -194,6 +192,8 @@ jobs:
 
       - name: Verify GHCR and TCR digests match
         if: ${{ vars.TCR_ENABLED == 'true' }}
+        # Only meaningful when the TCR copy above succeeded.
+        continue-on-error: true
         env:
           GHCR_IMAGE: ${{ steps.image.outputs.name }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}

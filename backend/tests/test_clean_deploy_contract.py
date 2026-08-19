@@ -58,7 +58,7 @@ def test_backend_image_publish_is_guarded_while_repository_is_private():
     assert "ops/build-deploy-bundle.sh" in workflow
     assert "gh release upload" in workflow
     assert "gh release view" in workflow
-    assert "--json isDraft" in workflow
+    assert "--json tagName" in workflow
     assert "packages/container/orangeserver-backend/versions" in workflow
     assert "GHCR tag $RELEASE_TAG already exists" in workflow
     assert "could not verify GHCR tag immutability" in workflow

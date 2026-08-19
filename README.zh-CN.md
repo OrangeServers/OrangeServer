@@ -102,13 +102,13 @@ M1/S3 还提供独立的自治任务工作台（`/ai-runs`）：管理员可以�
 ```bash
 set -o pipefail
 curl -fsSL \
-  https://github.com/OrangeServers/OrangeServer/releases/download/v1.0.4/bootstrap-compose.sh \
-  | sudo bash -s -- --version v1.0.4
+  https://github.com/OrangeServers/OrangeServer/releases/download/v1.1.1/bootstrap-compose.sh \
+  | sudo bash -s -- --version v1.1.1
 ```
 
 这个固定版本的薄引导器会下载并校验同版本部署包，生成 MySQL 与 Redis
 基础设施密码，并启动已发布的
-`ghcr.io/orangeservers/orangeserver-backend:v1.0.4` 镜像。
+`ghcr.io/orangeservers/orangeserver-backend:v1.1.1` 镜像。
 如果环境不允许把下载内容直接交给 shell，请先下载并审阅引导器再执行。
 
 **中国大陆线路（Gitee 固定 tag + 腾讯云 TCR + 公共镜像）：**
@@ -117,8 +117,8 @@ curl -fsSL \
 
 ```bash
 set -o pipefail
-curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.0.4/ops/bootstrap-compose-cn.sh \
-  | sudo bash -s -- --version v1.0.4
+curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.1.1/ops/bootstrap-compose-cn.sh \
+  | sudo bash -s -- --version v1.1.1
 ```
 
 大陆线路会从 DaoCloud 匿名公共镜像拉取固定 digest 的 Nginx、Redis、MySQL 官方
@@ -177,7 +177,8 @@ flowchart LR
 ## 项目状态
 
 OrangeServer 处于活跃开发中。当前 AI 能力覆盖权限过滤的平台查询、证据可溯的
-Linux/Docker 只读诊断、人工审批式批量命令，以及默认关闭的 M1 受控自治发布候选。
+Linux/Docker 只读诊断、人工审批式批量命令，以及标准 bundled 安装默认启用的 M1
+受控自治。
 外部诊断适配器为后续规划；已发布能力与未发布能力的边界见
 [变更日志](CHANGELOG.md)和[AI 运维路线图](docs/ai/ROADMAP.md)。
 
