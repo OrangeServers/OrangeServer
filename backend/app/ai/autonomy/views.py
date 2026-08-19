@@ -20,7 +20,8 @@ from app.ai.autonomy.repository import (
 )
 from app.ai.autonomy.readiness import autonomy_readiness
 from app.ai.autonomy.state import AutonomyStateError, TERMINAL_RUN_STATUSES
-from app.core.config import AI_AUTONOMY_ENABLED, FLASK_SECRET_KEY
+from app.ai.autonomy.flags import is_autonomy_enabled
+from app.core.config import FLASK_SECRET_KEY
 from app.core.db.database import db
 from app.tools.apierr import ApiCode, api_error, api_response
 from app.tools.at import get_current_user, get_current_user_role
@@ -69,7 +70,7 @@ def _repo() -> AutonomyRepository:
 
 def _disabled():
     return api_error(
-        ApiCode.FORBIDDEN, 'AI 自治功能未启用 (OGS_AI_AUTONOMY_ENABLED)', 403,
+        ApiCode.FORBIDDEN, 'AI 自治功能未启用', 403,
     )
 
 
@@ -98,13 +99,13 @@ def _handle(exc):
 
 def autonomy_status():
     """GET /ai/autonomy/status：功能与基础设施状态（不受 flag 阻断）。"""
-    status = autonomy_readiness(enabled=bool(AI_AUTONOMY_ENABLED))
+    status = autonomy_readiness(enabled=is_autonomy_enabled())
     return api_response(data=status, enabled=status['enabled'])
 
 
 def _guarded(role):
     """flag + v1 管理员限制的统一前置检查；通过返回 None。"""
-    if not AI_AUTONOMY_ENABLED:
+    if not is_autonomy_enabled():
         return _disabled()
     if role != 'admin':
         return _not_admin()

@@ -118,12 +118,11 @@ Run 的权威状态为 `queued`、`running`、`completed`、`partial`、`failed`
 
 详情见 [受控只读诊断](DIAGNOSTICS.md)。
 
-## M1 自治任务 API（已实现，默认关闭）
+## M1 自治任务 API
 
-自治接口只对管理员开放，并且还受 `OGS_AI_AUTONOMY_ENABLED` 二次门控。标准发布
-Compose 栈不启动自治 Worker 或专用 Redis 8；未同时满足 feature flag、checkpoint
-和 Worker 就绪条件时，Run 不能启动。聊天只拥有创建草稿引用卡的能力，不能启动、
-审批或取消 Run。
+自治接口只对管理员开放。标准 bundled 栈启动专用 Redis 与 Worker，默认可用。
+未同时满足进程启用、checkpoint 和 Worker 就绪条件时，Run 不能启动。聊天只拥有
+创建草稿引用卡的能力，不能启动、审批或取消 Run。
 
 ### 就绪状态与生命周期
 

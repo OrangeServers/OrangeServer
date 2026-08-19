@@ -97,7 +97,7 @@ def api(monkeypatch):
 
 
 def _enable(monkeypatch, flag=True):
-    monkeypatch.setattr(views, "AI_AUTONOMY_ENABLED", flag)
+    monkeypatch.setattr(views, "is_autonomy_enabled", lambda: flag)
 
 
 def test_routes_are_registered_with_expected_verbs():
@@ -202,7 +202,7 @@ def test_every_mutating_endpoint_is_rejected_when_flag_disabled(
         else:
             response = client.post(url, json=payload)
         assert response.status_code == 403, url
-        assert "OGS_AI_AUTONOMY_ENABLED" in response.get_json()["msg"]
+        assert "未启用" in response.get_json()["msg"]
 
 
 def test_non_admin_is_rejected_even_when_enabled(api, monkeypatch):

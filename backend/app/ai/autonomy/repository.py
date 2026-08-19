@@ -560,10 +560,21 @@ class AutonomyRepository:
             RunStatus.QUEUED.value,
             RunStatus.WAITING_APPROVAL.value,
         }
+        # 租约已过期 = Worker 已死/失联，取消可直接落终态，不再等确认。
+        lease_expired = (
+            run.lease_expires_at is not None
+            and run.lease_expires_at < _utcnow()
+        )
+        force_cancel = cancel_without_remote_stop or (
+            run.status in {
+                RunStatus.RUNNING.value,
+                RunStatus.RECOVERING.value,
+            } and lease_expired
+        )
         newly_requested = not bool(run.cancel_requested)
         run.cancel_requested = True
 
-        if cancel_without_remote_stop:
+        if force_cancel:
             pending_steps = self.session.query(
                 t_ai_autonomous_step,
             ).filter(
@@ -588,7 +599,7 @@ class AutonomyRepository:
             run.lease_token = None
             run.lease_expires_at = None
 
-        if not newly_requested and not cancel_without_remote_stop:
+        if not newly_requested and not force_cancel:
             return self._run_to_dict(run)
 
         self._bump(run)
@@ -596,10 +607,15 @@ class AutonomyRepository:
             self.append_event(run, 'run_cancel_requested', {
                 'revision': int(run.revision),
             })
-        if cancel_without_remote_stop:
+        if force_cancel:
+            reason = (
+                'cancelled_before_execution'
+                if cancel_without_remote_stop
+                else 'lease_expired_force_cancel'
+            )
             self.append_event(run, 'run_cancelled', {
                 'revision': int(run.revision),
-                'reason': 'cancelled_before_execution',
+                'reason': reason,
             })
         self._commit()
         return self._run_to_dict(run)

@@ -149,8 +149,8 @@ zh-CN，存量行为不变），rev52 增加由管理界面维护的 SMTP 配置
 保存 Fernet 密文，rev53 为 AI 自治（M1/S1）增加资产环境列与 Run/Step/事件/
 产物四张表；rev54 为自治 Run 表追加 Worker 租约、一次性 fencing token、心跳与
 图版本列（M1/S2），rev55 为自治 Run 表追加可选的自定义权限档案列，rev56 增加
-脱敏 Evidence 引用表（M1/S3，发布候选，默认关闭）；自治功能默认关闭
-（`OGS_AI_AUTONOMY_ENABLED` 不设置即无行为变化）。
+  脱敏 Evidence 引用表（M1/S3）。标准 bundled 栈会启动专用 Redis Stack 与
+  Worker，自治能力默认可用。
 各脚本针对其自身变更设计了重复执行保护，但重复运行前仍应
 确认输出和目标数据库正确。
 

@@ -13,7 +13,7 @@
 - **统一升级流程**：[`docs/operations/UPGRADE.md`](../docs/operations/UPGRADE.md) — 备份、迁移、验证与回滚
 - **配置参考**：[`CONFIG.md`](../CONFIG.md) — OGS_* 全部环境变量
 - **本目录文件**：
-  - `docker-compose.yml` — 生产 4 服务编排（含 profiles）
+   - `docker-compose.yml` — 生产 bundled 编排（业务四件套 + 自治 Redis/Worker）
   - `docker-compose.dev.yml` — 独立全容器开发模式（新 MySQL/Redis 卷、backend 源码重载、Vite HMR）
   - `docker-compose.dev-autonomy.yml` — M1 自治开发覆盖层（专用 Redis 8 + Celery Worker）
   - `nginx/orange_server.conf` — 物理机 nginx（含 frontend/dist 静态 serve + 6 个 API 前缀反代）
@@ -46,9 +46,8 @@ make docker-dev-reset
 make docker-dev-up
 ```
 
-M1 自治能力是默认关闭的发布候选。标准 bundled/host 发布路径不启动自治 Worker
-或专用 Redis 8；仅在隔离开发/验收环境中，将 `.env.dev` 的
-`OGS_AI_AUTONOMY_ENABLED` 显式改为 `true` 后运行：
+标准 bundled 发布路径会启动自治 Worker 与专用 Redis Stack。开发覆盖层仍可用于
+源码热重载：将 `.env.dev` 的 `OGS_AI_AUTONOMY_ENABLED` 设为 `true` 后运行：
 
 ```bash
 make docker-dev-autonomy-up

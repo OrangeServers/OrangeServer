@@ -219,9 +219,12 @@ class TestDockerCompose:
     def compose(self):
         return (DEPLOY / "docker-compose.yml").read_text(encoding="utf-8")
 
-    def test_01_compose_has_four_services(self, compose):
-        """必须 4 服务: backend / frontend / redis / mysql"""
-        for svc in ("backend", "frontend", "redis", "mysql"):
+    def test_01_compose_has_core_and_autonomy_services(self, compose):
+        """bundled 栈含业务四件套与自治 Redis/Worker"""
+        for svc in (
+            "backend", "frontend", "redis", "mysql",
+            "autonomy-redis", "autonomy-worker",
+        ):
             assert f"  {svc}:" in compose, f"docker-compose 缺服务: {svc}"
 
     def test_02_compose_has_internal_network(self, compose):
@@ -241,10 +244,8 @@ class TestDockerCompose:
 
     def test_05_compose_redis_has_healthcheck(self, compose):
         """redis 必须有 healthcheck"""
-        # 找到 redis 服务段
-        assert "redis:" in compose
-        # redis 段内必须有 healthcheck
-        redis_section = compose.split("redis:")[1].split("\n\n")[0] if "redis:" in compose else ""
+        assert "  redis:" in compose
+        redis_section = compose.split("  redis:")[1].split("\n\n")[0]
         assert "healthcheck" in redis_section
 
     def test_06_compose_mysql_uses_utf8mb4(self, compose):

@@ -276,11 +276,12 @@ make docker-dev-up
 > 如果宿主机的临时端口范围覆盖 8081/28001，请先将这两个监听端口加入
 > `net.ipv4.ip_local_reserved_ports`，或在 `.env.dev` 中改用已保留端口。
 
-### M1/S3 隔离自治验收
+### M1 自治栈
 
-M1 自治是默认关闭的发布候选能力。标准 `make docker-up` 只启动业务 Redis 7，
-不会启动自治 Worker 或专用 Redis 8；不要在普通发布实例中只设置
-`OGS_AI_AUTONOMY_ENABLED=true`，否则就绪检查会拒绝启动 Run。
+标准 `make docker-up` / 一键安装会启动业务 Redis 7，以及专用 Redis Stack 与
+Worker。自治任务默认可用。
+
+开发覆盖层仍可用于源码热重载验收：
 
 在一次性或隔离的开发/验收环境中，先在 `.env.dev` 显式设置非空的
 `OGS_AI_AUTONOMY_REDIS_PASSWORD`，再执行：

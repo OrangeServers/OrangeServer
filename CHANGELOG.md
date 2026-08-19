@@ -5,6 +5,13 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Changed
+
+- Standard bundled Compose now starts dedicated autonomy Redis Stack and a
+  Celery Worker using the same backend image. Autonomous runs are on by
+  default; `OGS_AI_AUTONOMY_ENABLED=false` remains an emergency process
+  kill switch.
+
 ## [1.1.0] - 2026-08-19
 
 ### Added

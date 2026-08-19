@@ -151,8 +151,8 @@ location /ai/ {
 | `reason` | 含义 | 处理 |
 |---|---|---|
 | `feature_disabled` | `OGS_AI_AUTONOMY_ENABLED` 未打开 | 标准发布栈应保持关闭。只在隔离开发/验收环境设为 `true` |
-| `redis_not_configured` | 未配置专用 Redis 8 | 设置 `OGS_AI_AUTONOMY_REDIS_HOST` 等变量，且不得指向业务 Redis 7 |
-| `checkpoint_unavailable` | Redis 8 checkpoint 不可达 | 检查隔离栈 Redis 8、密码和网络 |
+| `redis_not_configured` | 未配置专用自治 Redis | 设置 `OGS_AI_AUTONOMY_REDIS_HOST` 等变量，且不得指向业务 Redis 7 |
+| `checkpoint_unavailable` | 自治 Redis checkpoint 不可达 | 检查 bundled 栈 `autonomy-redis`、密码和网络 |
 | `worker_unavailable` | 自治 Worker 未就绪 | 使用 `make docker-dev-autonomy-up` 启动覆盖层，不要只改 feature flag |
 | `ready` | flag、checkpoint 和 Worker 均可用 | 才允许创建或启动 Run |
 
