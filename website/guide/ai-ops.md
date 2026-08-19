@@ -34,8 +34,10 @@ development or acceptance environment with the setup described in the
 
 ## What it cannot do
 
-- It cannot run SQL or open a shell.
-- It cannot execute anything that has not been explicitly approved.
+- It cannot run SQL or open an unrestricted shell.
+- Chat diagnostics and batch commands never execute until a human approves
+  them. M1 server-owned `allow` probes may continue without a per-step prompt;
+  `auto` is limited to assets marked `lab` and still cannot elevate a `deny`.
 - It cannot invent asset IDs, database fields, or execution results — tool
   results are the only source of truth.
 - Tool output, history summaries, and diagnostic evidence are treated as

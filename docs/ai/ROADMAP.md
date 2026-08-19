@@ -252,25 +252,17 @@ decision 请求只提交 `{operation, expected_revision}`，且 operation 必须
 | S2 执行与恢复 | 专用 Redis、Celery、LangGraph `allow/ask/deny` 路由、数据库租约、checkpoint fail-closed、可取消 SSH、写意图和未知结果 | 真实 MySQL/Redis/Worker 下通过重复投递、强杀、取消和 checkpoint 丢失测试 |
 | S3 规划、证据与产品闭环 | Planner、一次计划授权、可选 Guardian、脱敏 Evidence、独立 Verification、三态 Outcome、REST/SSE、工作台和聊天引用 | 已通过完成门；能力仍默认关闭，发布部署另行审批 |
 
-S3 实现状态（发布收口）：Planner、计划审批、受控动作、服务重启、独立验证、Evidence
-结论、REST/SSE 和工作台已合入 M1 集成分支。最终 PR 还必须分别完成本地代码门禁、
-全新 schema/部署包门禁、隔离 Compose 自治 smoke 和浏览器验收；这些证据不能由旧的
-CI 结果、普通聊天 draft 或“容器已启动”替代。feature flag 仍默认关闭，真实发布与
-生产启用是后续独立操作。
+S1、S2、S3 均已完成实现与隔离验收。能力仍默认关闭；标准发布栈不启动专用 Redis 8
+和 Worker。稳定 tag、GitHub Release、GHCR/TCR、Gitee 同名 tag、从零安装和升级/
+回滚属于合入 `main` 之后的独立发布操作，不能由旧的 CI 结果、普通聊天 draft 或
+“容器已启动”替代。
 
-依赖顺序：
+后续约束：
 
-1. `integration/ai-autonomy-m1` 是短期公开集成分支，直接建立在最新公开 `main` 上；
-   feature flag 始终默认关闭，正式发布仍只能来自 `main`。
-2. S1、S2、S3 严格顺序推进。前一阶段完成门未通过时，不创建下一阶段 Issue。
-3. 每个阶段对应一个 Issue 和一个 PR；工作分支从当前 M1 集成分支创建，PR 也只合回
-   该集成分支，禁止顺带迁入其他功能或旧分支历史。
-4. S3 完成后，从集成分支向 `main` 创建最终完整 PR；验收通过并合并后删除集成分支。
-5. M2 以后不提前创建占位 Issue，也不建立永久 `develop` 分支。
-
-每个 Issue 只需包含：目标、非目标、前置依赖、锁定的接口或状态、关键安全不变量、
-允许改动的模块、不得改动的模块、准确测试命令和隐私要求。后续实现不得自行改变
-MySQL/LangGraph/Redis/Celery 的职责、审批规则或恢复语义；需要改变时另开设计复核。
+1. 正式发布只能来自公开 `main` 上的稳定 tag；feature flag 始终默认关闭。
+2. M2 以后不提前创建占位 Issue，也不建立永久 `develop` 分支。
+3. 后续实现不得自行改变 MySQL/LangGraph/Redis/Celery 的职责、审批规则或恢复语义；
+   需要改变时另开设计复核。
 
 ## M1 最终验收
 

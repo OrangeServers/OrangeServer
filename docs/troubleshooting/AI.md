@@ -144,6 +144,22 @@ location /ai/ {
 错误日志关键词使用确定性阈值。进程和端口主要作为证据展示，因为平台不知道每个
 业务的正常基线。“未发现达到规则阈值的异常”不等于系统健康。
 
+## 自治工作台无法启动或一直显示未就绪
+
+先调用 `GET /ai/autonomy/status`，以返回的 `ready` 和固定 `reason` 为准：
+
+| `reason` | 含义 | 处理 |
+|---|---|---|
+| `feature_disabled` | `OGS_AI_AUTONOMY_ENABLED` 未打开 | 标准发布栈应保持关闭。只在隔离开发/验收环境设为 `true` |
+| `redis_not_configured` | 未配置专用 Redis 8 | 设置 `OGS_AI_AUTONOMY_REDIS_HOST` 等变量，且不得指向业务 Redis 7 |
+| `checkpoint_unavailable` | Redis 8 checkpoint 不可达 | 检查隔离栈 Redis 8、密码和网络 |
+| `worker_unavailable` | 自治 Worker 未就绪 | 使用 `make docker-dev-autonomy-up` 启动覆盖层，不要只改 feature flag |
+| `ready` | flag、checkpoint 和 Worker 均可用 | 才允许创建或启动 Run |
+
+只把 `OGS_AI_AUTONOMY_ENABLED=true` 加到普通 Compose 实例会保持 `ready=false`。
+隔离栈命令见 [部署手册](../../DEPLOY.md)。自治功能关闭时，现有聊天、诊断和批量
+审批应仍可用。
+
 ## API Key 保存后页面为空
 
 配置 API 不返回明文密钥，这是安全设计。正确表现应是掩码和“已配置”状态，而

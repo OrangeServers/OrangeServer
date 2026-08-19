@@ -80,6 +80,8 @@ git switch main
 git pull --ff-only origin main
 git tag -a "$release_version" -m "Release $release_version"
 git push origin "$release_version"
+# 大陆一键安装读取 Gitee 同名 tag；把同一 annotated tag 推到
+# https://gitee.com/orangeservers/OrangeServer 后再发布该线路。
 gh release create "$release_version" --draft --title "OrangeServer $release_version" \
   --generate-notes
 gh workflow run "Publish backend image" --ref main \
@@ -88,8 +90,12 @@ gh run watch
 gh release view "$release_version" --json isDraft,assets,tagName
 ```
 
-确认 GHCR/TCR（若启用）镜像 digest、部署包 SHA256、全新安装和浏览器健康检查均
-通过后，再显式发布 Release：
+确认 GHCR/TCR（若启用）镜像 digest、部署包 SHA256、Gitee 同名 tag、全新安装和
+浏览器健康检查均通过后，再显式发布 Release。随后把 README 与官网中英
+getting-started/deployment 里的安装版本钉从旧稳定版改到该 tag；未打 tag 前不要
+改这些入口。合入 `main` 后确认 GitHub Pages 工作流已发布官网。
+
+确认上述检查通过后，再显式发布 Release：
 
 ```bash
 gh release edit "$release_version" --draft=false
