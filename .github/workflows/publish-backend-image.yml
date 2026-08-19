@@ -7,11 +7,6 @@ on:
         description: Existing release tag to publish (for example v1.0.0)
         required: true
         type: string
-      tcr_sync_only:
-        description: Reuse an existing GHCR tag and only recover TCR plus release assets
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: write
@@ -70,7 +65,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PACKAGE_OWNER: ${{ github.repository_owner }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
-          TCR_SYNC_ONLY: ${{ inputs.tcr_sync_only }}
         shell: bash
         run: |
           error_file="$(mktemp)"
@@ -85,19 +79,11 @@ jobs:
               <<<"$versions" >/dev/null; then
               tag_exists=true
             fi
-            if [ "$TCR_SYNC_ONLY" = "true" ] && [ "$tag_exists" != "true" ]; then
-              echo "::error::GHCR tag $RELEASE_TAG does not exist; recovery mode cannot continue"
-              exit 1
-            fi
-            if [ "$TCR_SYNC_ONLY" != "true" ] && [ "$tag_exists" = "true" ]; then
+            if [ "$tag_exists" = "true" ]; then
               echo "::error::GHCR tag $RELEASE_TAG already exists and must not be overwritten"
               exit 1
             fi
           elif grep -q 'HTTP 404' "$error_file"; then
-            if [ "$TCR_SYNC_ONLY" = "true" ]; then
-              echo "::error::GHCR package does not exist; recovery mode cannot continue"
-              exit 1
-            fi
             echo "GHCR package does not exist yet; this is the first image publish."
           else
             cat "$error_file" >&2
@@ -119,7 +105,6 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Set up Node.js
-        if: ${{ inputs.tcr_sync_only != true }}
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -127,7 +112,6 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Rebuild release frontend
-        if: ${{ inputs.tcr_sync_only != true }}
         working-directory: frontend
         shell: bash
         run: |
@@ -140,14 +124,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Tencent Cloud TCR
-        if: ${{ vars.TCR_ENABLED == 'true' }}
-        uses: docker/login-action@v3
-        with:
-          registry: ccr.ccs.tencentyun.com
-          username: ${{ secrets.TCR_USERNAME }}
-          password: ${{ secrets.TCR_PASSWORD }}
 
       - name: Resolve publish tags
         id: publish_tags
@@ -163,7 +139,6 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and publish linux/amd64 image
-        if: ${{ inputs.tcr_sync_only != true }}
         uses: docker/build-push-action@v6
         with:
           context: backend
@@ -175,45 +150,6 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.tag }}
-
-      - name: Copy GHCR image to Tencent Cloud TCR
-        if: ${{ vars.TCR_ENABLED == 'true' }}
-        # Overseas runners cannot reliably reach the mainland registry; the
-        # failure is non-fatal because the local WSL push is the TCR fallback.
-        continue-on-error: true
-        env:
-          GHCR_IMAGE: ${{ steps.image.outputs.name }}
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
-        shell: bash
-        run: |
-          docker buildx imagetools create \
-            --tag "ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend:${RELEASE_TAG}" \
-            "${GHCR_IMAGE}:${RELEASE_TAG}"
-
-      - name: Verify GHCR and TCR digests match
-        if: ${{ vars.TCR_ENABLED == 'true' }}
-        # Only meaningful when the TCR copy above succeeded.
-        continue-on-error: true
-        env:
-          GHCR_IMAGE: ${{ steps.image.outputs.name }}
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
-        shell: bash
-        run: |
-          ghcr_digest="$(
-            docker buildx imagetools inspect \
-              "${GHCR_IMAGE}:${RELEASE_TAG}" \
-              | awk '$1 == "Digest:" {print $2; exit}'
-          )"
-          tcr_digest="$(
-            docker buildx imagetools inspect \
-              "ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend:${RELEASE_TAG}" \
-              | awk '$1 == "Digest:" {print $2; exit}'
-          )"
-          if [ -z "$ghcr_digest" ] || [ "$ghcr_digest" != "$tcr_digest" ]; then
-            echo "::error::GHCR and TCR digests differ"
-            exit 1
-          fi
-          echo "Both registries published ${ghcr_digest}"
 
       - name: Build checksummed deployment bundle
         env:
