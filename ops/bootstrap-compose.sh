@@ -198,6 +198,7 @@ set_key() {
 mysql_root_password="$(openssl rand -hex 24)"
 mysql_app_password="$(openssl rand -hex 24)"
 redis_password="$(openssl rand -hex 24)"
+autonomy_redis_password="$(openssl rand -hex 24)"
 
 set_key .env COMPOSE_PROJECT_NAME "$PROJECT_NAME"
 set_key .env OGS_BACKEND_IMAGE "$BACKEND_IMAGE"
@@ -215,6 +216,10 @@ set_key .env OGS_MYSQL_PASSWORD "$mysql_app_password"
 set_key .env OGS_REDIS_HOST redis
 set_key .env OGS_REDIS_PORT 6379
 set_key .env OGS_REDIS_PASSWORD "$redis_password"
+set_key .env OGS_AI_AUTONOMY_ENABLED true
+set_key .env OGS_AI_AUTONOMY_REDIS_HOST autonomy-redis
+set_key .env OGS_AI_AUTONOMY_REDIS_PORT 6379
+set_key .env OGS_AI_AUTONOMY_REDIS_PASSWORD "$autonomy_redis_password"
 set_key .env OGS_HTTPS false
 
 set_key backend/.env OGS_ENV prod
@@ -228,6 +233,10 @@ set_key backend/.env OGS_MYSQL_PASSWORD "$mysql_app_password"
 set_key backend/.env OGS_REDIS_HOST redis
 set_key backend/.env OGS_REDIS_PORT 6379
 set_key backend/.env OGS_REDIS_PASSWORD "$redis_password"
+set_key backend/.env OGS_AI_AUTONOMY_ENABLED true
+set_key backend/.env OGS_AI_AUTONOMY_REDIS_HOST autonomy-redis
+set_key backend/.env OGS_AI_AUTONOMY_REDIS_PORT 6379
+set_key backend/.env OGS_AI_AUTONOMY_REDIS_PASSWORD "$autonomy_redis_password"
 set_key backend/.env OGS_CSRF_ALLOWED_ORIGINS ""
 set_key backend/.env OGS_CORS_ORIGINS ""
 set_key backend/.env OGS_HTTPS false

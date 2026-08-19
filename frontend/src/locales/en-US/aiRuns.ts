@@ -7,7 +7,7 @@ export default {
   eyebrow: 'AUTONOMY',
   subtitle: 'Supervise every autonomous AI run on your assets, driven by server-authoritative state',
   create: 'New task draft',
-  featureDisabled: 'Autonomous runs are disabled: set OGS_AI_AUTONOMY_ENABLED on the server and restart.',
+  featureDisabled: 'Autonomous runs are unavailable. The standard install enables them; confirm dedicated Redis and the Worker are running.',
   notReady: 'Infrastructure not ready ({reason}); started runs will not execute. Drafts can still be created.',
   reason: {
     ready: 'ready',
