@@ -4,6 +4,49 @@
 构建。`publish` job 仅在公开的规范仓库中运行；私有归档或 Fork 即使手动触发也
 不会发布镜像。
 
+## 发布前收口门
+
+在创建稳定 tag 前，先在目标 commit 的干净工作树执行以下门禁。`vX.Y.Z` 只是待
+发布版本占位符，不要把它替换成已经发布过的 tag；稳定 tag 和 Release 资产均不可
+覆盖。
+
+```bash
+git status --short --branch
+git diff --check
+pwsh -File ops/check-docs.ps1
+bash ops/test-bootstrap-scripts.sh
+
+cd backend
+python -m pytest tests/ -q --ignore=app/tools/ansible_runner
+cd ../frontend
+npm ci --no-audit --no-fund
+npm run build
+cd ..
+
+# 生成与正式工作流相同的版本化部署包，并在发布前校验包名和摘要。
+rm -rf release-assets
+bash ops/build-deploy-bundle.sh --version vX.Y.Z --output-dir release-assets
+(
+  cd release-assets
+  sha256sum -c "orangeserver-deploy-vX.Y.Z.tar.gz.sha256"
+)
+tar -tzf "release-assets/orangeserver-deploy-vX.Y.Z.tar.gz" \
+  | grep -E '^(orangeserver/)?(backend/mysqldir/orange.sql|frontend/dist/index.html|ops/bootstrap-compose.sh)$'
+```
+
+M1 自治还要单独使用隔离的 MySQL、业务 Redis 7、自治 Redis 8、Worker 和 SSH 测试
+资产验证；标准发布栈只验证 feature flag 默认关闭，不把普通 Compose 启动误报为
+自治闭环。源码 exact-HEAD smoke 的入口是：
+
+```powershell
+pwsh -File ops/smoke-ai-autonomy-s2.ps1 -ExpectedHead <40-hex-commit>
+pwsh -File ops/smoke-ai-autonomy-s3.ps1 -ExpectedHead <40-hex-commit>
+```
+
+两个脚本都会从 Git archive 构造 disposable 栈，并在成功后清理专属容器、网络、
+卷和临时镜像；执行前工作树必须干净。它们验证的是 M1 隔离执行/恢复和聊天草稿边界，
+不替代真实 Provider 凭据下的人工 Run 验收。
+
 ## 首次公开发布
 
 1. 确认仓库已经公开，并完成发布前的全量验收。
@@ -25,6 +68,66 @@
 6. 上述验证全部完成后才把 Draft Release 发布，避免用户看到尚未就绪的下载入口。
 7. 将部署 `.env` 中的 `OGS_BACKEND_IMAGE` 和 `OGS_BACKEND_TAG` 指向已验证的
    版本，然后执行 `make docker-up-image`。
+
+## 发布命令
+
+合并到 `main` 并完成收口门后，使用同一个稳定版本号完成 tag、Draft Release、镜像
+和部署包发布。以下命令需要有仓库写权限；不会自动发布 Draft Release：
+
+```bash
+release_version=vX.Y.Z
+git switch main
+git pull --ff-only origin main
+git tag -a "$release_version" -m "Release $release_version"
+git push origin "$release_version"
+# 大陆一键安装读取 Gitee 同名 tag；把同一 annotated tag 推到
+# https://gitee.com/orangeservers/OrangeServer 后再发布该线路。
+gh release create "$release_version" --draft --title "OrangeServer $release_version" \
+  --generate-notes
+gh workflow run "Publish backend image" --ref main \
+  -f tag="$release_version"
+gh run watch
+gh release view "$release_version" --json isDraft,assets,tagName
+```
+
+确认 GHCR/TCR（若启用）镜像 digest、部署包 SHA256、Gitee 同名 tag、全新安装和
+浏览器健康检查均通过后，再显式发布 Release。随后把 README 与官网中英
+getting-started/deployment 里的安装版本钉从旧稳定版改到该 tag；未打 tag 前不要
+改这些入口。合入 `main` 后确认 GitHub Pages 工作流已发布官网。
+
+确认上述检查通过后，再显式发布 Release：
+
+```bash
+gh release edit "$release_version" --draft=false
+```
+
+如果 GHCR 已成功而 TCR 或 Release 附件阶段中断，使用工作流的恢复输入重新运行，
+不要移动稳定 tag、删除 GHCR 镜像或覆盖同名资产：
+
+```bash
+gh workflow run "Publish backend image" --ref main \
+  -f tag="$release_version" -f tcr_sync_only=true
+```
+
+### 从零安装验证
+
+发布后在一次性主机或独立 Compose project 使用固定版本引导器；不要在已有实例上
+用这条命令覆盖安装目录：
+
+```bash
+set -o pipefail
+curl -fsSL \
+  "https://github.com/OrangeServers/OrangeServer/releases/download/${release_version}/bootstrap-compose.sh" \
+  | sudo bash -s -- \
+      --version "$release_version" \
+      --project-name orangeserver_release_check \
+      --install-dir /opt/orangeserver-release-check \
+      --port 18082
+```
+
+安装完成后，先确认 `/local/health` 返回 HTTP 200，再完成 `/setup`，检查登录、
+资产、审计、AI Provider 和固定只读诊断。M1 自治的标准发布验证仍应保持
+`OGS_AI_AUTONOMY_ENABLED` 为空；要验收自治，请回到隔离 smoke 或开发覆盖层。
 
 ## 启用腾讯云 TCR 同步发布
 

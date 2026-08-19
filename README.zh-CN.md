@@ -55,6 +55,7 @@ OrangeServer 把日常 Linux 运维工作集中在同一个权限边界内：
 | 权限管理 | 将平台用户/用户组关联到资产/资产组和系统用户 |
 | 日志审计 | 查询登录、命令和平台操作记录 |
 | AI 运维 | 查询已授权平台数据，运行固定只读诊断，生成需人工确认的批量操作 |
+| M1 受控自治 | 在隔离测试环境中按计划调查、执行、验证并产出可引用结论；默认关闭 |
 | 双语界面 | 全站中英双语，设置 → 外观与语言即时切换，持久化到服务端 |
 
 ## AI 运维不是"把 Shell 交给模型"
@@ -84,6 +85,14 @@ flowchart LR
 不能提交诊断 Shell。证据会脱敏、限长、加密保存，规则 Finding 必须引用当前诊断
 Run 的证据 ID。需要改变主机状态的修复仍必须生成独立审批动作。详见
 [受控只读诊断](docs/ai/DIAGNOSTICS.md)。
+
+M1/S3 还提供独立的自治任务工作台（`/ai-runs`）：管理员可以把调查、受控变更、
+服务操作、独立验证和结论组织成一个可恢复 Run。它不是把 Shell 交给模型：目标资产、
+系统用户、权限模式、预算和动作白名单由服务端固定，写动作仍按 `ask`/Guardian/人工
+审批处理，`auto` 仅允许管理员标记为 `lab` 的资产。该能力是默认关闭的发布候选，
+标准发布 Compose 栈不启动自治 Worker 或专用 Redis 8；需要隔离验收时请按
+[AI 运维使用指南](docs/ai/USER_GUIDE.md)和[发布验收说明](docs/operations/BACKEND_IMAGE_RELEASE.md)
+配置。
 
 ## 快速开始
 
@@ -156,6 +165,7 @@ flowchart LR
 - [文档中心](docs/README.md)
 - [部署手册](DEPLOY.md)
 - [统一升级流程](docs/operations/UPGRADE.md)
+- [后端镜像与部署包发布](docs/operations/BACKEND_IMAGE_RELEASE.md)
 - [批量命令与批量脚本](docs/operations/BATCH_OPERATIONS.md)
 - [配置参考](CONFIG.md)
 - [AI 运维使用指南](docs/ai/USER_GUIDE.md)
@@ -168,8 +178,9 @@ flowchart LR
 ## 项目状态
 
 OrangeServer 处于活跃开发中。当前 AI 能力覆盖权限过滤的平台查询、证据可溯的
-Linux/Docker 只读诊断、以及人工审批式批量命令。外部诊断适配器为后续规划；
-已发布能力见 [变更日志](CHANGELOG.md)。
+Linux/Docker 只读诊断、人工审批式批量命令，以及默认关闭的 M1 受控自治发布候选。
+外部诊断适配器为后续规划；已发布能力与未发布能力的边界见
+[变更日志](CHANGELOG.md)和[AI 运维路线图](docs/ai/ROADMAP.md)。
 
 ## 开发与贡献
 

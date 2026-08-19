@@ -5,6 +5,80 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Added
+
+- AI autonomy M1/S1 safety and approval baseline (disabled by default):
+  Run/Step/event/artifact domain model with a strict server-side state
+  machine, an administrator-managed asset environment column
+  (`t_host.ai_environment`, rev53), structured probe actions with budget,
+  policy, redaction, and approval-digest validation, and optimistic-revision
+  step decisions that re-check asset and credential authorization atomically.
+  Every autonomy endpoint stays rejected until `OGS_AI_AUTONOMY_ENABLED` is
+  explicitly set, and this stage performs no remote execution.
+
+- AI autonomy M1/S3 planning, evidence and product loop (disabled by
+  default): a server-side tool-calling planner whose immutable plan steps are
+  bound to a one-time plan-level authorization digest, an optional Guardian
+  that can only tighten `ask` decisions, redacted untrusted Evidence, an
+  independent verification step and tri-state run outcomes, read-only REST
+  and resumable SSE contracts for runs, an administrator workbench
+  (`/ai-runs`), and chat draft reference cards that can never start, approve
+  or cancel runs. The feature remains gated behind
+  `OGS_AI_AUTONOMY_ENABLED`; the standard release deployment keeps it off and
+  does not start the dedicated Redis 8/Worker pair.
+
+### Fixed
+
+- Chat autonomy draft reference cards now use creation time plus a stable ID
+  when restoring history, so refreshing a conversation does not change their
+  display order.
+
+- The unreleased autonomy SSH runner now remains compatible with older Linux
+  `setsid` implementations that do not support `--wait`, while the development
+  Worker inherits the configured host-key policy from the backend.
+
+- The unreleased autonomy Planner now gives OpenAI-compatible reasoning models
+  such as DeepSeek one bounded, server-selected tool-contract repair after a
+  phase or parameter mismatch; rejected first proposals remain side-effect
+  free and all repaired plans still pass the server action fences. Finish
+  citations are constrained to server-issued same-run Evidence IDs; a second
+  invalid citation after an independent verification fails closed to an
+  inconclusive outcome without replaying writes.
+
+### Changed
+
+- The disabled-by-default M1 autonomy workflow now uses the common
+  `allow` / `ask` / `deny` harness contract and four permission profiles:
+  ask every time, AI review, automatic, and custom. New runs use a versioned
+  LangGraph route where server-owned read-only probes continue without a
+  per-step prompt, while `ask` still pauses at the existing approval interrupt
+  and `deny` can never be elevated by a model. Persisted v1 runs retain their
+  original graph and legacy mode semantics for recovery.
+
+- The disabled-by-default autonomy workbench now leads with a server-authoritative
+  conclusion and presents each step as a readable action, command result, and
+  linked bounded Artifact. Raw Evidence summaries and action digests remain
+  available under audit disclosures; execution, authorization, and Evidence
+  trust semantics are unchanged.
+
+- AI operations pages now make the primary path easier to scan: the Run list has
+  search and an explicit details action, creation modes show their guidance
+  together, advanced limits are opt-in, and detail-page evidence, artifacts, and
+  audit events are collapsed until needed. Conversation technical identifiers
+  and backend error details are likewise disclosed on demand; the shared header
+  also stays legible on narrow screens.
+
+- The unreleased M1/S2 worker path now fences every claim, checkpoint write,
+  and final write with a one-time lease token, continuously rescans
+  recoverable runs, and fails closed when its Redis checkpoint store or a
+  safe MySQL recovery cursor is unavailable. The feature remains disabled by
+  default and is not part of a release deployment.
+
+- Structured file patches now retain a complete managed backup reference and
+  a redacted, encrypted unified diff in the same transaction as the successful
+  step outcome. Missing rollback evidence fails closed instead of reporting a
+  safely recoverable change.
+
 ## [1.0.4] - 2026-07-30
 
 ### Fixed

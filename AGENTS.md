@@ -27,7 +27,14 @@ Stop and report the mismatch instead of guessing when:
 ## 2. Repository lineage
 
 - Public `origin/main` is the only canonical product baseline.
-- Every new branch starts from the latest public `origin/main`.
+- A milestone integration branch is a short-lived exception used only when an
+  Issue names it as the PR target. The integration branch itself starts from
+  the latest public `origin/main`, is never a release source, and is deleted
+  after its final PR is merged to `main`.
+- A work branch starts from the PR target named by its Issue: normally the
+  latest `origin/main`, or the current milestone integration branch. Never use
+  another feature branch, an old integration branch, or a staging default
+  branch as its base.
 - A private staging remote, when explicitly approved, is only storage for an
   unpublished branch. It does not have an independent product `main`.
 - Never merge, rebase, or copy an old staging `main` into a release branch.
@@ -38,16 +45,16 @@ Stop and report the mismatch instead of guessing when:
 - Merging, deployment, publishing, remote branch deletion, and other external
   writes require explicit user authorization.
 
-Create a normal branch with:
+Create a normal branch with the Issue's target branch as its base:
 
 ```powershell
-git fetch origin main
-git switch -c <type>/<short-name> origin/main
-git merge-base --is-ancestor origin/main HEAD
+git fetch origin <target-branch>
+git switch -c <type>/<short-name> origin/<target-branch>
+git merge-base --is-ancestor origin/<target-branch> HEAD
 ```
 
 If the ancestry check fails, do not repair it by merging unrelated histories.
-Create a clean branch from `origin/main` and port only reviewed changes.
+Create a clean branch from the correct target and port only reviewed changes.
 
 ## 3. Work from a bounded contract
 

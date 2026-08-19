@@ -1,8 +1,9 @@
 # AI 运维路线图
 
-> 本文描述 OrangeServer AI 运维的规划方向和后续工作包，不代表这些能力已经发布。
-> 当前可用行为以 [AI 运维使用指南](USER_GUIDE.md)、
-> [受控只读诊断](DIAGNOSTICS.md) 和 [AI REST/SSE 契约](API.md) 为准。
+> 本文同时记录已实现的 M1/S3 受控自治和后续规划。M1/S3 当前是默认关闭的发布候选
+> 能力，尚未在标准发布部署中启用；当前可用行为以
+> [AI 运维使用指南](USER_GUIDE.md)、[受控只读诊断](DIAGNOSTICS.md) 和
+> [AI REST/SSE 契约](API.md) 为准。
 
 ## 目标与边界
 
@@ -29,8 +30,9 @@ M0 是已经发布的能力：
 - 批量命令预览、人工审批、执行结果和审计；
 - 256K 标准上下文与 Provider 声明支持时可选的 1M 深度诊断档。
 
-当前诊断不能提交自由 Shell，修复也不会由诊断流程自动执行。后文中的自治接口、
-页面、状态和数据表均处于规划状态。
+当前诊断不能提交自由 Shell，修复也不会由诊断流程自动执行。M1/S3 另提供独立的
+自治任务工作台，但必须显式打开 feature flag，并配置专用 Redis 8 与 Worker；标准
+发布栈保持关闭时，现有聊天、诊断和批量审批行为不变。
 
 ## 长期里程碑
 
@@ -88,8 +90,8 @@ M0 是已经发布的能力：
 
 ### 产品形态
 
-M1 增加独立的自治任务工作台，前端规划路由为 `/ai-runs` 和
-`/ai-runs/:runId`。现有 AI 对话最终只增加“创建自治任务草稿”和“打开任务”的引用卡；
+M1 增加独立的自治任务工作台，已实现路由为 `/ai-runs` 和
+`/ai-runs/:runId`。现有 AI 对话只增加“创建自治任务草稿”和“打开任务”的引用卡；
 模型不能从聊天直接启动任务。
 
 v1 仅管理员可用，一次 Run 固定一个目标资产、一个系统用户和一个 Agent。Run 启动后，
@@ -100,7 +102,7 @@ v1 仅管理员可用，一次 Run 固定一个目标资产、一个系统用户
 | 模块 | 唯一职责 |
 |---|---|
 | MySQL | Run、Step、审批、Event、Artifact 引用和最终结果的业务事实 |
-| LangGraph | `计划 → 策略 → 审批暂停 → 执行 → 观察 → 验证 → 决策` 的流程游标 |
+| LangGraph | `计划 → 策略 → 按需审批暂停 → 执行 → 观察 → 验证 → 决策` 的流程游标 |
 | 专用 Redis 8 | LangGraph checkpoint 和 Celery broker，不保存业务最终结果 |
 | Celery Worker | 按 `run_id` 推进有界步骤，不承担流程状态或结果存储 |
 | 自治执行器 | 复用现有权限、凭据、SSH host-key 校验和审计，作为唯一远程副作用入口 |
@@ -115,12 +117,13 @@ WP0 优先验证官方 shallow Redis saver 是否满足 interrupt、resume 和�
 
 ### 最小领域模型
 
-新增四张表：
+新增五张表：
 
 - `t_ai_autonomous_run`
 - `t_ai_autonomous_step`
 - `t_ai_autonomous_event`
 - `t_ai_autonomous_artifact`
+- `t_ai_autonomous_evidence`
 
 资产增加服务端管理的 `ai_environment=production|staging|lab`，默认 `production`，
 只有管理员可以修改。审批字段保存在对应 Step 中，不再拆分 Action、Approval 或
@@ -135,20 +138,35 @@ Verification 表。
 
 实现必须满足：
 
-- 活动 Run 使用数据库租约和唯一约束防止并行执行；
+- 活动 Run 使用数据库唯一约束和 `owner + 一次性 token + 到期时间` 租约 fencing
+  防止并行执行及旧 Worker 回写；
 - Run 持久化 `revision`、`graph_version`、预算、心跳、取消请求和最新 Event 序号；
 - Event 在 Run 内单调递增，GET 快照始终比 SSE 增量权威；
 - Artifact 清控制字符、脱敏、限长后使用现有 Fernet 体系加密；
 - Artifact 默认保留 7 天，Run、Step 和 Event 默认保留 90 天；
 - Graph State 只保存 ID、阶段、计数和短摘要，不放凭据、完整命令、原始日志或完整 Prompt。
 
-### 模式和动作
+### 权限档案和动作
 
-| 模式 | 自动执行范围 |
+M1 采用成熟 Agent Harness 常见的确定性 `allow | ask | deny` 决策，不让模型直接决定
+自己是否有权执行：
+
+- `allow`：动作已落在服务端固定档案内，沿 LangGraph 连续执行；
+- `ask`：进入现有 interrupt 暂停，由所选权限档案路由给人或后续 Guardian；
+- `deny`：服务端硬拒绝，人和 Guardian 都不能把它提升为允许。
+
+用户选择的是权限档案，而不是为每条命令重新选择策略：
+
+| 权限档案 | `ask` 的处理方式 |
 |---|---|
-| `read_only` | 只读调查和验证 |
-| `assisted` | 只读自动；所有变更等待精确审批 |
-| `lab_autonomous` | 仅 `lab` 资产可选；结构化普通变更自动，高影响动作仍审批 |
+| 每次询问（`ask`） | 交给人；服务端白名单内的只读探针仍连续执行 |
+| AI 审查（`ai_review`） | S3 仅把可审查边界交给独立 Guardian；不可审查、高风险或 Guardian 不可用时转人工 |
+| 自动（`auto`） | 仅 `lab` 资产可选；固定档案内的 `allow` 连续执行，剩余 `ask` 仍转人工 |
+| 自定义（`custom`） | S3 由管理员组合固定动作类别和目标范围；不提供表达式或脚本策略语言 |
+
+旧实验数据中的 `read_only | assisted | lab_autonomous` 只用于恢复已落库的 `v1` Run；
+新 Run 使用上述四个值和条件路由的 `v2` 图。权限档案只改变 `ask` 的去向，不能扩大
+当前用户、资产、凭据、环境、预算和服务端永久拒绝规则。
 
 v1 动作保持克制：
 
@@ -159,7 +177,7 @@ v1 动作保持克制：
 - 端口、HTTP、进程、日志和服务状态验证；
 - 任意 Shell 可以提交，但始终等待绑定完整动作摘要的人工审批。
 
-以下动作即使在 `lab_autonomous` 中也必须审批：新增软件源、下载并执行、账号或 SSH
+以下动作即使在“自动”档中也必须审批：新增软件源、下载并执行、账号或 SSH
 配置、网络或防火墙、内核、Docker daemon、重启关机以及范围无法确定的修改。
 
 以下动作在 v1 永久拒绝：磁盘分区或格式化、根目录或宽范围删除、主动读取密钥、
@@ -169,10 +187,18 @@ v1 动作保持克制：
 版本；任一字段变化都会使审批失效。每个动作执行前重新检查当前用户、资产权限、
 凭据授权、资产环境和 digest。
 
+S2 只修正 `allow` 被驱动层错误改成逐条审批的问题，仍以精确 Step 人工审批处理
+`ask`。S3 在 Planner 产出完整变更计划后增加一次计划授权：计划摘要绑定有序动作
+digest、目标、凭据引用、策略版本、预算和有效期；计划内动作可连续执行，任一动作、
+参数、顺序、目标、凭据或策略变化都使授权失效并重新进入 `ask`。Guardian 只审这种
+稳定的计划边界，可复用当前配置的 Provider 但使用独立会话；普通调查不调用 Guardian，
+模型调用失败、超时、格式错误或不确定时一律转人工。
+
 ### 恢复、取消和回退
 
-Celery 任务只携带 `run_id`，按至少一次投递设计。Worker 通过数据库 revision 和租约
-幂等认领 Run，并在启动时扫描 queued、请求恢复和租约过期的 Run：
+Celery 任务只携带 `run_id`，按至少一次投递设计。Worker 通过数据库 revision 和带
+一次性 token 的租约幂等认领 Run，并在启动时及运行期间周期扫描 queued、请求恢复和
+租约过期的 Run：
 
 - 只读动作可以自动重试；
 - 已确认尚未执行的结构化动作可以继续；
@@ -196,9 +222,11 @@ M1 不承诺通用自动回滚。结构化文件补丁必须有备份并可恢�
 - 长日志始终外置为 Artifact，通过 Evidence 检索和分层摘要按需进入上下文；
 - 记录模型 usage、finish reason、耗时和截断原因，但不保存完整敏感 Prompt。
 
-### 规划接口
+### 已实现接口（默认关闭）
 
-以下接口在 M1 完成前均不可用：
+以下接口已实现，但只有管理员且在 `OGS_AI_AUTONOMY_ENABLED` 显式打开时才允许创建、
+启动或推进 Run。`GET /ai/autonomy/status` 始终可用于区分 feature flag、专用 Redis
+checkpoint 和 Worker 是否就绪；接口字段以 [AI REST/SSE 契约](API.md) 为准。
 
 | 方法 | 路径 | 行为 |
 |---|---|---|
@@ -216,35 +244,34 @@ decision 请求只提交 `{operation, expected_revision}`，且 operation 必须
 `allowed_operations`。SSE 支持 `Last-Event-ID`；断线恢复先获取权威快照，再从
 `latest_event_seq` 续传。终态 Event 到达后，前端仍重新获取最终快照。
 
-## M1 工作包
+## M1 稳定化工作包
 
 | WP | 内容 | 完成门 |
 |---|---|---|
-| WP0 | 兼容性与契约冻结：验证 LangGraph、Redis saver、Celery 与当前 Python；锁定依赖版本、状态和 API/SSE schema | interrupt/resume、Redis 重启和 Celery 投递 smoke 通过；不写业务功能 |
-| WP1 | MySQL 领域、四表、资产环境、状态转换、权限 Repository、迁移和 schema 同步 | 全新安装与升级结构一致；非法转换、越权和重复 Event 失败 |
-| WP2 | 专用 Redis 8、Celery、无副作用 Worker 入口、feature flag 和部署配置 | Worker 不启动 Web 或调度器；自治依赖停用不影响现有 AI |
-| WP3 | 结构化动作协议、三档策略、审批 digest、预算和纯函数测试 | 风险矩阵、Prompt 伪造、目标/凭据替换和 digest 篡改测试通过 |
-| WP4 | 可取消的结构化 SSH 原语、双流读取、退出码、超时、脱敏、Artifact 和审计 | 大输出不死锁；取消、超时和权限中途撤销准确；旧 SSH 接口不迁移 |
-| WP5 | LangGraph 固定图、Celery 推进、租约、幂等、恢复和 `needs_attention` | Fake Provider/Executor 下通过审批恢复、重复投递、强杀和 checkpoint 丢失 |
-| WP6 | REST/SSE 与真实 Linux 纵向闭环 | 刷新、断流、重复审批、跨用户访问和单机限制全部通过 |
-| WP7 | 独立工作台：列表、详情、时间线、Artifact 抽屉、审批、取消和恢复 UI | 桌面和窄屏验收；断线恢复状态模块有最小 Vitest |
-| WP8 | 聊天 draft 引用、执行后独立验证、故障注入、安全回归、文档和最终验收 | “已恢复/未恢复/无法确认”真实可证；完整本地测试通过 |
+| S1 安全与审批 | 领域表、资产环境、结构化动作、服务端只读探针、权限复核、不可变动作快照和 revision/digest 审批 | 全新安装/升级 schema 一致；伪装写入、越权、篡改、旧 revision 和重复审批失败 |
+| S2 执行与恢复 | 专用 Redis、Celery、LangGraph `allow/ask/deny` 路由、数据库租约、checkpoint fail-closed、可取消 SSH、写意图和未知结果 | 真实 MySQL/Redis/Worker 下通过重复投递、强杀、取消和 checkpoint 丢失测试 |
+| S3 规划、证据与产品闭环 | Planner、一次计划授权、可选 Guardian、脱敏 Evidence、独立 Verification、三态 Outcome、REST/SSE、工作台和聊天引用 | 已通过完成门；能力仍默认关闭，发布部署另行审批 |
 
-依赖顺序：
+S1、S2、S3 均已完成实现与隔离验收。能力仍默认关闭；标准发布栈不启动专用 Redis 8
+和 Worker。稳定 tag、GitHub Release、GHCR/TCR、Gitee 同名 tag、从零安装和升级/
+回滚属于合入 `main` 之后的独立发布操作，不能由旧的 CI 结果、普通聊天 draft 或
+“容器已启动”替代。
 
-1. 路线图文档合并后只创建 WP0。
-2. WP0 完成后，WP1 和 WP2 可以并行。
-3. WP3～WP8 按顺序推进，避免多个实现同时修改核心状态机。
-4. 每个 WP 对应一个 Issue、一个 PR，并从已经合并的 `main` 创建分支。
-5. M2 以后不提前创建占位 Issue。
+后续约束：
 
-每个 Issue 只需包含：目标、非目标、前置依赖、锁定的接口或状态、关键安全不变量、
-允许改动的模块、不得改动的模块、准确测试命令和隐私要求。后续实现不得自行改变
-MySQL/LangGraph/Redis/Celery 的职责、审批规则或恢复语义；需要改变时另开设计复核。
+1. 正式发布只能来自公开 `main` 上的稳定 tag；feature flag 始终默认关闭。
+2. M2 以后不提前创建占位 Issue，也不建立永久 `develop` 分支。
+3. 后续实现不得自行改变 MySQL/LangGraph/Redis/Celery 的职责、审批规则或恢复语义；
+   需要改变时另开设计复核。
 
 ## M1 最终验收
 
-每个 WP 运行相关后端或前端测试；WP8 在本地运行完整后端测试、前端类型检查、生产
+发布前验收按两层记录：标准发布路径验证从零安装、schema、镜像和前端静态产物；M1
+自治路径在独立的 Redis 8、Worker 和测试资产上验证执行、恢复、审批和结论。可复制的
+命令入口见[后端镜像与部署包发布](../operations/BACKEND_IMAGE_RELEASE.md)和
+[部署手册](../../DEPLOY.md)。
+
+每个阶段运行相关后端或前端测试；S3 在本地运行完整后端测试、前端类型检查、生产
 构建、新增的最小 Vitest 和 Compose 集成测试，不依赖远端 CI 额度。
 
 最终必须覆盖：

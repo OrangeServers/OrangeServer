@@ -596,6 +596,10 @@ def orange_init_api():
     from app.api.ai_api import register_ai_routes
     register_ai_routes(app)
 
+    # M1/S1: 自治任务最小 API（默认禁用，OGS_AI_AUTONOMY_ENABLED 门控）。
+    from app.api.autonomy_routes import register_autonomy_routes
+    register_autonomy_routes(app)
+
     # ---- 手动注册：特殊路由（WebSocket / 带参数 / 需要传参构造） ----
     # P0-1: /local/init 加 csrf_protect + ogs_auth_token
     #   原裸路由：任何匿名用户可触发初始化逻辑

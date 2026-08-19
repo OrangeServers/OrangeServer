@@ -927,8 +927,8 @@ body {
   border-bottom: 1px solid var(--ogs-header-border);
   position: relative; z-index: 10;
 }
-.layout-header .header-left { display: flex; align-items: center; gap: 14px; }
-.layout-header .header-right { display: flex; align-items: center; gap: 8px; }
+.layout-header .header-left { min-width: 0; flex: 1 1 auto; display: flex; align-items: center; gap: 14px; }
+.layout-header .header-right { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
 
 /* 折叠按钮 */
 .layout-header .collapse-btn {
@@ -955,6 +955,10 @@ body {
 
 /* 面包屑 */
 .layout-header .breadcrumb-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 15px;
   font-weight: 600;
   color: var(--ogs-text);
@@ -1022,6 +1026,21 @@ body {
   transition: transform 0.2s ease;
 }
 .layout-header .header-avatar:hover .el-icon { transform: rotate(180deg); }
+
+@media (max-width: 520px) {
+  .layout-header { padding-inline: 10px; }
+  .layout-header .header-left { gap: 8px; }
+  .layout-header .header-divider { margin-inline: 0; }
+  .layout-header .header-right { gap: 2px; }
+  .layout-header .header-icon-btn { width: 32px; height: 32px; }
+  .layout-header .header-avatar { gap: 6px; padding-right: 2px; }
+  .layout-header .header-avatar .username {
+    max-width: 76px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
 
 /* ===========================================================
  *  Page Container

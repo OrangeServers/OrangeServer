@@ -275,6 +275,16 @@ AI 运维会话默认使用 256K；只有能力标记为 1M 的 Provider 才能�
 | `OGS_AI_ALLOW_PRIVATE_PROVIDER` | `0` | ❌ | 是否允许 Provider Base URL 解析到私网、环回或链路本地地址。只有受控的私有模型网关部署才可设为 `1` |
 | `OGS_AI_DIAGNOSTIC_EVIDENCE_RETENTION_DAYS` | `7` | ❌ | AI 诊断原始脱敏证据保留天数，允许范围 1–3650 |
 | `OGS_AI_DIAGNOSTIC_REPORT_RETENTION_DAYS` | `90` | ❌ | AI 诊断结构化报告与审计引用保留天数，允许范围 1–3650 |
+| `OGS_AI_AUTONOMY_ENABLED` | 空（关闭） | ❌ | M1 自治功能门；仅隔离开发/验收环境显式设置为 `true`，普通部署保持关闭 |
+| `OGS_AI_AUTONOMY_REDIS_HOST` | 空 | 启用自治时 ✅ | 自治专用 Redis 8 地址，不得指向业务 Redis 7 |
+| `OGS_AI_AUTONOMY_REDIS_PORT` | `6379` | ❌ | 自治专用 Redis 8 端口；DB 0 用于 checkpoint，DB 1 用于 Celery broker |
+| `OGS_AI_AUTONOMY_REDIS_PASSWORD` | 空 | 网络部署时 ✅ | 自治专用 Redis 密码；与业务 Redis 密码分离，URI 保留字符由后端安全编码 |
+| `OGS_AI_AUTONOMY_LEASE_TTL_SECONDS` | `120` | ❌ | Worker 租约有效期，服务端硬下限 10 秒 |
+| `OGS_AI_AUTONOMY_APPROVAL_TTL_SECONDS` | `86400` | ❌ | draft 和待审批步骤有效期，服务端硬下限 60 秒 |
+
+M1 自治相关变量只在隔离开发/验收栈中成组设置；标准发布 Compose 不提供自治 Redis 8
+和 Worker，保持 `OGS_AI_AUTONOMY_ENABLED` 为空。启动覆盖层、就绪状态和从零验收命令
+见[部署手册](DEPLOY.md)与[发布验收说明](docs/operations/BACKEND_IMAGE_RELEASE.md)。
 
 默认支持 OpenAI、Anthropic、xAI、DeepSeek、MiniMax、Kimi、Qwen、GLM 和硅基流动。一个 Provider
 配置一个模型；管理员可以读取厂商模型列表，也可以直接填写模型 ID。Anthropic 原生 API 非

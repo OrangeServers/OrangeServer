@@ -1,0 +1,22 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        diffutils \
+        openssh-server \
+        procps \
+        util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --create-home --shell /bin/sh s2agent \
+    && passwd -d s2agent \
+    && ssh-keygen -A \
+    && mkdir -p /opt/s2-smoke \
+    && chown 10001:10001 /opt/s2-smoke
+
+COPY sshd_config /etc/ssh/sshd_config
+COPY ssh-target-entrypoint.sh /usr/local/bin/ssh-target-entrypoint
+COPY uptime-wrapper.sh /usr/local/bin/uptime
+RUN chmod 0755 /usr/local/bin/ssh-target-entrypoint /usr/local/bin/uptime
+
+EXPOSE 2222
+ENTRYPOINT ["/usr/local/bin/ssh-target-entrypoint"]

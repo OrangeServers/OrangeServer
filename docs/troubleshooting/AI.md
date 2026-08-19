@@ -38,6 +38,17 @@ Issue。服务端错误日志也应先脱敏。
 - Base URL、TLS 证书和出口网络正常；
 - 上游返回的模型 ID 与配置完全一致。
 
+自治 Planner 对 DeepSeek 等 OpenAI-compatible 推理模型的工具阶段/参数
+偏差提供一次有界协议修复：服务端指定应返回的函数，再次经过动作白名单和
+计划授权校验。Evidence 引用也受服务端生成的同一 Run ID 枚举约束；若模型在
+一次修复后仍引用 artifact/step ID，但本 Run 已有独立验证 Evidence，服务端只
+安全收口为 `inconclusive`，不会虚构成功或重放写动作。其它修复仍失败时保持
+`planner_failed` 的 fail-closed 结果。
+
+如果 Run 已经完成至少三类成功的只读探针、且尚未出现写动作，驱动会把下一轮
+阶段有界收束到 `propose_plan`，避免 DeepSeek 等兼容模型在调查充分后继续循环
+提议探针；这不会替模型生成计划，也不会绕过计划审批与动作白名单。
+
 只通过普通聊天测试不能证明 AI 运维可用，必须通过设置页的 Tool Calling 测试。
 
 ## 1M 深度诊断不可选
@@ -132,6 +143,22 @@ location /ai/ {
 当前 Analyzer 只对磁盘/inode、available 内存、负载、失败服务、Docker 状态和
 错误日志关键词使用确定性阈值。进程和端口主要作为证据展示，因为平台不知道每个
 业务的正常基线。“未发现达到规则阈值的异常”不等于系统健康。
+
+## 自治工作台无法启动或一直显示未就绪
+
+先调用 `GET /ai/autonomy/status`，以返回的 `ready` 和固定 `reason` 为准：
+
+| `reason` | 含义 | 处理 |
+|---|---|---|
+| `feature_disabled` | `OGS_AI_AUTONOMY_ENABLED` 未打开 | 标准发布栈应保持关闭。只在隔离开发/验收环境设为 `true` |
+| `redis_not_configured` | 未配置专用 Redis 8 | 设置 `OGS_AI_AUTONOMY_REDIS_HOST` 等变量，且不得指向业务 Redis 7 |
+| `checkpoint_unavailable` | Redis 8 checkpoint 不可达 | 检查隔离栈 Redis 8、密码和网络 |
+| `worker_unavailable` | 自治 Worker 未就绪 | 使用 `make docker-dev-autonomy-up` 启动覆盖层，不要只改 feature flag |
+| `ready` | flag、checkpoint 和 Worker 均可用 | 才允许创建或启动 Run |
+
+只把 `OGS_AI_AUTONOMY_ENABLED=true` 加到普通 Compose 实例会保持 `ready=false`。
+隔离栈命令见 [部署手册](../../DEPLOY.md)。自治功能关闭时，现有聊天、诊断和批量
+审批应仍可用。
 
 ## API Key 保存后页面为空
 

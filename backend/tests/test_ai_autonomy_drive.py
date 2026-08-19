@@ -1,0 +1,1688 @@
+# -*- coding: utf-8 -*-
+"""M1/S2: AutonomyDriver 驱动循环契约测试（Issue #13）。
+
+与租约/执行器测试相同的注入式 SQLite 内存引擎方案；图用
+MemorySaver 验证暂停/恢复语义（真实 Redis 8 上的 ShallowRedisSaver
+由 WP0 门槛脚本验证），心跳用替身，不碰真实线程与连接。
+"""
+import datetime
+import json
+import threading
+
+import pytest
+from cryptography.fernet import Fernet
+from langgraph.checkpoint.memory import MemorySaver
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.ai.autonomy import drive as drive_mod
+from app.ai.autonomy.drive import AutonomyDriver
+from app.ai.autonomy.executor import RunnerResult
+from app.ai.autonomy.lease import RunLeaseService
+from app.ai.autonomy.policy import PolicyDecision
+from app.ai.autonomy.repository import AutonomyRepository
+from app.ai.autonomy.state import StepStatus
+from app.core import config
+from app.core.db.database import (
+    db,
+    t_ai_autonomous_artifact,
+    t_ai_autonomous_event,
+    t_ai_autonomous_evidence,
+    t_ai_autonomous_run,
+    t_ai_autonomous_step,
+    t_group,
+    t_host,
+)
+
+SECRET_KEY = "unit-test-secret-key-for-autonomy-drive"
+TTL = 300
+
+
+def test_checkpoint_url_uses_db0_and_encodes_password(monkeypatch):
+    monkeypatch.setattr(config, "AI_AUTONOMY_REDIS_HOST", "192.0.2.10")
+    monkeypatch.setattr(config, "AI_AUTONOMY_REDIS_PORT", 6390)
+    monkeypatch.setattr(
+        config, "AI_AUTONOMY_REDIS_PASSWORD", "fake@pass:/#% ?",
+    )
+    assert drive_mod.autonomy_checkpoint_url() == (
+        "redis://:fake%40pass%3A%2F%23%25%20%3F@192.0.2.10:6390/0"
+    )
+
+
+def test_checkpoint_saver_uses_bounded_socket_timeouts(monkeypatch):
+    monkeypatch.setattr(config, "AI_AUTONOMY_ENABLED", True)
+    monkeypatch.setattr(config, "AI_AUTONOMY_REDIS_HOST", "192.0.2.10")
+    monkeypatch.setattr(config, "AI_AUTONOMY_REDIS_PORT", 6390)
+    monkeypatch.setattr(config, "AI_AUTONOMY_REDIS_PASSWORD", "fake-pass")
+    monkeypatch.setattr(config, "REDIS_CONF", {
+        "socket_connect_timeout": 1.25,
+        "socket_timeout": 2.5,
+    })
+    observed = {"setup": False, "closed": False}
+
+    class FakeSaver:
+        def setup(self):
+            observed["setup"] = True
+
+    class FakeManager:
+        def __enter__(self):
+            return FakeSaver()
+
+        def __exit__(self, *_args):
+            observed["closed"] = True
+
+    def fake_from_conn_string(url, *, connection_args=None):
+        observed["url"] = url
+        observed["connection_args"] = connection_args
+        return FakeManager()
+
+    from langgraph.checkpoint.redis import ShallowRedisSaver
+
+    monkeypatch.setattr(
+        ShallowRedisSaver, "from_conn_string",
+        staticmethod(fake_from_conn_string),
+    )
+    factory = drive_mod.make_autonomy_saver_factory()
+    assert factory is not None
+
+    _saver, close = factory()
+
+    assert observed["url"].endswith("/0")
+    assert observed["connection_args"] == {
+        "socket_connect_timeout": 1.25,
+        "socket_timeout": 2.5,
+        "retry_on_timeout": False,
+    }
+    assert observed["setup"] is True
+    close()
+    assert observed["closed"] is True
+
+
+def test_heartbeat_session_factory_works_in_background_thread():
+    """Celery creates the factory in-app, then heartbeat calls it out-of-app."""
+    from app.app_factory import app
+
+    with app.app_context():
+        factory = drive_mod.make_autonomy_heartbeat_session_factory()
+
+    observed = {}
+
+    def open_session():
+        try:
+            observed["session"] = factory()
+        except Exception as exc:  # pragma: no branch - regression signal
+            observed["error"] = exc
+
+    thread = threading.Thread(target=open_session)
+    thread.start()
+    thread.join(timeout=2)
+
+    assert thread.is_alive() is False
+    assert "error" not in observed
+    session = observed["session"]
+    try:
+        assert session.get_bind() is not None
+    finally:
+        session.close()
+
+
+def test_checkpoint_writes_require_the_exact_current_claim(env):
+    run = env["create_queued_run"]()
+    claim_a = env["claim"](run["id"])
+    config_payload = {
+        "configurable": {
+            "thread_id": drive_mod.THREAD_ID_PREFIX + run["id"],
+        },
+    }
+    calls = []
+
+    class RecordingSaver(MemorySaver):
+        def put(self, *args, **kwargs):
+            calls.append(("put", args, kwargs))
+            return "put-ok"
+
+        def put_writes(self, *args, **kwargs):
+            calls.append(("put_writes", args, kwargs))
+            return "writes-ok"
+
+    driver_a = env["make_driver"]()
+    driver_a._active_lease_token = claim_a["lease_token"]
+    saver_a = driver_a._fence_checkpoint_saver(
+        run["id"], RecordingSaver(),
+    )
+
+    row = _run_row(env, run["id"])
+    row.lease_owner = "driver-test-worker-b"
+    row.lease_token = "claim-token-b"
+    env["session"].commit()
+
+    with pytest.raises(drive_mod.DriveAbort, match="claim fence lost"):
+        saver_a.put(config_payload)
+    with pytest.raises(drive_mod.DriveAbort, match="claim fence lost"):
+        saver_a.put_writes(config_payload, [("channel", "value")], "task")
+    assert calls == []
+
+    driver_b = env["make_driver"](worker_id="driver-test-worker-b")
+    driver_b._active_lease_token = "claim-token-b"
+    saver_b = driver_b._fence_checkpoint_saver(
+        run["id"], RecordingSaver(),
+    )
+
+    assert saver_b.put(config_payload) == "put-ok"
+    assert saver_b.put_writes(
+        config_payload, [("channel", "value")], "task",
+    ) == "writes-ok"
+    assert [call[0] for call in calls] == ["put", "put_writes"]
+    assert calls[0][1][0] is config_payload
+    assert calls[1][1][0] is config_payload
+
+
+class FakePlatform:
+    def __init__(self, owner, role, state=None):
+        pass
+
+    def validate_asset_ids(self, asset_ids):
+        return True
+
+    def resolve_system_user(self, sys_user_id):
+        return {"id": int(sys_user_id), "alias": "readonly"}
+
+
+class FakeRunner:
+    def __init__(self):
+        self.calls = []
+        self.result = RunnerResult(exit_code=0, output="ok")
+
+    def __call__(self, command, **kwargs):
+        self.calls.append({"command": command, **kwargs})
+        return self.result
+
+
+class FakeExecutor:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def execute_step(self, owner, role, run_id, step_id, **kwargs):
+        self.calls.append((owner, role, run_id, step_id, kwargs))
+        return dict(self.result)
+
+
+class FakeHeartbeater:
+    """替身心跳：记录 renew 调用；lost 可直接置位模拟租约被抢。"""
+
+    instances = []
+
+    def __init__(self, renew_fn, interval_seconds):
+        self.renew_fn = renew_fn
+        self.interval = interval_seconds
+        self.started = False
+        self.stopped = False
+        self.lost = False
+        FakeHeartbeater.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+
+@pytest.fixture
+def env(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "OGS_FERNET_KEYS", Fernet.generate_key().decode("ascii"),
+    )
+    FakeHeartbeater.instances = []
+    db_path = (tmp_path / "autonomy-drive.db").as_posix()
+    engine = create_engine(
+        "sqlite:///%s" % db_path,
+        connect_args={"check_same_thread": False},
+    )
+    session_factory = sessionmaker(bind=engine)
+    session = session_factory()
+    db.metadata.create_all(
+        engine,
+        tables=[t_group.__table__, t_host.__table__,
+                t_ai_autonomous_run.__table__,
+                t_ai_autonomous_step.__table__,
+                t_ai_autonomous_event.__table__,
+                t_ai_autonomous_artifact.__table__,
+                t_ai_autonomous_evidence.__table__],
+    )
+
+    platform_state = {"asset_ok": True}
+    repo = AutonomyRepository(
+        session, SECRET_KEY,
+        platform_factory=lambda owner, role: FakePlatform(owner, role),
+    )
+    runner = FakeRunner()
+
+    host_seq = {"n": 0}
+
+    def create_queued_run(**kwargs):
+        graph_version = kwargs.pop("graph_version", None)
+        legacy_mode = kwargs.get("mode") if kwargs.get("mode") in {
+            "read_only", "assisted", "lab_autonomous",
+        } else None
+        if legacy_mode is not None:
+            kwargs["mode"] = "ask"
+        host_seq["n"] += 1
+        n = host_seq["n"]
+        host = t_host(
+            alias="web-%02d" % n, host_ip="203.0.113.%d" % (120 + n),
+            host_port=22, ai_environment="lab",
+        )
+        session.add(host)
+        session.commit()
+        payload = dict(
+            goal="diagnose latency",
+            host_id=int(host.id),
+            system_user_id=19,
+            mode="ask",
+        )
+        payload.update(kwargs)
+        run = repo.create_run("admin", "admin", **payload)
+        if graph_version is not None or legacy_mode is not None:
+            row = session.get(t_ai_autonomous_run, run["id"])
+            if graph_version is not None:
+                row.graph_version = graph_version
+            if legacy_mode is not None:
+                row.mode = legacy_mode
+            session.commit()
+        return repo.start_run("admin", "admin", run["id"])
+
+    planner_calls = {"n": 0}
+
+    def fake_planner(context):
+        """第一轮提案一个探针，之后不再提案（驱动循环应收敛）。"""
+        planner_calls["n"] += 1
+        if planner_calls["n"] > 1:
+            return []
+        step = context["repo"].propose_probe(
+            context["owner"], context["role"],
+            context["run_id"], "system.load",
+        )
+        return [step["id"]]
+
+    saver = MemorySaver()
+
+    def make_driver(**overrides):
+        kwargs = dict(
+            planner=fake_planner,
+            runner=runner,
+            platform_factory=lambda owner, role: FakePlatform(owner, role),
+            saver_factory=lambda: (saver, lambda: None),
+            heartbeater_factory=FakeHeartbeater,
+            heartbeat_session_factory=session_factory,
+            lease_ttl=TTL,
+            worker_id="driver-test-worker",
+        )
+        kwargs.update(overrides)
+        return AutonomyDriver(session, SECRET_KEY, **kwargs)
+
+    lease = RunLeaseService(session)
+
+    def claim(run_id):
+        claimed = lease.claim_run(run_id, "driver-test-worker", TTL)
+        assert claimed is not None
+        return claimed
+
+    env = {
+        "session": session,
+        "repo": repo,
+        "runner": runner,
+        "lease": lease,
+        "saver": saver,
+        "create_queued_run": create_queued_run,
+        "make_driver": make_driver,
+        "claim": claim,
+    }
+    yield env
+    session.close()
+    engine.dispose()
+
+
+def _run_row(env, run_id):
+    return env["session"].query(t_ai_autonomous_run).filter_by(
+        id=run_id,
+    ).one()
+
+
+def _step_row(env, step_id):
+    return env["session"].query(t_ai_autonomous_step).filter_by(
+        id=step_id,
+    ).one()
+
+
+def _events(env, run_id):
+    return env["session"].query(t_ai_autonomous_event).filter_by(
+        run_id=run_id,
+    ).order_by(t_ai_autonomous_event.sequence.asc()).all()
+
+
+def _pending_step(env, run_id):
+    return env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run_id, status=StepStatus.WAITING_APPROVAL.value,
+    ).first()
+
+
+def _approve_and_drive(env, driver, run_id, operation="approve"):
+    """按权威快照的 revision 决策后再次驱动（模拟决策接口投递）。"""
+    run = _run_row(env, run_id)
+    step = _pending_step(env, run_id)
+    env["repo"].decide(
+        "admin", "admin", run_id, step.id,
+        operation=operation, expected_revision=int(run.revision),
+    )
+    claimed = env["claim"](run_id)
+    return driver.drive(run_id, claimed)
+
+
+# ---------------------------------------------------------------------------
+# 首轮驱动：规划 → 策略 → 审批暂停
+# ---------------------------------------------------------------------------
+
+def test_v2_allowed_probe_executes_without_per_step_approval(env):
+    run = env["create_queued_run"](mode="ask")
+    assert _run_row(env, run["id"]).graph_version == "v2"
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    row = _run_row(env, run["id"])
+    assert row.status == "completed"
+    step = env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).one()
+    assert step.status == "succeeded"
+    assert _pending_step(env, run["id"]) is None
+    event_types = [event.event_type for event in _events(env, run["id"])]
+    assert "step_policy_decided" in event_types
+    assert "steps_waiting_approval" not in event_types
+
+
+def test_v2_ask_pauses_without_calling_the_runner(env, monkeypatch):
+    monkeypatch.setattr(
+        drive_mod, "classify_action",
+        lambda *_args: (PolicyDecision.ASK, "test boundary needs approval"),
+    )
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_PAUSED
+    assert env["runner"].calls == []
+    assert _run_row(env, run["id"]).status == "waiting_approval"
+    assert _pending_step(env, run["id"]) is not None
+
+
+def test_v2_tampered_action_is_denied_without_calling_the_runner(env):
+    planner_calls = {"count": 0}
+
+    def tampering_planner(context):
+        planner_calls["count"] += 1
+        if planner_calls["count"] > 1:
+            return []
+        step = context["repo"].propose_probe(
+            context["owner"], context["role"],
+            context["run_id"], "system.load",
+        )
+        row = _step_row(env, step["id"])
+        snapshot = json.loads(row.action_json)
+        snapshot["action_version"] += 1
+        row.action_json = json.dumps(snapshot, sort_keys=True)
+        env["session"].commit()
+        return [step["id"]]
+
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=tampering_planner)
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert env["runner"].calls == []
+    step = env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).one()
+    assert step.status == "failed"
+    assert step.note == "malformed action snapshot"
+
+
+def test_first_drive_pauses_at_approval(env):
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_PAUSED
+    row = _run_row(env, run["id"])
+    assert row.status == "waiting_approval"
+    step = _pending_step(env, run["id"])
+    assert step is not None
+    # 暂停即释放租约：等人审批期间不占租约。
+    assert row.lease_owner is None
+    assert row.lease_token is None
+    assert row.lease_expires_at is None
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "steps_waiting_approval" in types
+
+
+def test_checkpoint_does_not_store_the_run_goal(env):
+    secret_goal = "diagnose password=checkpoint-secret"
+    run = env["create_queued_run"](
+        goal=secret_goal, mode="assisted", graph_version="v1",
+    )
+    driver = env["make_driver"]()
+
+    assert driver.drive(run["id"], env["claim"](run["id"])) == (
+        drive_mod.RESULT_PAUSED
+    )
+
+    checkpoint = env["saver"].get_tuple({
+        "configurable": {
+            "thread_id": drive_mod.THREAD_ID_PREFIX + run["id"],
+        },
+    })
+    assert checkpoint is not None
+    serialized = json.dumps(checkpoint.checkpoint, sort_keys=True)
+    assert secret_goal not in serialized
+    assert "checkpoint-secret" not in serialized
+
+
+def test_second_drive_without_decision_stays_paused(env):
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+    assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
+
+    # 决策未到又被投递（重复投递场景）：健康暂停的租约已释放，
+    # 再认领直接失败，任务跳过，绝不产生副作用。
+    assert env["lease"].claim_run(
+        run["id"], "driver-test-worker", TTL,
+    ) is None
+    assert len(env["runner"].calls) == 0
+    assert _run_row(env, run["id"]).status == "waiting_approval"
+
+
+# ---------------------------------------------------------------------------
+# 恢复：approve 执行 / reject 跳过
+# ---------------------------------------------------------------------------
+
+def test_resume_approved_executes_and_completes(env):
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+    assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
+
+    result = _approve_and_drive(env, driver, run["id"], "approve")
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    row = _run_row(env, run["id"])
+    assert row.status == "completed"
+    assert row.lease_owner is None
+    assert row.lease_token is None
+    step = env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).one()
+    assert step.status == "succeeded"
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "run_completed" in types
+
+
+def test_resume_rejected_skips_execution(env):
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+    assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
+
+    result = _approve_and_drive(env, driver, run["id"], "reject")
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert env["runner"].calls == []
+    step = env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).one()
+    assert step.status == "failed"
+    assert step.note == "rejected"
+
+
+def test_cancel_between_pause_and_resume_skips_execution(env):
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+    assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
+
+    row = _run_row(env, run["id"])
+    revision = int(row.revision)
+    env["repo"].decide(
+        "admin", "admin", run["id"], _pending_step(env, run["id"]).id,
+        operation="approve", expected_revision=revision,
+    )
+    # 审批后、恢复前请求取消：已批准步骤也不得开跑。
+    row = _run_row(env, run["id"])
+    row.cancel_requested = True
+    env["session"].commit()
+
+    claimed = env["claim"](run["id"])
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_CANCELLED
+    assert env["runner"].calls == []
+    assert _run_row(env, run["id"]).status == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# fail-closed：前置缺失绝不产生副作用
+# ---------------------------------------------------------------------------
+
+def test_no_planner_fails_closed(env):
+    run = env["create_queued_run"]()
+    driver = env["make_driver"](planner=None)
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_FAILED
+    row = _run_row(env, run["id"])
+    assert row.status == "failed"
+    assert row.lease_owner is None
+    assert row.lease_token is None
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "planner_unavailable" in types
+    assert env["runner"].calls == []
+
+
+def test_planner_proposal_error_fails_run_closed(env):
+    """S3：模型/供应商侧可预期失败一律 fail-closed，不重试。"""
+    from app.ai.autonomy.planner import PlannerProposalError
+
+    def failing_planner(context):
+        raise PlannerProposalError("provider_call_failed")
+
+    run = env["create_queued_run"]()
+    driver = env["make_driver"](planner=failing_planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_FAILED
+    row = _run_row(env, run["id"])
+    assert row.status == "failed"
+    assert row.lease_owner is None
+    assert row.lease_token is None
+    events = _events(env, run["id"])
+    failed = [e for e in events if e.event_type == "planner_failed"]
+    assert len(failed) == 1
+    assert json.loads(failed[0].payload_json)["note"] == (
+        "provider_call_failed"
+    )
+    assert env["runner"].calls == []
+
+
+def test_planner_context_carries_authoritative_budget_and_history(env):
+    """S3：预算余量与观察回灌由服务端从 MySQL 推导，模型只能读。"""
+    observed = {}
+
+    def capturing_planner(context):
+        observed.update(context)
+        return []
+
+    run = env["create_queued_run"]()
+    driver = env["make_driver"](planner=capturing_planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert observed["budget"] == {
+        "remaining_loops": 20,
+        "remaining_actions": 30,
+    }
+    assert observed["history"] == []
+    assert observed["goal"] == "diagnose latency"
+
+
+def test_planner_context_forces_plan_after_three_distinct_probes(env):
+    """The phase handoff is derived from authoritative successful actions."""
+    run = env["create_queued_run"]()
+    for probe_id in ("system.load", "system.memory", "system.disk_usage"):
+        step = env["repo"].propose_probe(
+            "admin", "admin", run["id"], probe_id,
+        )
+        row = _step_row(env, step["id"])
+        row.status = StepStatus.SUCCEEDED.value
+    env["session"].commit()
+
+    driver = env["make_driver"]()
+
+    assert driver._planner_requires_plan(run["id"]) is True
+
+
+def test_no_saver_fails_closed(env):
+    run = env["create_queued_run"]()
+    driver = env["make_driver"](saver_factory=None)
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_CHECKPOINT_UNAVAILABLE
+    row = _run_row(env, run["id"])
+    assert row.status == "needs_attention"
+    assert row.lease_owner is None
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "checkpoint_unavailable" in types
+
+
+def test_saver_factory_failure_persists_attention_and_releases_lease(env):
+    run = env["create_queued_run"]()
+
+    def broken_factory():
+        raise RuntimeError("redis unavailable")
+
+    driver = env["make_driver"](saver_factory=broken_factory)
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_CHECKPOINT_UNAVAILABLE
+    row = _run_row(env, run["id"])
+    assert row.status == "needs_attention"
+    assert row.lease_owner is None
+    assert row.lease_token is None
+    assert [event.event_type for event in _events(env, run["id"])].count(
+        "checkpoint_unavailable"
+    ) == 1
+
+
+def test_saver_access_failure_persists_attention_and_releases_lease(env):
+    run = env["create_queued_run"]()
+
+    class BrokenSaver(MemorySaver):
+        def get_tuple(self, _config):
+            from redis.exceptions import ConnectionError
+
+            raise ConnectionError("checkpoint backend unavailable")
+
+    driver = env["make_driver"](
+        saver_factory=lambda: (BrokenSaver(), lambda: None),
+    )
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_CHECKPOINT_UNAVAILABLE
+    row = _run_row(env, run["id"])
+    assert row.status == "needs_attention"
+    assert row.lease_owner is None
+    assert row.lease_token is None
+    assert [event.event_type for event in _events(env, run["id"])].count(
+        "checkpoint_unavailable"
+    ) == 1
+
+
+def test_non_checkpoint_runtime_error_is_not_misclassified(env):
+    run = env["create_queued_run"]()
+
+    def broken_planner(_context):
+        raise RuntimeError("redis policy issue")
+
+    driver = env["make_driver"](planner=broken_planner)
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_NEEDS_ATTENTION
+    assert _run_row(env, run["id"]).status == "running"
+    assert "checkpoint_unavailable" not in {
+        event.event_type for event in _events(env, run["id"])
+    }
+
+
+def test_checkpoint_failure_cannot_overwrite_new_claim(env):
+    run = env["create_queued_run"]()
+    claimed = env["claim"](run["id"])
+    row = _run_row(env, run["id"])
+    row.lease_token = "new-claim-token"
+    env["session"].commit()
+
+    def broken_factory():
+        raise RuntimeError("checkpoint setup failed")
+
+    driver = env["make_driver"](saver_factory=broken_factory)
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_LEASE_LOST
+    row = _run_row(env, run["id"])
+    assert row.status == "running"
+    assert row.lease_token == "new-claim-token"
+    assert "checkpoint_unavailable" not in {
+        event.event_type for event in _events(env, run["id"])
+    }
+
+
+def test_finalize_cannot_overwrite_same_identity_new_claim(env):
+    run = env["create_queued_run"]()
+    claimed = env["claim"](run["id"])
+
+    def takeover_then_finish(_context):
+        row = _run_row(env, run["id"])
+        row.lease_token = "new-claim-token"
+        env["session"].commit()
+        return []
+
+    driver = env["make_driver"](planner=takeover_then_finish)
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_LEASE_LOST
+    row = _run_row(env, run["id"])
+    assert row.status == "running"
+    assert row.lease_token == "new-claim-token"
+    assert "run_completed" not in {
+        event.event_type for event in _events(env, run["id"])
+    }
+
+
+def test_failure_path_cannot_overwrite_same_identity_new_claim(env):
+    run = env["create_queued_run"]()
+    claimed = env["claim"](run["id"])
+
+    def takeover_then_fail(_context):
+        row = _run_row(env, run["id"])
+        row.lease_token = "new-claim-token"
+        env["session"].commit()
+        raise drive_mod.PlannerUnavailable("planner unavailable")
+
+    driver = env["make_driver"](planner=takeover_then_fail)
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_LEASE_LOST
+    row = _run_row(env, run["id"])
+    assert row.status == "running"
+    assert row.lease_token == "new-claim-token"
+    assert "planner_unavailable" not in {
+        event.event_type for event in _events(env, run["id"])
+    }
+
+
+def test_planner_proposal_cannot_write_after_same_identity_takeover(env):
+    run = env["create_queued_run"]()
+    claimed = env["claim"](run["id"])
+
+    def takeover_before_proposal(context):
+        row = _run_row(env, run["id"])
+        row.lease_token = "new-claim-token"
+        env["session"].commit()
+        step = context["repo"].propose_probe(
+            context["owner"], context["role"],
+            context["run_id"], "system.load",
+        )
+        return [step["id"]]
+
+    driver = env["make_driver"](planner=takeover_before_proposal)
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_LEASE_LOST
+    assert env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).count() == 0
+    assert _run_row(env, run["id"]).lease_token == "new-claim-token"
+    assert "step_proposed" not in {
+        event.event_type for event in _events(env, run["id"])
+    }
+
+
+def test_drive_does_not_checkpoint_after_exact_claim_takeover(env):
+    run = env["create_queued_run"]()
+    claimed = env["claim"](run["id"])
+    takeover = {"done": False}
+    stale_writes = []
+
+    class RecordingSaver(MemorySaver):
+        def put(self, *args, **kwargs):
+            if takeover["done"]:
+                stale_writes.append("put")
+            return super().put(*args, **kwargs)
+
+        def put_writes(self, *args, **kwargs):
+            if takeover["done"]:
+                stale_writes.append("put_writes")
+            return super().put_writes(*args, **kwargs)
+
+    def takeover_after_plan(_context):
+        row = _run_row(env, run["id"])
+        row.lease_token = "new-claim-token"
+        env["session"].commit()
+        takeover["done"] = True
+        return []
+
+    driver = env["make_driver"](
+        planner=takeover_after_plan,
+        saver_factory=lambda: (RecordingSaver(), lambda: None),
+    )
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_LEASE_LOST
+    assert stale_writes == []
+    assert _run_row(env, run["id"]).lease_token == "new-claim-token"
+    assert "checkpoint_unavailable" not in {
+        event.event_type for event in _events(env, run["id"])
+    }
+
+
+def test_policy_cannot_persist_after_same_identity_takeover(env):
+    run = env["create_queued_run"]()
+    claimed = env["claim"](run["id"])
+
+    def propose_then_takeover(context):
+        step = context["repo"].propose_probe(
+            context["owner"], context["role"],
+            context["run_id"], "system.load",
+        )
+        row = _run_row(env, run["id"])
+        row.lease_token = "new-claim-token"
+        env["session"].commit()
+        return [step["id"]]
+
+    driver = env["make_driver"](planner=propose_then_takeover)
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_LEASE_LOST
+    step = env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).one()
+    assert step.status == StepStatus.PROPOSED.value
+    assert _run_row(env, run["id"]).lease_token == "new-claim-token"
+    event_types = {
+        event.event_type for event in _events(env, run["id"])
+    }
+    assert "step_proposed" in event_types
+    assert "step_policy_decided" not in event_types
+
+
+def test_unknown_graph_version_fails_closed(env):
+    run = env["create_queued_run"]()
+    row = _run_row(env, run["id"])
+    row.graph_version = "v9-does-not-exist"
+    env["session"].commit()
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_FAILED
+    row = _run_row(env, run["id"])
+    assert row.status == "failed"
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "unknown_graph_version" in types
+
+
+def test_cancel_before_start_confirms_cancelled(env):
+    run = env["create_queued_run"]()
+    row = _run_row(env, run["id"])
+    row.cancel_requested = True
+    env["session"].commit()
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_CANCELLED
+    row = _run_row(env, run["id"])
+    assert row.status == "cancelled"
+    assert row.lease_token is None
+    assert env["runner"].calls == []
+
+
+def test_cancel_request_cannot_overwrite_needs_attention(env):
+    run = env["create_queued_run"]()
+    row = _run_row(env, run["id"])
+    row.status = "needs_attention"
+    row.cancel_requested = True
+    env["session"].commit()
+    driver = env["make_driver"]()
+
+    result = driver.drive(run["id"], {"revision": int(row.revision)})
+
+    assert result == drive_mod.RESULT_NEEDS_ATTENTION
+    assert _run_row(env, run["id"]).status == "needs_attention"
+    assert env["runner"].calls == []
+
+
+def test_finalize_preserves_unknown_outcome_over_cancel(env):
+    run = env["create_queued_run"]()
+    claimed = env["claim"](run["id"])
+    row = _run_row(env, run["id"])
+    row.status = "needs_attention"
+    row.cancel_requested = True
+    env["session"].commit()
+    driver = env["make_driver"]()
+    driver._active_lease_token = claimed["lease_token"]
+
+    result = driver._finalize(run["id"], {"decision": "cancelled"})
+
+    assert result == drive_mod.RESULT_NEEDS_ATTENTION
+    row = _run_row(env, run["id"])
+    assert row.status == "needs_attention"
+    assert row.completed_at is None
+
+
+def test_terminal_run_is_skipped(env):
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+    assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
+    result = _approve_and_drive(env, driver, run["id"], "approve")
+    assert result == drive_mod.RESULT_COMPLETED
+
+    # 终态 Run 再被投递：认领直接失败，任务跳过，不改状态。
+    assert env["lease"].claim_run(
+        run["id"], "driver-test-worker", TTL,
+    ) is None
+    assert _run_row(env, run["id"]).status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# 租约丢失与预算
+# ---------------------------------------------------------------------------
+
+def test_lease_lost_aborts_without_side_effects(env):
+    run = env["create_queued_run"]()
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+
+    # 首个节点边界前租约就被抢走：立即中止。
+    def factory(renew_fn, interval):
+        heartbeater = FakeHeartbeater(renew_fn, interval)
+        heartbeater.lost = True
+        return heartbeater
+
+    driver._heartbeater_factory = factory
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_LEASE_LOST
+    assert env["runner"].calls == []
+    row = _run_row(env, run["id"])
+    # 租约已不属于自己：不写状态、不释放，留给新持有者。
+    assert row.status == "running"
+    assert row.lease_owner == "driver-test-worker"
+
+
+def test_loop_budget_exhausted_marks_failed(env):
+    run = env["create_queued_run"](budget_payload={"max_loops": 1})
+    # 规划器不提案：首轮 decide 即触发循环预算上限。
+    driver = env["make_driver"](planner=lambda context: [])
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_FAILED
+    row = _run_row(env, run["id"])
+    assert row.status == "failed"
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "budget_exhausted" in types
+
+
+def test_duration_budget_exhausted_before_side_effects(env):
+    run = env["create_queued_run"]()
+    row = _run_row(env, run["id"])
+    row.started_at = (
+        drive_mod._utcnow() - datetime.timedelta(seconds=3601)
+    )
+    env["session"].commit()
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_FAILED
+    assert _run_row(env, run["id"]).status == "failed"
+    assert env["runner"].calls == []
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "budget_exhausted" in types
+
+
+def test_remaining_duration_caps_command_timeout(env):
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
+    row = _run_row(env, run["id"])
+    row.started_at = (
+        drive_mod._utcnow() - datetime.timedelta(seconds=3590)
+    )
+    env["session"].commit()
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+    assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
+
+    result = _approve_and_drive(env, driver, run["id"], "approve")
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    timeout = env["runner"].calls[0]["timeout_seconds"]
+    assert 1 <= timeout <= 10
+
+
+def test_lease_loss_during_remote_execution_aborts_graph(env):
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+    assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
+    row = _run_row(env, run["id"])
+    step = _pending_step(env, run["id"])
+    env["repo"].decide(
+        "admin", "admin", run["id"], step.id,
+        operation="approve", expected_revision=int(row.revision),
+    )
+    fake_executor = FakeExecutor({
+        "step_status": "running",
+        "run_status": "running",
+        "revision": int(_run_row(env, run["id"]).revision),
+        "termination": "lease_lost",
+    })
+    driver.executor = fake_executor
+    claimed = env["claim"](run["id"])
+
+    result = driver.drive(run["id"], claimed)
+
+    assert result == drive_mod.RESULT_LEASE_LOST
+    assert len(fake_executor.calls) == 1
+    call_kwargs = fake_executor.calls[0][4]
+    assert call_kwargs["lease_owner"] == "driver-test-worker"
+    assert callable(call_kwargs["control_probe"])
+    assert _run_row(env, run["id"]).status == "running"
+
+
+def test_heartbeat_started_and_stopped(env):
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+    assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
+
+    assert len(FakeHeartbeater.instances) == 1
+    heartbeater = FakeHeartbeater.instances[0]
+    assert heartbeater.started is True
+    assert heartbeater.stopped is True
+    # 心跳间隔必须显著短于租约 TTL。
+    assert heartbeater.interval == TTL // 4
+
+
+# ---------------------------------------------------------------------------
+# 恢复扫描与驱动循环的分工
+# ---------------------------------------------------------------------------
+
+def test_scan_excludes_healthy_paused_runs(env):
+    run = env["create_queued_run"](mode="assisted", graph_version="v1")
+    driver = env["make_driver"]()
+    claimed = env["claim"](run["id"])
+    assert driver.drive(run["id"], claimed) == drive_mod.RESULT_PAUSED
+
+    # 健康暂停（租约已释放）不是恢复候选，由决策接口显式唤醒。
+    candidates = env["lease"].scan_recoverable(
+        now=datetime.datetime.utcnow() + datetime.timedelta(hours=1),
+    )
+    assert candidates == []
+
+    # 决策后回到 queued，重新进入扫描候选。
+    row = _run_row(env, run["id"])
+    env["repo"].decide(
+        "admin", "admin", run["id"], _pending_step(env, run["id"]).id,
+        operation="approve", expected_revision=int(row.revision),
+    )
+    candidates = env["lease"].scan_recoverable()
+    assert [c["run_id"] for c in candidates] == [run["id"]]
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 2：计划级授权——一次批准连续执行，篡改即失效
+# ---------------------------------------------------------------------------
+
+def _plan_planner(actions, summary="restart nginx"):
+    """首轮提议一张计划，之后不再提议（驱动循环应收敛）。"""
+    calls = {"n": 0}
+
+    def planner(context):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            return []
+        step = context["repo"].propose_plan(
+            context["owner"], context["role"], context["run_id"],
+            summary, actions,
+        )
+        return [step["id"]]
+
+    return planner
+
+
+def _plan_step(env, run_id):
+    return env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run_id, kind="plan",
+    ).one()
+
+
+def _approve_plan(env, run_id):
+    run = _run_row(env, run_id)
+    plan = _plan_step(env, run_id)
+    env["repo"].decide(
+        "admin", "admin", run_id, plan.id,
+        operation="approve", expected_revision=int(run.revision),
+    )
+
+
+def test_approved_plan_executes_continuously_without_asking_again(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_PAUSED
+    assert env["runner"].calls == []
+    assert _run_row(env, run["id"]).status == "waiting_approval"
+    assert _plan_step(env, run["id"]).status == "waiting_approval"
+
+    _approve_plan(env, run["id"])
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    # 未变更的动作按快照连续执行，绝不逐条再问。
+    assert len(env["runner"].calls) == 1
+    assert "systemctl restart nginx" in env["runner"].calls[0]["command"]
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "succeeded"
+    action_steps = env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).all()
+    assert len(action_steps) == 1
+    assert action_steps[0].status == "succeeded"
+    snapshot = json.loads(plan.action_json)
+    # 展开的 Step 就是提案时预分配、被 digest 覆盖的那一个。
+    assert action_steps[0].id == snapshot["actions"][0]["step_id"]
+    assert action_steps[0].action_digest == (
+        snapshot["ordered_action_digests"][0]
+    )
+    events = _events(env, run["id"])
+    waiting = [
+        e for e in events if e.event_type == "steps_waiting_approval"
+    ]
+    assert len(waiting) == 1  # 只为计划审批暂停过一次
+    decided = [
+        e for e in events
+        if e.event_type == "step_policy_decided"
+        and json.loads(e.payload_json).get("step_id")
+        == action_steps[0].id
+    ]
+    assert len(decided) == 1
+    assert json.loads(decided[0].payload_json)["decision"] == "allow"
+    completed = [e for e in events if e.event_type == "plan_completed"]
+    assert len(completed) == 1
+    assert json.loads(completed[0].payload_json)["action_count"] == 1
+
+
+def test_probe_only_plan_executes_without_any_pause(env):
+    planner = _plan_planner(
+        [{"kind": "probe", "params": {"probe_id": "system.load"}}],
+        summary="recheck load",
+    )
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    assert _plan_step(env, run["id"]).status == "succeeded"
+    types = [e.event_type for e in _events(env, run["id"])]
+    assert "steps_waiting_approval" not in types
+    assert "plan_completed" in types
+
+
+def test_tampered_plan_is_invalidated_before_any_side_effect(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+
+    _approve_plan(env, run["id"])
+    # 批准之后篡改快照：合法审批也必须立即失效。
+    plan = _plan_step(env, run["id"])
+    snapshot = json.loads(plan.action_json)
+    snapshot["actions"][0]["parameters"]["unit"] = "attacker"
+    plan.action_json = json.dumps(snapshot)
+    env["session"].commit()
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert env["runner"].calls == []
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "failed"
+    assert "digest_mismatch" in (plan.note or "")
+    invalidated = [
+        e for e in _events(env, run["id"])
+        if e.event_type == "plan_authorization_invalidated"
+    ]
+    assert len(invalidated) == 1
+    assert json.loads(invalidated[0].payload_json)["reason"] == (
+        "digest_mismatch"
+    )
+    # 半张计划绝不下场：零动作 Step、零远程副作用。
+    assert env["session"].query(t_ai_autonomous_step).filter_by(
+        run_id=run["id"], kind="action",
+    ).count() == 0
+
+
+def test_binding_drift_invalidates_an_approved_plan(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+
+    _approve_plan(env, run["id"])
+    # 批准后服务端预算被收紧：展开前的权威复核必须拦下。
+    row = _run_row(env, run["id"])
+    budget = json.loads(row.budget_json)
+    budget["max_actions"] = 0
+    row.budget_json = json.dumps(budget)
+    env["session"].commit()
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert env["runner"].calls == []
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "failed"
+    assert "budget_changed" in (plan.note or "")
+    invalidated = [
+        e for e in _events(env, run["id"])
+        if e.event_type == "plan_authorization_invalidated"
+    ]
+    assert len(invalidated) == 1
+    assert json.loads(invalidated[0].payload_json)["reason"] == (
+        "budget_changed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 3：可选 Guardian——ai_review 稳定计划边界的独立复核
+# ---------------------------------------------------------------------------
+
+class FakeGuardian:
+    """替身复核器：记录调用上下文；可配置决策、异常或瞆形输出。"""
+
+    def __init__(self, decision="approve", reason="bounded", error=None):
+        self.decision = decision
+        self.reason = reason
+        self.error = error
+        self.calls = []
+
+    def __call__(self, context):
+        self.calls.append(context)
+        if self.error is not None:
+            raise self.error
+        return {"decision": self.decision, "reason": self.reason}
+
+
+def _guardian_events(env, run_id):
+    return [
+        e for e in _events(env, run_id)
+        if e.event_type == "guardian_decision"
+    ]
+
+
+def test_guardian_approves_ai_review_plan_without_human_pause(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    guardian = FakeGuardian("approve", "aligned with goal")
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    # approve：无人工暂停，直达展开执行。
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    assert "systemctl restart nginx" in env["runner"].calls[0]["command"]
+    assert _plan_step(env, run["id"]).status == "succeeded"
+    assert len(guardian.calls) == 1
+    context = guardian.calls[0]
+    assert context["goal"] == "diagnose latency"
+    assert context["summary"] == "restart nginx"
+    # 独立上下文：凭据与原始日志绝不进入复核输入。
+    serialized = json.dumps(context, ensure_ascii=False, default=str)
+    for marker in ("password", "secret", "private_key"):
+        assert marker not in serialized.lower()
+    events = _events(env, run["id"])
+    # 提案通知（plan_proposed 时 needs_ask）不算暂停；Run 最终完成
+    # 且零 steps_waiting_approval 暂停事件之外的来源即无人工暂停。
+    paused = [
+        e for e in events if e.event_type == "steps_waiting_approval"
+    ]
+    proposed = [e for e in events if e.event_type == "plan_proposed"]
+    assert len(paused) == len(proposed)  # 仅提案时的一条通知，无驱动暂停
+    decisions = _guardian_events(env, run["id"])
+    assert len(decisions) == 1
+    payload = json.loads(decisions[0].payload_json)
+    assert payload["decision"] == "approve"
+    assert payload["reason"] == "aligned with goal"
+
+
+def test_guardian_reject_fails_plan_and_never_executes(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    guardian = FakeGuardian("reject", "scope drift")
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    # reject：计划落 failed，零副作用；循环回 planner 后收敛收口。
+    assert result == drive_mod.RESULT_COMPLETED
+    assert env["runner"].calls == []
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "failed"
+    assert "guardian rejected" in (plan.note or "")
+    events = _events(env, run["id"])
+    paused = [
+        e for e in events if e.event_type == "steps_waiting_approval"
+    ]
+    proposed = [e for e in events if e.event_type == "plan_proposed"]
+    assert len(paused) == len(proposed)  # 无驱动层的人工暂停
+    decisions = _guardian_events(env, run["id"])
+    assert len(decisions) == 1
+    assert json.loads(decisions[0].payload_json)["decision"] == "reject"
+
+
+def test_guardian_escalate_falls_back_to_human_approval(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    guardian = FakeGuardian("escalate", "not sure")
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    # escalate：照常人工审批，人工批准后才执行。
+    assert result == drive_mod.RESULT_PAUSED
+    assert env["runner"].calls == []
+    assert _run_row(env, run["id"]).status == "waiting_approval"
+    plan = _plan_step(env, run["id"])
+    assert plan.status == "waiting_approval"
+    assert "guardian escalated" in (plan.note or "")
+    decisions = _guardian_events(env, run["id"])
+    assert len(decisions) == 1
+    assert json.loads(decisions[0].payload_json)["decision"] == "escalate"
+
+    result = _approve_and_drive(env, driver, run["id"], "approve")
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    assert len(guardian.calls) == 1  # 人工接管后不再复核
+
+
+@pytest.mark.parametrize("guardian", [
+    FakeGuardian("allow"),            # 词汇表之外的决策
+    FakeGuardian("approve", error=RuntimeError("boom")),  # 复核器自身异常
+])
+def test_guardian_invalid_output_or_error_falls_back_to_human(
+    env, guardian,
+):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_PAUSED
+    assert env["runner"].calls == []
+    assert _plan_step(env, run["id"]).status == "waiting_approval"
+    decisions = _guardian_events(env, run["id"])
+    assert len(decisions) == 1
+    assert json.loads(decisions[0].payload_json)["decision"] == "escalate"
+
+
+def test_ask_mode_plan_makes_zero_guardian_calls(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    guardian = FakeGuardian("approve")
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    # ask 档案：写计划照常人工审批，Guardian 零调用。
+    assert result == drive_mod.RESULT_PAUSED
+    assert guardian.calls == []
+    assert _guardian_events(env, run["id"]) == []
+
+
+def test_probe_only_investigation_makes_zero_guardian_calls(env):
+    guardian = FakeGuardian("approve")
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](guardian=guardian)
+
+    # 默认替身 planner 只提案一个只读探针：普通调查不碰 Guardian。
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(env["runner"].calls) == 1
+    assert guardian.calls == []
+    assert _guardian_events(env, run["id"]) == []
+
+
+def test_guardian_called_at_most_once_per_plan_boundary(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    guardian = FakeGuardian("escalate", "unsure")
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+    assert len(guardian.calls) == 1
+
+    # 重复投递/人为重新入队：同一计划边界绝不二次调用模型。
+    row = _run_row(env, run["id"])
+    row.status = "queued"
+    env["session"].commit()
+
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+    assert len(guardian.calls) == 1
+    assert _plan_step(env, run["id"]).status == "waiting_approval"
+
+
+def test_interrupted_guardian_review_recovers_to_human(env):
+    planner = _plan_planner([{"kind": "systemd", "params": {
+        "operation": "restart", "unit": "nginx",
+    }}])
+    guardian = FakeGuardian("approve")
+    run = env["create_queued_run"](mode="ai_review")
+    driver = env["make_driver"](planner=planner, guardian=guardian)
+
+    # 只跑 planner 落计划：人工模拟“复核标记已落库后进程崩溃”。
+    plan_id = planner({
+        "owner": "admin", "role": "admin", "run_id": run["id"],
+        "repo": env["repo"],
+    })[0]
+    plan = _step_row(env, plan_id)
+    plan.status = "running"
+    plan.note = "guardian review pending"
+    # 模拟租约丢失后的重新投递：Run 回到可认领状态。
+    row = _run_row(env, run["id"])
+    row.status = "queued"
+    env["session"].commit()
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    # 回退人工：零模型调用、零副作用，计划可被人工决策。
+    assert result == drive_mod.RESULT_PAUSED
+    assert guardian.calls == []
+    assert env["runner"].calls == []
+    plan = _step_row(env, plan_id)
+    assert plan.status == "waiting_approval"
+    assert "interrupted" in (plan.note or "")
+    decisions = _guardian_events(env, run["id"])
+    assert len(decisions) == 1
+    payload = json.loads(decisions[0].payload_json)
+    assert payload["decision"] == "escalate"
+    assert payload["reason"] == "review_interrupted"
+
+
+# ---------------------------------------------------------------------------
+# S3 切片 4：Evidence 归一 / 全新 Verification / 三态 Outcome
+# ---------------------------------------------------------------------------
+
+def _evidence_rows(env, run_id):
+    return env["session"].query(t_ai_autonomous_evidence).filter_by(
+        run_id=run_id,
+    ).order_by(t_ai_autonomous_evidence.created_at.asc()).all()
+
+
+def test_full_loop_concludes_resolved_with_fresh_verification(env):
+    """Fake Provider 全回路：调查→计划→审批→执行→验证→结论。"""
+    calls = {"n": 0}
+
+    def planner(context):
+        calls["n"] += 1
+        repo = context["repo"]
+        if calls["n"] == 1:
+            step = repo.propose_plan(
+                context["owner"], context["role"], context["run_id"],
+                "restart nginx",
+                [{"kind": "systemd", "params": {
+                    "operation": "restart", "unit": "nginx",
+                }}],
+            )
+            return [step["id"]]
+        if calls["n"] == 2:
+            # 写副作用之后的全新只读观察，不是复用旧输出。
+            step = repo.propose_verification(
+                context["owner"], context["role"],
+                context["run_id"], "system.load",
+            )
+            return [step["id"]]
+        evidence = env["repo"].list_evidence(
+            context["owner"], context["run_id"],
+        )
+        repo.conclude_run(
+            context["owner"], context["role"], context["run_id"],
+            "resolved", [item["id"] for item in evidence],
+        )
+        return []
+
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+    assert driver.drive(
+        run["id"], env["claim"](run["id"]),
+    ) == drive_mod.RESULT_PAUSED
+    _approve_plan(env, run["id"])
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    # 写动作 + 验证探针各一次远程调用，顺序固定。
+    commands = [call["command"] for call in env["runner"].calls]
+    assert commands == ["systemctl restart nginx", "uptime"]
+
+    row = _run_row(env, run["id"])
+    assert row.status == "completed"
+    assert row.outcome == "resolved"
+
+    # 观察归一化：每个已执行 Step 恰好一条 Evidence（observe 多轮
+    # 重入不重复落），标记不可信，大输出留在加密 Artifact。
+    evidence = _evidence_rows(env, run["id"])
+    assert [item.kind for item in evidence] == [
+        "action_observation", "verification_observation",
+    ]
+    assert all(bool(item.trusted) is False for item in evidence)
+    assert all(item.step_id for item in evidence)
+    assert len({item.step_id for item in evidence}) == 2
+    for item in evidence:
+        assert json.loads(item.artifact_ids_json or "[]")
+
+    concluded = [
+        e for e in _events(env, run["id"])
+        if e.event_type == "run_concluded"
+    ]
+    assert len(concluded) == 1
+    payload = json.loads(concluded[0].payload_json)
+    assert payload["outcome"] == "resolved"
+    assert payload["requested"] == "resolved"
+    assert payload["forced"] == ""
+    assert set(payload["evidence_ids"]) == {item.id for item in evidence}
+
+
+def test_completed_run_without_conclusion_defaults_to_inconclusive(env):
+    """模型没有给出结论：默认 inconclusive，绝不虚构成功。"""
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"]()
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    row = _run_row(env, run["id"])
+    assert row.status == "completed"
+    assert row.outcome == "inconclusive"
+    assert "run_concluded" not in [
+        e.event_type for e in _events(env, run["id"])
+    ]
+    # 观察照常归一化，供后续人工/续传引用。
+    evidence = _evidence_rows(env, run["id"])
+    assert len(evidence) == 1
+    assert evidence[0].kind == "action_observation"
+
+
+def test_resolved_without_verification_observation_is_downgraded(env):
+    """只做过只读调查就想 resolved：服务端强制降为 inconclusive。"""
+    calls = {"n": 0}
+
+    def planner(context):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            step = context["repo"].propose_probe(
+                context["owner"], context["role"],
+                context["run_id"], "system.load",
+            )
+            return [step["id"]]
+        evidence = env["repo"].list_evidence(
+            context["owner"], context["run_id"],
+        )
+        context["repo"].conclude_run(
+            context["owner"], context["role"], context["run_id"],
+            "resolved", [item["id"] for item in evidence],
+        )
+        return []
+
+    run = env["create_queued_run"](mode="ask")
+    driver = env["make_driver"](planner=planner)
+
+    result = driver.drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert _run_row(env, run["id"]).outcome == "inconclusive"
+    concluded = [
+        e for e in _events(env, run["id"])
+        if e.event_type == "run_concluded"
+    ]
+    assert len(concluded) == 1
+    payload = json.loads(concluded[0].payload_json)
+    assert payload["requested"] == "resolved"
+    assert payload["forced"] == "verification_missing"

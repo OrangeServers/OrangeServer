@@ -294,6 +294,243 @@ def test_baseline_varchar_lengths_match_current_orm():
     assert mismatches == {}, f"orange.sql varchar length != ORM: {mismatches}"
 
 
+def test_rev53_autonomy_migration_matches_baseline_and_orm():
+    """M1/S1: rev53 列集合仍是 orange.sql 基线与 ORM 的子集。
+
+    rev53 迁移文件本身不可变；后续迁移（rev54+）向同表追加列，
+    完整三方一致由最新迁移的契约测试断言。"""
+    from app.core.db.database import db
+
+    rev53 = (
+        BACKEND / "mysqldir" / "rev53_ai_autonomy_baseline.sql"
+    ).read_text(encoding="utf-8")
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+
+    def columns(source, table):
+        match = re.search(
+            r"CREATE TABLE(?: IF NOT EXISTS)? `" + table
+            + r"` \((.*?)\)\s*ENGINE=",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        assert match, f"{table} is missing from the schema source"
+        return set(
+            re.findall(r"^\s*`([^`]+)`\s+", match.group(1), re.MULTILINE)
+        )
+
+    tables = [
+        "t_ai_autonomous_run",
+        "t_ai_autonomous_step",
+        "t_ai_autonomous_event",
+        "t_ai_autonomous_artifact",
+    ]
+    for table in tables:
+        rev53_columns = columns(rev53, table)
+        baseline_columns = columns(schema, table)
+        orm_columns = set(db.metadata.tables[table].columns.keys())
+        assert rev53_columns <= baseline_columns, table
+        assert rev53_columns <= orm_columns, table
+
+    assert (
+        "ADD COLUMN `ai_environment` VARCHAR(10) NOT NULL "
+        "DEFAULT ''production''"
+    ) in rev53
+    host_ddl = re.search(
+        r"CREATE TABLE `t_host` \((.*?)\)\s*ENGINE=", schema, re.DOTALL,
+    )
+    assert host_ddl, "orange.sql must define t_host"
+    assert (
+        "`ai_environment` varchar(10) NOT NULL DEFAULT 'production'"
+    ) in host_ddl.group(1)
+    assert "ai_environment" in db.metadata.tables["t_host"].columns
+
+
+def test_rev54_autonomy_migration_matches_baseline_and_orm():
+    """M1/S2: rev54 追加列仍是 orange.sql 基线与 ORM 的子集。
+
+    rev54 迁移文件本身不可变；后续迁移（rev55+）向同表追加列，
+    完整三方一致由最新迁移的契约测试断言。"""
+    from app.core.db.database import db
+
+    rev53 = (
+        BACKEND / "mysqldir" / "rev53_ai_autonomy_baseline.sql"
+    ).read_text(encoding="utf-8")
+    rev54 = (
+        BACKEND / "mysqldir" / "rev54_ai_autonomy_lease.sql"
+    ).read_text(encoding="utf-8")
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+
+    def create_columns(source, table):
+        match = re.search(
+            r"CREATE TABLE(?: IF NOT EXISTS)? `" + table
+            + r"` \((.*?)\)\s*ENGINE=",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        assert match, f"{table} is missing from the schema source"
+        return set(
+            re.findall(r"^\s*`([^`]+)`\s+", match.group(1), re.MULTILINE)
+        )
+
+    added = set(re.findall(
+        r"ADD COLUMN `(\w+)`", rev54,
+    ))
+    assert added == {
+        "lease_owner", "lease_token", "lease_expires_at", "heartbeat_at",
+        "graph_version", "active_host_id",
+    }, added
+    # 每个 ALTER 都有幂等守卫，脚本可重复执行。
+    assert rev54.count("information_schema.COLUMNS") == 6
+    assert rev54.count("PREPARE stmt FROM @sql;") == 8
+
+    rev53_columns = create_columns(rev53, "t_ai_autonomous_run")
+    baseline_columns = create_columns(schema, "t_ai_autonomous_run")
+    orm_columns = set(
+        db.metadata.tables["t_ai_autonomous_run"].columns.keys()
+    )
+    assert rev53_columns | added <= baseline_columns
+    assert rev53_columns | added <= orm_columns
+
+    run_ddl = re.search(
+        r"CREATE TABLE `t_ai_autonomous_run` \((.*?)\)\s*ENGINE=",
+        schema,
+        re.DOTALL,
+    )
+    assert run_ddl, "orange.sql must define t_ai_autonomous_run"
+    assert "`lease_owner` varchar(64) DEFAULT NULL" in run_ddl.group(1)
+    assert "`lease_token` varchar(64) DEFAULT NULL" in run_ddl.group(1)
+    assert "`lease_expires_at` datetime DEFAULT NULL" in run_ddl.group(1)
+    assert "`heartbeat_at` datetime DEFAULT NULL" in run_ddl.group(1)
+    assert (
+        "`graph_version` varchar(32) NOT NULL DEFAULT 'v1'"
+    ) in run_ddl.group(1)
+    assert (
+        "KEY `idx_ai_auto_run_lease_expires` (`lease_expires_at`)"
+    ) in run_ddl.group(1)
+    assert (
+        "ADD KEY `idx_ai_auto_run_lease_expires` (`lease_expires_at`)"
+    ) in rev54
+    assert "`active_host_id` int GENERATED ALWAYS AS" in run_ddl.group(1)
+    assert "UNIQUE KEY `uq_ai_auto_run_active_host` (`active_host_id`)" in (
+        run_ddl.group(1)
+    )
+    assert "ADD UNIQUE KEY `uq_ai_auto_run_active_host`" in rev54
+    assert "HAVING COUNT(*) > 1" in rev54
+
+    # Generated-expression string literals must not inherit the caller's
+    # connection charset. The old dump begins with SET NAMES utf8 (utf8mb3),
+    # while migrations use utf8mb4; explicit introducers keep fresh and
+    # upgraded information_schema expressions identical.
+    for status in ("completed", "failed", "cancelled", "expired"):
+        assert f"_utf8mb4'{status}'" in run_ddl.group(1)
+        assert f"_utf8mb4''{status}''" in rev54
+
+
+def test_rev55_autonomy_migration_matches_baseline_and_orm():
+    """M1/S3: rev55 追加列后，rev53+rev54+rev55、orange.sql 与 ORM 一致。"""
+    from app.core.db.database import db
+
+    def migration_columns(path):
+        text = (BACKEND / "mysqldir" / path).read_text(encoding="utf-8")
+        return set(re.findall(r"ADD COLUMN `(\w+)`", text))
+
+    rev53 = (
+        BACKEND / "mysqldir" / "rev53_ai_autonomy_baseline.sql"
+    ).read_text(encoding="utf-8")
+    rev55 = (
+        BACKEND / "mysqldir" / "rev55_ai_autonomy_custom_profile.sql"
+    ).read_text(encoding="utf-8")
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+
+    def create_columns(source, table):
+        match = re.search(
+            r"CREATE TABLE(?: IF NOT EXISTS)? `" + table
+            + r"` \((.*?)\)\s*ENGINE=",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        assert match, f"{table} is missing from the schema source"
+        return set(
+            re.findall(r"^\s*`([^`]+)`\s+", match.group(1), re.MULTILINE)
+        )
+
+    added = set(re.findall(r"ADD COLUMN `(\w+)`", rev55))
+    assert added == {"custom_profile_json"}, added
+    # 每个 ALTER 都有幂等守卫，脚本可重复执行。
+    assert rev55.count("information_schema.COLUMNS") == 1
+    assert rev55.count("PREPARE stmt FROM @sql;") == 1
+
+    rev53_columns = create_columns(rev53, "t_ai_autonomous_run")
+    rev54_added = migration_columns("rev54_ai_autonomy_lease.sql")
+    baseline_columns = create_columns(schema, "t_ai_autonomous_run")
+    orm_columns = set(
+        db.metadata.tables["t_ai_autonomous_run"].columns.keys()
+    )
+    assert (
+        rev53_columns | rev54_added | added
+        == baseline_columns == orm_columns
+    )
+
+    run_ddl = re.search(
+        r"CREATE TABLE `t_ai_autonomous_run` \((.*?)\)\s*ENGINE=",
+        schema,
+        re.DOTALL,
+    )
+    assert run_ddl, "orange.sql must define t_ai_autonomous_run"
+    assert "`custom_profile_json` text DEFAULT NULL" in run_ddl.group(1)
+
+
+def test_rev56_autonomy_evidence_table_matches_baseline_and_orm():
+    """M1/S3 切片 4：rev56 新增 Evidence 表后，orange.sql 与 ORM 一致。"""
+    from app.core.db.database import db
+
+    rev56 = (
+        BACKEND / "mysqldir" / "rev56_ai_autonomy_evidence.sql"
+    ).read_text(encoding="utf-8")
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+
+    def create_columns(source, table):
+        match = re.search(
+            r"CREATE TABLE(?: IF NOT EXISTS)? `" + table
+            + r"` \((.*?)\)\s*ENGINE=",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        assert match, f"{table} is missing from the schema source"
+        return set(
+            re.findall(r"^\s*`([^`]+)`\s+", match.group(1), re.MULTILINE)
+        )
+
+    # 守卫式 CREATE：表已存在时不重复建表，脚本可重复执行。
+    assert rev56.count("information_schema.TABLES") == 1
+    assert rev56.count("PREPARE stmt FROM @sql;") == 1
+    assert "t_ai_autonomous_evidence" in rev56
+
+    baseline_columns = create_columns(schema, "t_ai_autonomous_evidence")
+    orm_columns = set(
+        db.metadata.tables["t_ai_autonomous_evidence"].columns.keys()
+    )
+    migration_columns = create_columns(rev56, "t_ai_autonomous_evidence")
+    assert baseline_columns == orm_columns == migration_columns
+
+    evidence_ddl = re.search(
+        r"CREATE TABLE `t_ai_autonomous_evidence` \((.*?)\)\s*ENGINE=",
+        schema,
+        re.DOTALL,
+    )
+    assert evidence_ddl, "orange.sql must define t_ai_autonomous_evidence"
+    # Evidence 永远标记不可信：默认 0，无其它默认可意外置 1。
+    assert "`trusted` tinyint(1) NOT NULL DEFAULT 0" in evidence_ddl.group(1)
+    assert (
+        "REFERENCES `t_ai_autonomous_run` (`id`) ON DELETE CASCADE"
+        in evidence_ddl.group(1)
+    )
+    # 全新基线的 DROP 顺序必须先于父表之外引用它的表。
+    assert schema.index(
+        "DROP TABLE IF EXISTS `t_ai_autonomous_evidence`;"
+    ) < schema.index("DROP TABLE IF EXISTS `t_ai_autonomous_run`;")
+
+
 def test_dockerfile_builds_from_committed_requirements_without_resolving_lock():
     dockerfile = (BACKEND / "Dockerfile").read_text(encoding="utf-8")
     assert "pip-compile" not in dockerfile
@@ -316,6 +553,59 @@ def test_full_container_dev_is_isolated_and_source_mapped():
     assert "fetch('http://127.0.0.1:5173/')" in compose
 
 
+def test_autonomy_dev_overlay_uses_dedicated_redis8_and_worker():
+    overlay = (
+        DEPLOY / "docker-compose.dev-autonomy.yml"
+    ).read_text(encoding="utf-8")
+    autonomy_redis = overlay.split(
+        "  autonomy-redis:\n", 1
+    )[1].split("\n  backend:\n", 1)[0]
+    makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+
+    assert "redis:8.0-alpine" in overlay
+    assert "dev-autonomy-redis-data:/data" in overlay
+    assert '--appendonly\n      - "yes"' in autonomy_redis
+    assert "--appendfsync\n      - everysec" in autonomy_redis
+    assert "--maxmemory-policy\n      - noeviction" in autonomy_redis
+    assert "command:\n      - redis-server" in autonomy_redis
+    assert "exec redis-server" not in autonomy_redis
+    assert "\n      - sh\n" not in autonomy_redis
+    assert (
+        "--requirepass\n"
+        "      - ${OGS_AI_AUTONOMY_REDIS_PASSWORD:"
+        "?Set OGS_AI_AUTONOMY_REDIS_PASSWORD in .env.dev}"
+    ) in autonomy_redis
+    assert "OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis" in overlay
+    assert "OGS_AI_AUTONOMY_REDIS_PORT: 6379" in overlay
+    assert overlay.count("OGS_AI_AUTONOMY_REDIS_PASSWORD: ${") == 3
+    # Three service environments plus the redis-server command argument.
+    assert overlay.count(":?Set OGS_AI_AUTONOMY_REDIS_PASSWORD") == 4
+    assert overlay.count(
+        "OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-false}"
+    ) == 2
+    assert "autonomy-worker:" in overlay
+    image = (
+        "${OGS_DEV_AUTONOMY_BACKEND_IMAGE:-orangeserver-autonomy-dev}:"
+        "${OGS_DEV_AUTONOMY_BACKEND_TAG:-local}"
+    )
+    assert overlay.count("image: " + image) == 2
+    assert overlay.count("context: ../backend") == 2
+    assert overlay.count("pull_policy: never") == 2
+    assert "app.ai.autonomy.celery_entry:celery_app" in overlay
+    assert "--concurrency=1" in overlay
+    assert "inspect ping" in overlay
+    assert "../backend:/app" in overlay
+    assert overlay.count("condition: service_healthy") == 4
+    assert "docker-compose.dev-autonomy.yml" in makefile
+    assert "docker-dev-autonomy-up:" in makefile
+    assert "OGS_AI_AUTONOMY_ENABLED=true" in makefile
+    assert "-u OGS_AI_AUTONOMY_ENABLED" in makefile
+    assert "-u OGS_AI_AUTONOMY_REDIS_PASSWORD" in makefile
+    assert "[ -z \"$$password\" ]" in makefile
+    assert "make docker-dev-autonomy-ps" in makefile
+    assert "--build" in makefile
+
+
 def test_dev_env_is_generated_and_not_committed():
     makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
     gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
@@ -325,3 +615,5 @@ def test_dev_env_is_generated_and_not_committed():
     assert "up -d --wait --wait-timeout 180" in makefile
     assert ".env.dev" in gitignore
     assert "umask 077" in init_script
+    assert "OGS_AI_AUTONOMY_ENABLED=false" in init_script
+    assert "OGS_AI_AUTONOMY_REDIS_PASSWORD=$(random_hex 24)" in init_script

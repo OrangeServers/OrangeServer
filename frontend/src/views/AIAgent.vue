@@ -27,7 +27,10 @@
         <div class="conversation-head">
           <div class="conversation-identity">
             <span class="agent-mark" :class="{ thinking: isThinking }"><OrangeMark /></span>
-            <strong>{{ currentTitle }}</strong>
+            <div class="conversation-title-block">
+              <span class="conversation-kicker">{{ $t('ai.conversation.current') }}</span>
+              <strong :title="currentTitle">{{ currentTitle }}</strong>
+            </div>
           </div>
           <el-button class="mobile-context-button" text @click="contextDrawer = true">
             <el-icon><View /></el-icon>
@@ -93,6 +96,14 @@
                       class="md-body"
                       v-html="renderMarkdown(item.value.content)"
                     />
+                    <template v-else-if="item.value.error">
+                      <strong class="message-error-label">{{ $t('ai.msg.errorSummary') }}</strong>
+                      <span>{{ readableMessage(item.value.content) }}</span>
+                      <details class="message-error-details">
+                        <summary>{{ $t('ai.msg.viewTechnicalDetails') }}</summary>
+                        <code>{{ item.value.content }}</code>
+                      </details>
+                    </template>
                     <template v-else>{{ item.value.content }}</template>
                     <span v-if="item.value.streaming" class="stream-caret" />
                   </div>
@@ -117,9 +128,18 @@
                     <span class="tool-event-state">
                       {{ item.value.status === 'running' ? $t('ai.tool.running') : item.value.status === 'success' ? $t('ai.tool.done') : $t('ai.tool.failed') }}
                     </span>
-                    <code>{{ item.value.tool }}</code>
+                    <details class="tool-event-technical">
+                      <summary>{{ $t('ai.tool.technicalDetails') }}</summary>
+                      <code>{{ item.value.tool }}</code>
+                    </details>
                   </div>
-                  <p v-if="item.value.summary">{{ item.value.summary }}</p>
+                  <p v-if="item.value.summary">
+                    {{ item.value.status === 'error' ? readableToolSummary(item.value.summary) : item.value.summary }}
+                  </p>
+                  <details v-if="item.value.summary && item.value.status === 'error'" class="tool-error-details">
+                    <summary>{{ $t('ai.msg.viewTechnicalDetails') }}</summary>
+                    <code>{{ item.value.summary }}</code>
+                  </details>
                 </div>
               </div>
 
@@ -128,6 +148,11 @@
                 :run="item.value"
                 @cancel="cancelDiagnosticRun"
                 @open-evidence="openDiagnosticEvidence"
+              />
+
+              <AutonomyDraftCard
+                v-else-if="item.kind === 'autonomy_draft'"
+                :draft="item.value"
               />
 
               <article
@@ -338,8 +363,16 @@
         >
           <span class="conversation-item-icon"><el-icon><ChatLineRound /></el-icon></span>
           <span class="conversation-item-body">
-            <strong>{{ conversation.title || $t('ai.conversation.untitled') }}</strong>
+            <strong :title="conversation.title || $t('ai.conversation.untitled')">
+              {{ conversation.title || $t('ai.conversation.untitled') }}
+            </strong>
             <small>{{ providerName(conversation.provider_code || '') }} · {{ relativeTime(conversation.updated_at) }}</small>
+            <small class="conversation-item-id">
+              #{{ conversation.id.slice(0, 8) }}
+              <el-tag v-if="conversation.has_pending_action" size="small" type="warning" effect="plain">
+                {{ $t('ai.drawer.pendingAction') }}
+              </el-tag>
+            </small>
           </span>
           <el-button
             class="conversation-delete"
@@ -473,6 +506,7 @@ import { store } from '@/store'
 import { currentLocale, t } from '@/i18n'
 import { providerBrandColor, providerIcon } from '@/assets/provider-logos'
 import DiagnosticRunCard from '@/components/ai/DiagnosticRunCard.vue'
+import AutonomyDraftCard from '@/components/ai/AutonomyDraftCard.vue'
 import OrangeMark from '@/components/OrangeMark.vue'
 import {
   cancelDiagnostic,
@@ -481,6 +515,7 @@ import {
   getDiagnosticRun,
 } from '@/api/aiDiagnostics'
 import { aiJsonRequest, postAiStream } from '@/utils/aiStream'
+import { sortAutonomyDrafts } from '@/utils/autonomyDrafts'
 import {
   AI_CONTEXT_MODE_DEEP,
   AI_CONTEXT_MODE_STANDARD,
@@ -490,6 +525,7 @@ import type {
   AiActionHistory,
   AiApiResponse,
   AiApproval,
+  AiAutonomyDraft,
   AiChatMessage,
   AiConversation,
   AiConversationDetail,
@@ -512,6 +548,7 @@ type TimelineItem =
   | { kind: 'tool'; value: AiToolEvent }
   | { kind: 'diagnostic'; value: AiDiagnosticRun }
   | { kind: 'action'; value: AiActionHistory }
+  | { kind: 'autonomy_draft'; value: AiAutonomyDraft }
 
 const PROVIDER_NAMES: Record<string, string> = {
   openai: 'OpenAI',
@@ -539,6 +576,7 @@ const conversations = ref<AiConversation[]>([])
 const currentConversationId = ref('')
 const messages = ref<AiChatMessage[]>([])
 const toolEvents = ref<AiToolEvent[]>([])
+const autonomyDrafts = ref<AiAutonomyDraft[]>([])
 const resultScope = ref<AiResultScope | null>(null)
 const actionHistory = ref<AiActionHistory[]>([])
 const pendingApproval = ref<AiApproval | null>(null)
@@ -577,6 +615,7 @@ const timeline = computed<TimelineItem[]>(() => {
     ...toolEvents.value.map(value => ({ kind: 'tool' as const, value })),
     ...diagnosticRuns.value.map(value => ({ kind: 'diagnostic' as const, value })),
     ...actionHistory.value.map(value => ({ kind: 'action' as const, value })),
+    ...autonomyDrafts.value.map(value => ({ kind: 'autonomy_draft' as const, value })),
   ]
   return items.sort((a, b) => timelineTime(a) - timelineTime(b))
 })
@@ -606,6 +645,7 @@ const currentConversation = computed(() =>
   conversations.value.find(conversation => conversation.id === currentConversationId.value),
 )
 const latestDiagnostic = computed(() => diagnosticRuns.value[diagnosticRuns.value.length - 1])
+const latestAutonomyDraft = computed(() => autonomyDrafts.value[autonomyDrafts.value.length - 1])
 const activeDiagnostic = computed(() =>
   [...diagnosticRuns.value]
     .reverse()
@@ -622,7 +662,12 @@ const currentTitle = computed(() => currentConversation.value?.title || t('ai.co
 const currentModelLabel = computed(() => {
   const provider = activeProvider.value
   if (!provider) return t('ai.provider.selectToStart')
-  return `${provider.name || providerName(provider.provider_code)} · ${provider.model || t('ai.provider.modelNotConfigured')} · ${contextModeLabel(selectedContextMode.value)}`
+  return `${provider.name || providerName(provider.provider_code)} · ${contextModeLabel(selectedContextMode.value)}`
+})
+const currentModelTechnical = computed(() => {
+  const provider = activeProvider.value
+  if (!provider) return ''
+  return provider.model || t('ai.provider.modelNotConfigured')
 })
 const composerPlaceholder = computed(() => {
   if (!providers.value.length) return t('ai.composer.placeholder.noProvider')
@@ -660,14 +705,22 @@ function ContextView(): ReturnType<typeof h> {
         h('div', [
           h('strong', approving.value
             ? t('ai.context.stateAction')
-            : activeDiagnostic.value
+              : activeDiagnostic.value
               ? t('ai.context.stateDiagnostic')
               : sending.value
                 ? t('ai.context.stateProcessing')
+                : latestAutonomyDraft.value
+                  ? t('ai.context.stateDraft')
                 : latestDiagnostic.value
                   ? t('ai.context.stateDiagnosticDone')
                   : t('ai.context.stateIdle')),
           h('span', currentModelLabel.value),
+          currentModelTechnical.value
+            ? h('details', { class: 'context-technical' }, [
+                h('summary', t('ai.context.modelDetails')),
+                h('code', currentModelTechnical.value),
+              ])
+            : null,
         ]),
       ]),
     ]),
@@ -842,6 +895,21 @@ function providerLabel(provider: AiProvider): string {
     : t('ai.provider.labelUnavailable', { base, reason: providerUnavailableReason(provider) })
 }
 
+function readableMessage(content: string): string {
+  const raw = String(content || '').replace(/^detail:\s*/i, '').trim()
+  if (/active autonomous run already exists for this host/i.test(raw)) {
+    return t('ai.msg.activeAutonomyConflict')
+  }
+  return raw || t('ai.msg.requestFail')
+}
+
+function readableToolSummary(summary: string): string {
+  const raw = String(summary || '').trim()
+  const withoutTechnicalDetail = raw.replace(/\s*detail:\s*.*$/i, '').trim()
+  if (withoutTechnicalDetail) return withoutTechnicalDetail
+  return readableMessage(raw)
+}
+
 function unwrapArray<T>(payload: unknown, key: string): T[] {
   if (Array.isArray(payload)) return payload as T[]
   if (!payload || typeof payload !== 'object') return []
@@ -885,6 +953,7 @@ function timelineTime(item: TimelineItem): number {
 function timelineItemKey(item: TimelineItem): string {
   if (item.kind === 'action') return `action-${item.value.action.action_id}`
   if (item.kind === 'diagnostic') return `diagnostic-${item.value.id}`
+  if (item.kind === 'autonomy_draft') return `draft-${item.value.id || item.value.run_id}`
   return `${item.kind}-${item.value.id}`
 }
 
@@ -1301,6 +1370,7 @@ async function openConversation(id: string, closeDrawer = true): Promise<void> {
     currentConversationId.value = detail.id || id
     messages.value = detail.messages || []
     toolEvents.value = restoreToolEvents(detail.tool_events || [])
+    autonomyDrafts.value = restoreAutonomyDrafts(detail.autonomy_drafts || [])
     applyDiagnosticState(detail)
     providerObservability.value = detail.provider_observability || null
     resultScope.value = null
@@ -1346,6 +1416,7 @@ function startNewConversation(): void {
   currentConversationId.value = ''
   messages.value = []
   toolEvents.value = []
+  autonomyDrafts.value = []
   resultScope.value = null
   actionHistory.value = []
   pendingApproval.value = null
@@ -1492,6 +1563,9 @@ async function handleSseEvent(event: AiSseEvent): Promise<void> {
     case 'tool.completed':
       upsertToolEvent(data, data.error ? 'error' : 'success')
       updateResultScope(data)
+      break
+    case 'autonomy.draft_created':
+      upsertAutonomyDraft(data)
       break
     case 'diagnostic.started':
     case 'diagnostic_started':
@@ -1644,6 +1718,52 @@ function restoreToolEvents(items: AiToolEvent[]): AiToolEvent[] {
   return restored
 }
 
+/** 切片 7：引用卡只做展示与跳转，聊天侧不提供启动/审批入口。 */
+function normalizeAutonomyDraft(data: Record<string, unknown>): AiAutonomyDraft | null {
+  const runId = String(data.run_id || '')
+  if (!runId) return null
+  return {
+    id: String(data.id || ''),
+    run_id: runId,
+    goal: String(data.goal || ''),
+    status: String(data.status || 'draft'),
+    mode: String(data.mode || ''),
+    host_alias: String(data.host_alias || ''),
+    created_at: typeof data.created_at === 'string' ? data.created_at : nowIso(),
+  }
+}
+
+function upsertAutonomyDraft(data: Record<string, unknown>): void {
+  const draft = normalizeAutonomyDraft(data)
+  if (!draft) return
+  const next = [...autonomyDrafts.value]
+  const index = autonomyDrafts.value.findIndex(
+    item => item.run_id === draft.run_id,
+  )
+  if (index < 0) {
+    next.push(draft)
+  } else {
+    next[index] = {
+      ...next[index],
+      ...draft,
+      created_at: next[index].created_at || draft.created_at,
+    }
+  }
+  autonomyDrafts.value = sortAutonomyDrafts(next)
+}
+
+function restoreAutonomyDrafts(items: AiAutonomyDraft[]): AiAutonomyDraft[] {
+  const restored: AiAutonomyDraft[] = []
+  for (const item of items || []) {
+    const draft = normalizeAutonomyDraft(item as unknown as Record<string, unknown>)
+    if (!draft) continue
+    if (!restored.some(candidate => candidate.run_id === draft.run_id)) {
+      restored.push(draft)
+    }
+  }
+  return sortAutonomyDrafts(restored)
+}
+
 function summarizeToolData(data: Record<string, unknown>): string {
   if (typeof data.summary === 'string') return data.summary
   if (typeof data.message === 'string') return data.message
@@ -1667,6 +1787,7 @@ const TOOL_LABEL_KEYS: Record<string, string> = {
   prepare_batch_command: 'ai.tool.labels.prepareBatchCommand',
   run_readonly_diagnostic: 'ai.tool.labels.runReadonlyDiagnostic',
   start_diagnostic: 'ai.tool.labels.runReadonlyDiagnostic',
+  create_autonomy_draft: 'ai.tool.labels.createAutonomyDraft',
 }
 
 function toolLabel(tool: string): string {
@@ -2308,6 +2429,15 @@ onBeforeUnmount(() => {
 .agent-mark.thinking {
   animation: orange-glow 1.8s ease-in-out infinite;
 }
+.conversation-title-block { min-width: 0; }
+.conversation-kicker {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--ogs-text-tertiary);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
 .conversation-identity strong {
   display: block;
   max-width: 420px;
@@ -2489,6 +2619,24 @@ onBeforeUnmount(() => {
   border: 1px solid var(--ogs-border-subtle);
   margin: 0 2px;
 }
+.message-error-label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--ogs-danger);
+  font-size: 12px;
+}
+.message-error-details {
+  margin-top: 8px;
+  color: var(--ogs-text-tertiary);
+  font-size: 11px;
+}
+.message-error-details summary { cursor: pointer; }
+.message-error-details code {
+  display: block;
+  margin-top: 4px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 /* —— Agent 回复的 Markdown 排版 —— */
 .md-body { display: block; white-space: normal; }
 .md-body p { margin: 0 0 8px; }
@@ -2612,17 +2760,36 @@ onBeforeUnmount(() => {
 .status-success .tool-event-state { color: var(--ogs-success); }
 .status-error .tool-event-state { color: var(--ogs-danger); }
 .tool-event-title code {
-  max-width: 100%;
-  padding: 2px 6px;
-  overflow: hidden;
   color: var(--ogs-text-muted);
-  border-radius: 4px;
-  background: var(--ogs-bg-elevated);
   font-family: var(--ogs-mono);
   font-size: 11px;
-  line-height: 1.4;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+}
+.tool-event-technical {
+  color: var(--ogs-text-muted);
+  font-size: 10px;
+}
+.tool-event-technical summary { cursor: pointer; }
+.tool-event-technical code {
+  display: block;
+  margin-top: 3px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--ogs-bg-elevated);
+}
+.tool-error-details {
+  margin-top: 6px;
+  color: var(--ogs-text-tertiary);
+  font-size: 10px;
+}
+.tool-error-details summary { cursor: pointer; }
+.tool-error-details code {
+  display: block;
+  margin-top: 3px;
+  padding: 3px 6px;
+  color: var(--ogs-text-secondary);
+  background: var(--ogs-bg-elevated);
+  white-space: pre-wrap;
 }
 .tool-event p {
   margin-top: 5px;
@@ -3093,8 +3260,17 @@ onBeforeUnmount(() => {
 .conversation-item-body strong, .conversation-item-body small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-item-body strong { font-size: 13px; }
 .conversation-item-body small { margin-top: 4px; color: var(--ogs-text-muted); font-size: 11px; }
+.conversation-item-id { display: flex !important; align-items: center; gap: 6px; }
+.conversation-item-id :deep(.el-tag) { font-size: 10px; line-height: 16px; }
 .conversation-delete { opacity: 0; }
 .conversation-item:hover .conversation-delete, .conversation-item:focus-within .conversation-delete { opacity: 1; }
+.context-technical {
+  margin-top: 3px;
+  color: var(--ogs-text-tertiary);
+  font-size: 10px;
+}
+.context-technical summary { cursor: pointer; }
+.context-technical code { display: block; margin-top: 2px; overflow-wrap: anywhere; }
 .result-drawer-head {
   margin-bottom: 12px;
   display: flex;

@@ -19,6 +19,7 @@
 
 - [官网部署指南](https://orangeservers.github.io/OrangeServer/zh/guide/deployment.html)：普通全新安装入口。
 - [部署手册](../DEPLOY.md)：Docker、物理机和 Kubernetes 部署。
+- [后端镜像与部署包发布](operations/BACKEND_IMAGE_RELEASE.md)：版本标签、镜像、部署包和从零验收命令。
 - [批量操作安全与审计](operations/BATCH_OPERATIONS.md)：权限复核、脚本限制和兼容接口。
 - [统一升级流程](operations/UPGRADE.md)：备份、迁移、验证和回滚。
 - [配置参考](../CONFIG.md)：`OGS_*` 环境变量。

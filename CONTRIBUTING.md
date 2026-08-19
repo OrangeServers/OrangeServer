@@ -49,7 +49,7 @@ AI and automation changes require special care:
 ## Repository lineage and pre-disclosure work
 
 The public `origin/main` branch is the only canonical product baseline. Start
-every change from its latest revision:
+a normal change from its latest revision:
 
 ```bash
 git fetch origin main
@@ -62,6 +62,14 @@ branch, but it is not a second product line and its default branch must never be
 merged into public work. When disclosure is approved, review and test the same
 branch, then push that branch to the public repository and open a pull request.
 Do not convert changes between unrelated public and private histories.
+
+A large milestone may use a short-lived public `integration/<milestone>` branch
+created from `origin/main`. Its Issue must name that branch as the PR target;
+work branches then start from the current integration branch. Integration
+branches accept only that milestone, are never tagged or deployed as releases,
+and are deleted after a final reviewed PR merges them into `main`. Do not keep a
+permanent `develop` branch or turn an integration branch into a second product
+line.
 
 Before the first public push:
 
