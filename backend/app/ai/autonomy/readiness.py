@@ -7,6 +7,8 @@ URLs, credentials, worker names and private host details must never cross the
 API boundary.
 """
 from collections.abc import Mapping
+import time
+from threading import Lock
 from urllib.parse import quote
 import uuid
 
@@ -21,6 +23,9 @@ REASON_REDIS_NOT_CONFIGURED = 'redis_not_configured'
 REASON_CHECKPOINT_UNAVAILABLE = 'checkpoint_unavailable'
 REASON_WORKER_UNAVAILABLE = 'worker_unavailable'
 WORKER_POOL = 'prefork'
+WORKER_READINESS_CACHE_SECONDS = 2.0
+_worker_readiness_cache = {'expires_at': 0.0, 'value': None}
+_worker_readiness_cache_lock = Lock()
 
 
 def autonomy_redis_url(database: int) -> str:
@@ -227,6 +232,28 @@ def worker_readiness(timeout: float = READINESS_TIMEOUT_SECONDS) -> bool:
     return bool(worker_readiness_details(timeout)['ready'])
 
 
+def _cached_worker_readiness_details(
+    timeout: float = READINESS_TIMEOUT_SECONDS,
+) -> dict:
+    """Coalesce dashboard probes so concurrent requests do not fan out."""
+    now = time.monotonic()
+    cached = _worker_readiness_cache['value']
+    if cached is not None and now < _worker_readiness_cache['expires_at']:
+        return dict(cached)
+    with _worker_readiness_cache_lock:
+        now = time.monotonic()
+        cached = _worker_readiness_cache['value']
+        if cached is None or now >= _worker_readiness_cache['expires_at']:
+            cached = worker_readiness_details(timeout)
+            _worker_readiness_cache.update({
+                'expires_at': (
+                    time.monotonic() + WORKER_READINESS_CACHE_SECONDS
+                ),
+                'value': dict(cached),
+            })
+        return dict(cached)
+
+
 def autonomy_readiness(
     *, enabled=None, checkpoint_probe=None, worker_probe=None,
 ) -> dict:
@@ -256,7 +283,7 @@ def autonomy_readiness(
         return result
 
     checkpoint_probe = checkpoint_probe or checkpoint_readiness
-    worker_probe = worker_probe or worker_readiness_details
+    worker_probe = worker_probe or _cached_worker_readiness_details
     try:
         result['checkpoint_ready'] = bool(checkpoint_probe())
     except Exception:

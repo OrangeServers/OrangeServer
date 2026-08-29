@@ -251,3 +251,28 @@ def test_readiness_reports_safe_pool_and_concurrency(monkeypatch):
     assert result['worker_concurrency_configured'] == 2
     assert result['worker_concurrency_observed'] == 2
     assert 'private-secret' not in str(result)
+
+
+def test_dashboard_worker_readiness_probe_is_coalesced(monkeypatch):
+    calls = []
+    expected = {
+        'ready': True,
+        'worker_pool': 'prefork',
+        'worker_concurrency_configured': 2,
+        'worker_concurrency_observed': 2,
+    }
+    monkeypatch.setattr(
+        readiness, '_worker_readiness_cache',
+        {'expires_at': 0.0, 'value': None},
+    )
+    monkeypatch.setattr(
+        readiness, 'worker_readiness_details',
+        lambda timeout: calls.append(timeout) or expected,
+    )
+
+    first = readiness._cached_worker_readiness_details()
+    first['ready'] = False
+    second = readiness._cached_worker_readiness_details()
+
+    assert calls == [readiness.READINESS_TIMEOUT_SECONDS]
+    assert second == expected
