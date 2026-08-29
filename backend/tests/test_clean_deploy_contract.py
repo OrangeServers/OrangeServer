@@ -135,6 +135,11 @@ def test_standard_compose_is_four_containers_with_one_redis():
     assert "  frontend:" not in compose
     assert "  autonomy-redis:" not in compose
     assert "redis:8.10.0-alpine" in compose
+    assert (
+        "yes --appendfsync everysec --maxmemory 512mb "
+        "--maxmemory-policy volatile-lru\n"
+        "        --requirepass \"$$OGS_REDIS_PASSWORD\""
+    ) in compose
     assert "app.ai.autonomy.celery_entry:celery_app" in compose
     assert compose.count(
         "OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-true}",

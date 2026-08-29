@@ -116,16 +116,14 @@ services:
     networks: [ogs-internal]
     environment:
       OGS_REDIS_PASSWORD: ${OGS_REDIS_PASSWORD:-}
-    command: >
-      sh -c "if [ -n \"$$OGS_REDIS_PASSWORD\" ]; then
-                exec redis-server --appendonly yes --appendfsync everysec
-                  --maxmemory 512mb --maxmemory-policy volatile-lru
-                  --requirepass \"$$OGS_REDIS_PASSWORD\";
-              else
-                echo '[WARN] OGS_REDIS_PASSWORD is empty; use only on an isolated network';
-                exec redis-server --appendonly yes --appendfsync everysec
-                  --maxmemory 512mb --maxmemory-policy volatile-lru;
-              fi"
+    command:
+      - sh
+      - -c
+      - >-
+        if [ -z "$$OGS_REDIS_PASSWORD" ]; then echo '[WARN] OGS_REDIS_PASSWORD is
+        empty; use only on an isolated network'; fi; exec redis-server --appendonly
+        yes --appendfsync everysec --maxmemory 512mb --maxmemory-policy volatile-lru
+        --requirepass "$$OGS_REDIS_PASSWORD"
     volumes:
       # Keep the M1 volume name so existing LangGraph checkpoints survive.
       - autonomy-redis-data:/data
