@@ -280,6 +280,10 @@ AI 运维会话默认使用 256K；只有能力标记为 1M 的 Provider 才能�
 | `OGS_AI_AUTONOMY_REDIS_PORT` | `6379` | ❌ | 自治 Redis 端口；DB 0 用于 checkpoint/向量，DB 1 用于 Celery broker |
 | `OGS_AI_AUTONOMY_REDIS_PASSWORD` | 空 | 网络部署时 ✅ | 自治 Redis 密码；bundled 栈与 `OGS_REDIS_PASSWORD` 相同，URI 保留字符由后端安全编码 |
 | `OGS_AUTONOMY_WORKER_CONCURRENCY` | `2` | ❌ | Celery prefork 并发槽数，必须为正整数；受限机器可设为 `1` |
+| `OGS_AI_ALERTMANAGER_TOKEN` | 空 | 启用告警入口时 ✅ | Alertmanager Webhook 的独立 Bearer Token；不得与用户登录或 Provider 密钥复用 |
+| `OGS_AI_ALERTMANAGER_OWNER` | 空 | 启用告警入口时 ✅ | 告警 Run 的固定管理员所有者；必须是现存且未删除的 admin 账号 |
+| `OGS_AI_PROMETHEUS_BASE_URL` | 空 | ❌ | 可选 Prometheus 根地址；只执行服务端固定的 15 分钟可用性查询，不接受模型或 Webhook 提供 URL/PromQL |
+| `OGS_AI_PROMETHEUS_BEARER_TOKEN` | 空 | ❌ | 可选 Prometheus Bearer Token；不会进入模型、事件或 Evidence |
 | `OGS_AI_AUTONOMY_LEASE_TTL_SECONDS` | `120` | ❌ | Worker 租约有效期，服务端硬下限 10 秒 |
 | `OGS_AI_AUTONOMY_APPROVAL_TTL_SECONDS` | `86400` | ❌ | draft 和待审批步骤有效期，服务端硬下限 60 秒 |
 

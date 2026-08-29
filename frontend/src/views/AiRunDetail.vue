@@ -614,6 +614,8 @@ function stepExecutionText(step: AutonomyStep): string {
 function evidenceKindLabel(kind: string): string {
   if (kind === 'action_observation') return t('aiRuns.detail.evidenceKind.action')
   if (kind === 'verification_observation') return t('aiRuns.detail.evidenceKind.verification')
+  if (kind === 'alert_observation') return t('aiRuns.detail.evidenceKind.alert')
+  if (kind === 'prometheus_observation') return t('aiRuns.detail.evidenceKind.prometheus')
   return t('aiRuns.detail.evidenceKind.generic')
 }
 

@@ -5,6 +5,13 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- The AI Ops landing page now leads with pending alerts, active runs, recent
+  conclusions, Worker capacity, and knowledge-index status. An optional
+  Bearer-authenticated Alertmanager webhook creates idempotent `ask` runs and
+  attaches bounded, server-owned Prometheus observations to their timeline.
+
 ### Changed
 
 - Chat now handles query, explanation, diagnosis, and Autonomy Run drafts;

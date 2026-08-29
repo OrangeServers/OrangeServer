@@ -172,6 +172,9 @@ mysql -h <mysql-host> -u <mysql-user> -p <database> \
 
 mysql -h <mysql-host> -u <mysql-user> -p <database> \
   < backend/mysqldir/rev56_ai_autonomy_evidence.sql
+
+mysql -h <mysql-host> -u <mysql-user> -p <database> \
+  < backend/mysqldir/rev57_ai_ops_trigger.sql
 ```
 
 顺序不可颠倒：rev49 修改 rev48 创建的 `t_ai_provider`，rev50 增加受控诊断的
@@ -180,7 +183,8 @@ zh-CN，存量行为不变），rev52 增加由管理界面维护的 SMTP 配置
 保存 Fernet 密文，rev53 为 AI 自治（M1/S1）增加资产环境列与 Run/Step/事件/
 产物四张表；rev54 为自治 Run 表追加 Worker 租约、一次性 fencing token、心跳与
 图版本列（M1/S2），rev55 为自治 Run 表追加可选的自定义权限档案列，rev56 增加
-  脱敏 Evidence 引用表（M1/S3）。标准 bundled 栈会启动统一 Redis 8 与 Worker，
+  脱敏 Evidence 引用表（M1/S3），rev57 为 Run 增加触发类型、幂等引用和脱敏触发
+  摘要（M2/S1）。标准 bundled 栈会启动统一 Redis 8 与 Worker，
   自治能力默认可用。
 各脚本针对其自身变更设计了重复执行保护，但重复运行前仍应
 确认输出和目标数据库正确。
@@ -306,7 +310,7 @@ make docker-health
 
 - 应用启动失败但 schema 向后兼容时，可先恢复上一镜像。
 - 如果旧应用不能识别新 schema，停止写入后恢复升级前 MySQL 备份。
-- rev48/rev49/rev50/rev53/rev54/rev55/rev56 不提供自动 down migration；不要在生产手工删除列或表。
+- rev48/rev49/rev50/rev53/rev54/rev55/rev56/rev57 不提供自动 down migration；不要在生产手工删除列或表。
 - 恢复数据库前先保留失败现场的日志和当前数据库快照。
 - Release bundle 安装可停止前后端，将当前安装目录移回
   `<安装目录>-next-<failed-version>`，再把保留的

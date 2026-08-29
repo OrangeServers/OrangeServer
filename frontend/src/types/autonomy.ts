@@ -76,6 +76,9 @@ export interface AutonomyRun {
   custom_profile: AutonomyCustomProfile | null
   status: AutonomyRunStatus
   outcome: AutonomyRunOutcome | null
+  trigger_type: 'manual' | 'chat' | 'alertmanager' | string
+  trigger_ref: string | null
+  trigger_summary: string
   revision: number
   graph_version: string
   budget: AutonomyBudget
@@ -151,6 +154,9 @@ export interface AutonomyReadiness {
   checkpoint_ready: boolean
   worker_ready: boolean
   ready: boolean
+  worker_pool: string
+  worker_concurrency_configured: number | null
+  worker_concurrency_observed: number | null
   reason:
     | 'ready'
     | 'feature_disabled'
@@ -158,6 +164,21 @@ export interface AutonomyReadiness {
     | 'checkpoint_unavailable'
     | 'worker_unavailable'
     | string
+}
+
+/** GET /ai/ops/status：管理员 AIOps 首页聚合，只引用现有 Run。 */
+export interface AIOpsStatus extends AutonomyReadiness {
+  web_worker_class: string
+  autonomy_pool: string
+  autonomy_concurrency: number
+  active_runs: number
+  queued_runs: number
+  knowledge_index_state: string
+  alertmanager_configured: boolean
+  prometheus_configured: boolean
+  pending_alerts: AutonomyRun[]
+  running_runs: AutonomyRun[]
+  recent_conclusions: AutonomyRun[]
 }
 
 /** 创建草稿请求体 */

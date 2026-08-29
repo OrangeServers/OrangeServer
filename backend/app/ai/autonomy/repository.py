@@ -107,9 +107,11 @@ CUSTOM_ACTION_CATEGORIES = frozenset({
 # 限长 500；结论至多引用 16 条同一 Run 的 Evidence。
 EVIDENCE_KINDS = frozenset({
     'action_observation', 'verification_observation',
+    'alert_observation', 'prometheus_observation',
 })
 EVIDENCE_SUMMARY_CHARS = 500
 MAX_EVIDENCE_CITATIONS = 16
+RUN_TRIGGER_TYPES = frozenset({'manual', 'chat', 'alertmanager'})
 
 
 def parse_custom_profile(payload):
@@ -143,8 +145,13 @@ def parse_custom_profile(payload):
 
 
 _ACTIVE_HOST_UNIQUE_KEY = 'uq_ai_auto_run_active_host'
+_TRIGGER_UNIQUE_KEY = 'uq_ai_auto_run_trigger'
 _SQLITE_ACTIVE_HOST_UNIQUE_ERROR = (
     'UNIQUE constraint failed: t_ai_autonomous_run.active_host_id'
+)
+_SQLITE_TRIGGER_UNIQUE_ERROR = (
+    'UNIQUE constraint failed: '
+    't_ai_autonomous_run.trigger_type, t_ai_autonomous_run.trigger_ref'
 )
 
 
@@ -154,6 +161,14 @@ def _is_active_host_unique_violation(exc: IntegrityError) -> bool:
     return (
         _ACTIVE_HOST_UNIQUE_KEY in message
         or _SQLITE_ACTIVE_HOST_UNIQUE_ERROR in message
+    )
+
+
+def _is_trigger_unique_violation(exc: IntegrityError) -> bool:
+    message = str(getattr(exc, 'orig', None) or exc)
+    return (
+        _TRIGGER_UNIQUE_KEY in message
+        or _SQLITE_TRIGGER_UNIQUE_ERROR in message
     )
 
 
@@ -365,6 +380,9 @@ class AutonomyRepository:
             'system_user_id': int(row.system_user_id),
             'system_user_alias': row.system_user_alias,
             'mode': row.mode,
+            'trigger_type': getattr(row, 'trigger_type', 'manual'),
+            'trigger_ref': getattr(row, 'trigger_ref', None),
+            'trigger_summary': getattr(row, 'trigger_summary', '') or '',
             'custom_profile': (
                 json.loads(row.custom_profile_json)
                 if getattr(row, 'custom_profile_json', None) else None
@@ -409,6 +427,9 @@ class AutonomyRepository:
         mode: str,
         budget_payload: Optional[Dict[str, Any]] = None,
         profile_payload: Optional[Dict[str, Any]] = None,
+        trigger_type: str = 'manual',
+        trigger_ref: Optional[str] = None,
+        trigger_summary: str = '',
     ) -> Dict[str, Any]:
         from app.core.db.database import t_ai_autonomous_run
 
@@ -417,6 +438,19 @@ class AutonomyRepository:
             raise AutonomyValidationError('goal must be 1..512 characters')
         if mode not in {m.value for m in CANONICAL_RUN_MODES}:
             raise AutonomyValidationError('unknown mode: %r' % (mode,))
+        trigger_type = sanitize_text(trigger_type).strip().lower()
+        if trigger_type not in RUN_TRIGGER_TYPES:
+            raise AutonomyValidationError(
+                'unknown trigger type: %r' % (trigger_type,)
+            )
+        trigger_ref = sanitize_text(trigger_ref or '').strip() or None
+        if trigger_ref is not None and len(trigger_ref) > 64:
+            raise AutonomyValidationError('trigger_ref is too long')
+        if trigger_type == 'alertmanager' and not trigger_ref:
+            raise AutonomyValidationError(
+                'alertmanager trigger requires trigger_ref'
+            )
+        trigger_summary = sanitize_text(trigger_summary).strip()[:512]
         if mode == RunMode.CUSTOM.value:
             if profile_payload is None:
                 raise AutonomyValidationError(
@@ -478,6 +512,9 @@ class AutonomyRepository:
             system_user_id=system_user_id,
             system_user_alias=str(credential.get('alias') or ''),
             mode=mode,
+            trigger_type=trigger_type,
+            trigger_ref=trigger_ref,
+            trigger_summary=trigger_summary,
             custom_profile_json=(
                 json.dumps(custom_profile, sort_keys=True)
                 if custom_profile else None
@@ -503,11 +540,18 @@ class AutonomyRepository:
                 raise AutonomyConflict(
                     'an active autonomous run already exists for this host'
                 ) from None
+            if _is_trigger_unique_violation(exc):
+                raise AutonomyConflict(
+                    'an autonomous run already exists for this trigger'
+                ) from None
             raise
         self.append_event(run, 'run_created', {
             'mode': mode, 'host_id': host_id,
             'system_user_id': system_user_id,
             'custom_profile': custom_profile,
+            'trigger_type': trigger_type,
+            'trigger_ref': trigger_ref,
+            'trigger_summary': trigger_summary,
         })
         self._commit()
         return self._run_to_dict(run)
@@ -620,6 +664,19 @@ class AutonomyRepository:
         self._commit()
         return self._run_to_dict(run)
 
+    def find_run_by_trigger(
+        self, owner: str, trigger_type: str, trigger_ref: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Find an idempotent external trigger without exposing other owners."""
+        from app.core.db.database import t_ai_autonomous_run
+
+        row = self.session.query(t_ai_autonomous_run).filter_by(
+            owner=owner,
+            trigger_type=str(trigger_type),
+            trigger_ref=str(trigger_ref),
+        ).first()
+        return self._run_to_dict(row) if row is not None else None
+
     def get_run(self, owner: str, run_id: str) -> Dict[str, Any]:
         return self._run_to_dict(self._get_run_row(owner, run_id))
 
@@ -632,6 +689,39 @@ class AutonomyRepository:
             max(1, min(int(limit), 200))
         ).all()
         return [self._run_to_dict(row) for row in rows]
+
+    def ops_summary(self, owner: str, limit: int = 8) -> Dict[str, Any]:
+        """Bounded data for the AIOps landing page; Run stays authoritative."""
+        from app.core.db.database import t_ai_autonomous_run
+
+        limit = max(1, min(int(limit), 20))
+        active_values = [status.value for status in ACTIVE_RUN_STATUSES]
+        active_query = self.session.query(t_ai_autonomous_run).filter(
+            t_ai_autonomous_run.owner == owner,
+            t_ai_autonomous_run.status.in_(active_values),
+        )
+        queued = active_query.filter(
+            t_ai_autonomous_run.status == RunStatus.QUEUED.value,
+        ).count()
+        running = active_query.order_by(
+            t_ai_autonomous_run.updated_at.desc(),
+        ).limit(limit).all()
+        alerts = active_query.filter(
+            t_ai_autonomous_run.trigger_type == 'alertmanager',
+        ).order_by(t_ai_autonomous_run.updated_at.desc()).limit(limit).all()
+        conclusions = self.session.query(t_ai_autonomous_run).filter(
+            t_ai_autonomous_run.owner == owner,
+            t_ai_autonomous_run.outcome.isnot(None),
+        ).order_by(t_ai_autonomous_run.completed_at.desc()).limit(limit).all()
+        return {
+            'active_runs': active_query.count(),
+            'queued_runs': int(queued),
+            'pending_alerts': [self._run_to_dict(row) for row in alerts],
+            'running_runs': [self._run_to_dict(row) for row in running],
+            'recent_conclusions': [
+                self._run_to_dict(row) for row in conclusions
+            ],
+        }
 
     def list_steps(self, owner: str, run_id: str) -> List[Dict[str, Any]]:
         from app.core.db.database import t_ai_autonomous_step
@@ -1422,6 +1512,7 @@ class AutonomyRepository:
         summary: str,
         step_id: Optional[str] = None,
         artifact_ids: Optional[List[str]] = None,
+        event_type: Optional[str] = None,
         commit: bool = True,
     ) -> Dict[str, Any]:
         """把一次执行观察归一化成有界脱敏的 Evidence 引用。
@@ -1433,7 +1524,7 @@ class AutonomyRepository:
             t_ai_autonomous_artifact, t_ai_autonomous_evidence,
         )
 
-        self._get_run_row(owner, run_id)
+        run = self._get_run_row(owner, run_id)
         if str(kind) not in EVIDENCE_KINDS:
             raise AutonomyValidationError('unknown evidence kind: %r' % (kind,))
         text = sanitize_text(summary or '')[:EVIDENCE_SUMMARY_CHARS]
@@ -1461,6 +1552,12 @@ class AutonomyRepository:
             trusted=False,
         )
         self.session.add(evidence)
+        if event_type:
+            self.append_event(run, str(event_type), {
+                'evidence_id': evidence.id,
+                'kind': evidence.kind,
+                'summary': evidence.summary,
+            })
         if commit:
             self._commit()
         return self._evidence_to_dict(evidence)

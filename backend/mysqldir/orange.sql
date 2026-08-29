@@ -157,6 +157,9 @@ CREATE TABLE `t_ai_autonomous_run` (
   `system_user_id` int NOT NULL,
   `system_user_alias` varchar(24) NOT NULL,
   `mode` varchar(16) NOT NULL,
+  `trigger_type` varchar(16) NOT NULL DEFAULT 'manual',
+  `trigger_ref` varchar(64) DEFAULT NULL,
+  `trigger_summary` varchar(512) NOT NULL DEFAULT '',
   `custom_profile_json` text DEFAULT NULL,
   `status` varchar(20) NOT NULL,
   `outcome` varchar(16) DEFAULT NULL,
@@ -187,6 +190,7 @@ CREATE TABLE `t_ai_autonomous_run` (
   KEY `idx_ai_auto_run_created_at` (`created_at`),
   KEY `idx_ai_auto_run_updated_at` (`updated_at`),
   KEY `idx_ai_auto_run_lease_expires` (`lease_expires_at`),
+  UNIQUE KEY `uq_ai_auto_run_trigger` (`trigger_type`,`trigger_ref`),
   UNIQUE KEY `uq_ai_auto_run_active_host` (`active_host_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

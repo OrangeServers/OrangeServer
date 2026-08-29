@@ -139,6 +139,9 @@ def test_create_run_defaults_and_event_trail(repo_env):
     assert run["revision"] == 0
     assert run["host_alias"] == "web-01"
     assert run["system_user_alias"] == "readonly"
+    assert run["trigger_type"] == "manual"
+    assert run["trigger_ref"] is None
+    assert run["trigger_summary"] == ""
     assert run["budget"]["max_actions"] == 30
     assert run["graph_version"] == "v2"
 
@@ -150,6 +153,52 @@ def test_create_run_defaults_and_event_trail(repo_env):
     assert payload["system_user_id"] == 19
     assert "password" not in payload
     assert "credential" not in json.dumps(payload)
+
+
+def test_alert_trigger_roundtrip_and_unique_idempotency(repo_env):
+    repo = repo_env["repo"]
+    run = repo.create_run(
+        "admin", "admin",
+        goal="service alert",
+        host_id=repo_env["host_id"],
+        system_user_id=19,
+        mode="ask",
+        trigger_type="alertmanager",
+        trigger_ref="a" * 64,
+        trigger_summary="firing: nginx on asset #1",
+    )
+    assert repo.find_run_by_trigger(
+        "admin", "alertmanager", "a" * 64,
+    )["id"] == run["id"]
+
+    row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    row.status = "completed"
+    repo_env["session"].commit()
+    with pytest.raises(AutonomyConflict, match="trigger"):
+        repo.create_run(
+            "admin", "admin",
+            goal="duplicate service alert",
+            host_id=repo_env["host_id"],
+            system_user_id=19,
+            mode="ask",
+            trigger_type="alertmanager",
+            trigger_ref="a" * 64,
+        )
+
+
+def test_external_evidence_appends_timeline_event(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    evidence = repo.record_evidence(
+        "admin", run["id"],
+        kind="alert_observation",
+        summary="Alertmanager firing: nginx",
+        event_type="alert_firing",
+    )
+    event = repo_env["session"].query(t_ai_autonomous_event).filter_by(
+        run_id=run["id"], event_type="alert_firing",
+    ).one()
+    assert json.loads(event.payload_json)["evidence_id"] == evidence["id"]
 
 
 @pytest.mark.parametrize("mode", ["ask", "ai_review", "auto", "custom"])

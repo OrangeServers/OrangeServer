@@ -56,6 +56,10 @@ Alertmanager → Prometheus/SSH → Autonomy Run 闭环；S2 增加只索引审�
 已验证 Run 的可重建向量知识库。M2 不迁移 ASGI/asyncio，不替换 Celery prefork，
 也不新增默认监控或向量数据库容器。
 
+当前 Unreleased 已完成 S0 实现，并实现 S1 的单条 Alertmanager 告警入口、固定
+Prometheus 可用性观察、Run 触发契约和运维态势首页；真实告警纵向验收与 S2 仍由
+Issue #25 跟踪，未完成前不视为 M2 发布门通过。
+
 - Prometheus 和 Loki 请求必须经过服务端查询代理；模型不能提供任意 URL、Header、
   tenant 或无限制 PromQL/LogQL。
 - 服务端限制时间范围、步长、返回量、并发、超时和可用标签，并在进入模型前聚合、

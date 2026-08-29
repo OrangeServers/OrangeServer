@@ -22,6 +22,8 @@
       </div>
     </header>
 
+    <AIOpsOverview v-if="isAdmin" />
+
     <div class="agent-workspace">
       <section class="conversation-panel" :aria-label="$t('ai.conversation.aria')">
         <div class="conversation-head">
@@ -417,6 +419,7 @@ import { currentLocale, t } from '@/i18n'
 import { providerBrandColor, providerIcon } from '@/assets/provider-logos'
 import DiagnosticRunCard from '@/components/ai/DiagnosticRunCard.vue'
 import AutonomyDraftCard from '@/components/ai/AutonomyDraftCard.vue'
+import AIOpsOverview from '@/components/ai/AIOpsOverview.vue'
 import OrangeMark from '@/components/OrangeMark.vue'
 import {
   cancelDiagnostic,

@@ -87,6 +87,19 @@ Agent 只创建待审批动作。执行卡会展示命令、目标数量、系�
 
 ![诊断证据抽屉（脱敏示例数据）](../images/ai-diagnostic-evidence.png)
 
+## 运维态势与告警入口
+
+管理员打开 AI 运维页时，会先看到待处理告警、活动任务、最近结论、Worker 并发槽和
+知识索引状态；聊天仍保留在下方，用于查询、解释、诊断和创建自治任务草稿。
+
+配置 Alertmanager 机器入口后，单条 `firing` 告警会按 `groupKey + startsAt` 幂等创建
+并启动一个 `ask` Run。Webhook 标签只引用服务端已有资产和系统凭据，不能提供用户、
+凭据内容、URL、Header 或 PromQL。可选的 Prometheus 观察固定查询该服务最近 15 分钟
+的可用性，结果以脱敏 Evidence/Artifact 进入同一 Run 时间线。
+
+`resolved` 通知只追加一条告警恢复观察，不能替代 Worker 的独立验证，也不会把 Run
+直接标为已解决。任何写动作仍必须经过原有服务端策略与 `ask` 审批。
+
 ## 自治任务工作台
 
 启用 M1 自治功能后，管理员可以在 `/ai-runs` 创建和查看单资产自治任务，

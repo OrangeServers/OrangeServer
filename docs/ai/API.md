@@ -118,6 +118,23 @@ Run 的权威状态为 `queued`、`running`、`completed`、`partial`、`failed`
 
 详情见 [受控只读诊断](DIAGNOSTICS.md)。
 
+## M2 告警与运维态势 API
+
+| 方法 | 路径 | 调用方 | 说明 |
+|---|---|---|---|
+| GET | `/ai/ops/status` | admin | 返回待处理告警、活动/排队 Run、最近结论、Worker 容量和知识索引状态 |
+| POST | `/ai/ops/alertmanager/webhook` | Alertmanager | 使用独立 Bearer Token；单条 `firing` 幂等创建并启动 `ask` Run，`resolved` 只追加 Evidence |
+
+Webhook 最大 256 KiB，首版每次只接受一条 Alertmanager alert。标签必须包含
+`ogs_host_id`、`ogs_system_user_id` 和 `service`（或 `alertname`）；服务端会重新验证
+固定管理员、资产、系统凭据和授权关系。幂等键由 `groupKey + startsAt` 计算，调用方
+不能指定 Run owner、执行模式或权限。配置 Prometheus 时还必须提供 `instance` 和
+`job`，缺失时整条告警会被拒绝，不会静默跳过指标证据。
+
+配置 Prometheus 后，服务端只执行固定的服务可用性模板：最近 15 分钟、30 秒步长、
+5 秒超时且最多保留 1000 个样本。Webhook 和模型都不能提供 URL、Header 或任意
+PromQL。返回的 Evidence/Artifact 不包含 Prometheus 地址、认证信息或原始指标标签。
+
 ## M1 自治任务 API
 
 自治接口只对管理员开放。标准 bundled 栈启动统一 Redis 8 与 Worker，默认可用。
@@ -177,7 +194,8 @@ Run 的权威状态为 `queued`、`running`、`completed`、`partial`、`failed`
 
 ### 快照、事件和结论
 
-Run 快照包含目标和凭据的服务端绑定、权限模式、预算、状态、三态结论、`revision`、
+Run 快照包含目标和凭据的服务端绑定、权限模式、预算、状态、三态结论、`trigger_type`、
+脱敏的 `trigger_summary`、`revision`、
 `graph_version`、最新事件序号、取消请求和时间戳；每个 Step 包含 `kind`、状态、顺序、
 人类可读摘要、动作 digest 和受限备注。`GET /ai/autonomous-runs/{run_id}` 返回的
 `steps` 按 `seq` 排序，`allowed_operations` 为空表示当前没有待决策操作。
@@ -200,13 +218,13 @@ SSE 事件使用 MySQL 内的 Run 级单调 `sequence`。客户端断线后应�
 ### M1 持久化数据结构
 
 全新安装由 `backend/mysqldir/orange.sql` 一次创建；已有实例按
-[统一升级流程](../operations/UPGRADE.md) 依次执行 rev53、rev54、rev55、rev56。表是
+[统一升级流程](../operations/UPGRADE.md) 依次执行 rev53、rev54、rev55、rev56、rev57。表是
 业务事实源，Redis 8 只保存 LangGraph checkpoint 和 Celery broker 数据。
 
 | 表/字段 | 用途 | 关键约束 |
 |---|---|---|
 | `t_host.ai_environment` | 资产环境 | `production\|staging\|lab`，默认 `production`，仅管理员维护 |
-| `t_ai_autonomous_run` | Run 权威快照 | 目标资产/系统用户、`mode`/`custom_profile_json`、状态/结论、预算、`revision`/事件游标、租约 fencing、心跳和 `graph_version`；活动状态按 `active_host_id` 唯一约束封住同资产并行 Run |
+| `t_ai_autonomous_run` | Run 权威快照 | 目标资产/系统用户、`mode`/`custom_profile_json`、触发类型/幂等引用/脱敏摘要、状态/结论、预算、`revision`/事件游标、租约 fencing、心跳和 `graph_version`；活动状态按 `active_host_id` 唯一约束封住同资产并行 Run |
 | `t_ai_autonomous_step` | 有序计划、动作和验证 | `(run_id, seq)` 唯一；保存不可变动作摘要/digest、审批状态和有限备注 |
 | `t_ai_autonomous_event` | Run 内追加式事件 | `(run_id, sequence)` 唯一且单调；payload 不保存凭据 |
 | `t_ai_autonomous_artifact` | 加密执行产物 | 输出清洗、脱敏、限长后以 Fernet 密文保存；正文单条读取并按 `expires_at` 过期 |

@@ -24,6 +24,16 @@ def register_autonomy_routes(app: Any) -> None:
         _secure(views.autonomy_status, "admin", "user"), methods=["GET"],
     )
     app.add_url_rule(
+        "/ai/ops/status", "ai_ops_status",
+        _secure(views.ops_status, "admin"), methods=["GET"],
+    )
+    # Machine-to-machine endpoint: its own constant-time Bearer check replaces
+    # session auth and CSRF; never wrap it with the browser security chain.
+    app.add_url_rule(
+        "/ai/ops/alertmanager/webhook", "ai_ops_alertmanager_webhook",
+        views.alertmanager_webhook, methods=["POST"],
+    )
+    app.add_url_rule(
         "/ai/autonomous-runs", "ai_autonomy_create_run",
         _secure(views.create_run, *admins), methods=["POST"],
     )

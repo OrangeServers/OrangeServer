@@ -8,6 +8,7 @@
 import { aiJsonRequest, parseEventBlock } from '@/utils/aiStream'
 import { t } from '@/i18n'
 import type {
+  AIOpsStatus,
   AutonomyArtifact,
   AutonomyArtifactDetail,
   AutonomyCreateRunPayload,
@@ -31,6 +32,11 @@ async function envelopeData<T>(promise: Promise<AutonomyEnvelope<T>>): Promise<T
 /** 功能与基础设施就绪度（不受 flag 阻断，user 角色也可读） */
 export function getAutonomyStatus(): Promise<AutonomyReadiness> {
   return envelopeData(aiJsonRequest<AutonomyEnvelope<AutonomyReadiness>>('/ai/autonomy/status'))
+}
+
+/** 管理员 AIOps 首页聚合。 */
+export function getAIOpsStatus(): Promise<AIOpsStatus> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<AIOpsStatus>>('/ai/ops/status'))
 }
 
 /** 当前用户的 Run 列表（owner 隔离） */

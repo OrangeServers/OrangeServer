@@ -222,6 +222,8 @@ export default {
     evidenceKind: {
       action: 'Action result',
       verification: 'Verification result',
+      alert: 'Alert observation',
+      prometheus: 'Metrics observation',
       generic: 'Execution evidence',
     },
     artifactKind: {

@@ -79,6 +79,18 @@ class FakeRepo:
     def list_evidence(self, owner, run_id):
         return self._record("list_evidence", owner, run_id)
 
+    def ops_summary(self, owner):
+        self.calls.append(("ops_summary", (owner,), {}))
+        if self.exc is not None:
+            raise self.exc
+        return {
+            "active_runs": 0,
+            "queued_runs": 0,
+            "pending_alerts": [],
+            "running_runs": [],
+            "recent_conclusions": [],
+        }
+
 
 @pytest.fixture()
 def api(monkeypatch):
@@ -108,6 +120,8 @@ def test_routes_are_registered_with_expected_verbs():
     for rule in app.url_map.iter_rules():
         rules.setdefault(rule.rule, set()).update(rule.methods)
     assert "GET" in rules["/ai/autonomy/status"]
+    assert "GET" in rules["/ai/ops/status"]
+    assert "POST" in rules["/ai/ops/alertmanager/webhook"]
     assert "POST" in rules["/ai/autonomous-runs"]
     assert "GET" in rules["/ai/autonomous-runs"]
     assert "GET" in rules["/ai/autonomous-runs/<string:run_id>"]
@@ -156,7 +170,16 @@ def test_status_probe_reports_flag_without_being_blocked(
     _enable(monkeypatch, False)
     response = client.get("/ai/autonomy/status")
     assert response.status_code == 200
-    assert response.get_json()["data"] == {
+    for key in (
+        "active_runs", "queued_runs", "pending_alerts", "running_runs",
+        "recent_conclusions", "web_worker_class", "autonomy_pool",
+        "autonomy_concurrency", "knowledge_index_state",
+    ):
+        assert key in response.get_json()["data"]
+    assert {key: response.get_json()["data"][key] for key in (
+        "enabled", "configured", "checkpoint_ready", "worker_ready",
+        "ready", "reason",
+    )} == {
         "enabled": False,
         "configured": False,
         "checkpoint_ready": False,
@@ -167,7 +190,10 @@ def test_status_probe_reports_flag_without_being_blocked(
 
     _enable(monkeypatch, True)
     response = client.get("/ai/autonomy/status")
-    assert response.get_json()["data"] == {
+    assert {key: response.get_json()["data"][key] for key in (
+        "enabled", "configured", "checkpoint_ready", "worker_ready",
+        "ready", "reason",
+    )} == {
         "enabled": True,
         "configured": True,
         "checkpoint_ready": True,
@@ -240,6 +266,7 @@ def test_create_run_passes_boundary_inputs_to_repository(api, monkeypatch):
         "mode": "ask",
         "budget_payload": {"max_actions": 3},
         "profile_payload": None,
+        "trigger_type": "manual",
     }
 
 

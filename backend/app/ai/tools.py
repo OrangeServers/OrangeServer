@@ -279,6 +279,8 @@ class ToolRegistry:
                 mode=mode,
                 budget_payload=None,
                 profile_payload=None,
+                trigger_type="chat",
+                trigger_summary="AI chat draft",
             )
         except AutonomyValidationError as exc:
             raise ToolValidationError(str(exc)) from exc

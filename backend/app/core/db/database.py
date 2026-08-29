@@ -574,6 +574,10 @@ class t_ai_autonomous_run(db.Model, TimestampMixin):
         db.UniqueConstraint(
             'active_host_id', name='uq_ai_auto_run_active_host',
         ),
+        db.UniqueConstraint(
+            'trigger_type', 'trigger_ref',
+            name='uq_ai_auto_run_trigger',
+        ),
     )
     id = db.Column(db.String(32), primary_key=True)
     owner = db.Column(db.String(24), nullable=False, index=True)
@@ -583,6 +587,17 @@ class t_ai_autonomous_run(db.Model, TimestampMixin):
     system_user_id = db.Column(db.INTEGER, nullable=False)
     system_user_alias = db.Column(db.String(24), nullable=False)
     mode = db.Column(db.String(16), nullable=False)
+    # M2/S1: 触发来源只保存服务端枚举、不可逆幂等引用和脱敏摘要。
+    # 手工/聊天创建没有 trigger_ref；Alertmanager 使用
+    # sha256(groupKey + startsAt)，唯一键封住重复投递竞态。
+    trigger_type = db.Column(
+        db.String(16), nullable=False,
+        default='manual', server_default='manual',
+    )
+    trigger_ref = db.Column(db.String(64), nullable=True)
+    trigger_summary = db.Column(
+        db.String(512), nullable=False, default='', server_default='',
+    )
     # M1/S3: custom 权限档案（仅 mode='custom' 时非空）。服务端固定
     #   动作类别集合 + Run 已绑定的单一主机；不引入策略表达式语言。
     #   同步 DDL: backend/mysqldir/rev55_ai_autonomy_custom_profile.sql

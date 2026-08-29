@@ -220,6 +220,8 @@ export default {
     evidenceKind: {
       action: '动作结果',
       verification: '验证结果',
+      alert: '告警观察',
+      prometheus: '指标观察',
       generic: '执行证据',
     },
     artifactKind: {

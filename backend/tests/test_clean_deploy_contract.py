@@ -452,8 +452,8 @@ def test_rev54_autonomy_migration_matches_baseline_and_orm():
         assert f"_utf8mb4''{status}''" in rev54
 
 
-def test_rev55_autonomy_migration_matches_baseline_and_orm():
-    """M1/S3: rev55 追加列后，rev53+rev54+rev55、orange.sql 与 ORM 一致。"""
+def test_autonomy_run_migrations_match_baseline_and_orm():
+    """rev53+rev54+rev55+rev57、orange.sql 与 ORM 列集合一致。"""
     from app.core.db.database import db
 
     def migration_columns(path):
@@ -488,12 +488,16 @@ def test_rev55_autonomy_migration_matches_baseline_and_orm():
 
     rev53_columns = create_columns(rev53, "t_ai_autonomous_run")
     rev54_added = migration_columns("rev54_ai_autonomy_lease.sql")
+    rev57_added = migration_columns("rev57_ai_ops_trigger.sql")
+    assert rev57_added == {
+        "trigger_type", "trigger_ref", "trigger_summary",
+    }
     baseline_columns = create_columns(schema, "t_ai_autonomous_run")
     orm_columns = set(
         db.metadata.tables["t_ai_autonomous_run"].columns.keys()
     )
     assert (
-        rev53_columns | rev54_added | added
+        rev53_columns | rev54_added | added | rev57_added
         == baseline_columns == orm_columns
     )
 
@@ -504,6 +508,14 @@ def test_rev55_autonomy_migration_matches_baseline_and_orm():
     )
     assert run_ddl, "orange.sql must define t_ai_autonomous_run"
     assert "`custom_profile_json` text DEFAULT NULL" in run_ddl.group(1)
+    assert "UNIQUE KEY `uq_ai_auto_run_trigger`" in run_ddl.group(1)
+
+    rev57 = (
+        BACKEND / "mysqldir" / "rev57_ai_ops_trigger.sql"
+    ).read_text(encoding="utf-8")
+    assert rev57.count("information_schema.COLUMNS") == 3
+    assert rev57.count("information_schema.STATISTICS") == 1
+    assert rev57.count("PREPARE stmt FROM @sql;") == 4
 
 
 def test_rev56_autonomy_evidence_table_matches_baseline_and_orm():

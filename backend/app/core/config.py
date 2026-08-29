@@ -287,6 +287,15 @@ AI_AUTONOMY_GUARDIAN_ENABLED = str(
     _env('OGS_AI_AUTONOMY_GUARDIAN_ENABLED', ''),
 ).strip().lower() in ('1', 'true', 'yes', 'on')
 
+# M2/S1: Alertmanager 是独立机器调用方，使用固定 Bearer token 和固定
+# 管理员 owner；标签只能提供资产/凭据 ID，不能选择用户、URL 或 PromQL。
+AI_ALERTMANAGER_TOKEN = str(_env('OGS_AI_ALERTMANAGER_TOKEN', '')).strip()
+AI_ALERTMANAGER_OWNER = str(_env('OGS_AI_ALERTMANAGER_OWNER', '')).strip()
+AI_PROMETHEUS_BASE_URL = str(_env('OGS_AI_PROMETHEUS_BASE_URL', '')).strip()
+AI_PROMETHEUS_BEARER_TOKEN = str(
+    _env('OGS_AI_PROMETHEUS_BEARER_TOKEN', '')
+).strip()
+
 # REVIEW-11-P1-1: SSH 危险命令黑名单
 #   拦截 rm -rf / / mkfs / dd if= / shutdown / reboot / fork 炸弹 等
 #   逗号分隔, 可通过 env 覆盖 (生产环境只追加,不删除默认项)
