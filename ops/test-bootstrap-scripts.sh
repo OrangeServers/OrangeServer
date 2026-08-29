@@ -116,7 +116,7 @@ run_canonical() {
         fail "canonical installer failed for ${name}"
     fi
     expect_file_contains "$record" "OGS_BACKEND_IMAGE=${expected_image}"
-    expect_file_contains "$record" "OGS_REDIS_IMAGE=redis:8.10.0-alpine"
+    expect_file_contains "$record" "OGS_REDIS_IMAGE=redis:8.10.0"
     expect_file_contains "$record" "OGS_MYSQL_IMAGE=mysql:8.0.42"
 }
 
@@ -223,7 +223,7 @@ expect_file_contains "$CN_BUILD_ARGS" "$VERSION"
 expect_file_contains "$CN_INSTALL_ARGS" "--backend-image"
 expect_file_contains "$CN_INSTALL_ARGS" "ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend"
 expect_file_contains "$CN_INSTALL_ARGS" "--redis-image"
-expect_file_contains "$CN_INSTALL_ARGS" "m.daocloud.io/docker.io/library/redis:8.10.0-alpine"
+expect_file_contains "$CN_INSTALL_ARGS" "m.daocloud.io/docker.io/library/redis:8.10.0"
 expect_file_contains "$CN_INSTALL_ARGS" "--mysql-image"
 expect_file_contains "$CN_INSTALL_ARGS" "m.daocloud.io/docker.io/library/mysql@sha256:63823b8e2cbe4ae0c558155e02d00beba56130fbc3d147efccbdb328ae2dbb9e"
 expect_file_contains "$CN_INSTALL_ARGS" "--bundle-file"

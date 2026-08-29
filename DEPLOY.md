@@ -128,7 +128,7 @@ make docker-up
 > ```bash
 > set -o pipefail
 > curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/vX.Y.Z/ops/bootstrap-compose-cn.sh \
->   | sudo env OGS_CN_REDIS_IMAGE=registry.example.com/redis:8.10.0-alpine \
+>   | sudo env OGS_CN_REDIS_IMAGE=registry.example.com/redis:8.10.0 \
 >       bash -s -- --version vX.Y.Z
 > ```
 

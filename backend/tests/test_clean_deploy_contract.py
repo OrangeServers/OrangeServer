@@ -134,7 +134,8 @@ def test_standard_compose_is_four_containers_with_one_redis():
     assert all(f"  {service}:" in compose for service in ("app", "worker", "redis", "mysql"))
     assert "  frontend:" not in compose
     assert "  autonomy-redis:" not in compose
-    assert "redis:8.10.0-alpine" in compose
+    assert "redis:8.10.0" in compose
+    assert "redis:8.10.0-alpine" not in compose
     assert (
         "yes --appendfsync everysec --maxmemory 512mb "
         "--maxmemory-policy volatile-lru\n"

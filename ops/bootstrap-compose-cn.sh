@@ -4,7 +4,7 @@ umask 077
 
 REPOSITORY_URL="${OGS_CN_REPOSITORY_URL:-https://gitee.com/orangeservers/OrangeServer.git}"
 BACKEND_IMAGE="${OGS_CN_BACKEND_IMAGE:-ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend}"
-REDIS_IMAGE="${OGS_CN_REDIS_IMAGE:-m.daocloud.io/docker.io/library/redis:8.10.0-alpine}"
+REDIS_IMAGE="${OGS_CN_REDIS_IMAGE:-m.daocloud.io/docker.io/library/redis:8.10.0}"
 MYSQL_IMAGE="${OGS_CN_MYSQL_IMAGE:-m.daocloud.io/docker.io/library/mysql@sha256:63823b8e2cbe4ae0c558155e02d00beba56130fbc3d147efccbdb328ae2dbb9e}"
 VERSION=""
 FORWARD_ARGS=()

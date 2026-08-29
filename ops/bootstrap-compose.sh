@@ -10,7 +10,7 @@ PROJECT_NAME="orangeserver"
 BUNDLE_FILE=""
 CHECKSUM_FILE=""
 BACKEND_IMAGE="ghcr.io/orangeservers/orangeserver-backend"
-REDIS_IMAGE="redis:8.10.0-alpine"
+REDIS_IMAGE="redis:8.10.0"
 MYSQL_IMAGE="mysql:8.0.42"
 
 usage() {

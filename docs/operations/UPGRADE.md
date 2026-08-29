@@ -123,7 +123,7 @@ done
 chmod 600 "${next_dir}/.env" "${next_dir}/backend/.env"
 ```
 
-统一 Redis 镜像默认为 `redis:8.10.0-alpine`。无法访问 Docker Hub 的网络先把该镜像
+统一 Redis 镜像默认为 `redis:8.10.0`（包含 checkpoint/RAG 所需的 Search 和 JSON）。无法访问 Docker Hub 的网络先把该镜像
 转存到内部仓库，再在根 `.env` 设置 `OGS_REDIS_IMAGE` 指向转存地址。
 
 目标 bundle 包含 `CHANGELOG.md`、本文和数据库迁移 SQL。先比较当前

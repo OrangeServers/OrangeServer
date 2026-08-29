@@ -33,7 +33,7 @@
 |------|------|---------------|---------------|------|
 | app | 源码部署默认本地构建；Release 安装使用固定版本 GHCR 镜像 | ${OGS_HTTP_PORT:-8080} | 28000 | Flask + Gunicorn + WebSocket + 内置 SPA |
 | worker | 与 app 相同 | (无) | (无) | Celery prefork，默认并发 2 |
-| redis | redis:8.10.0-alpine | (无) | 6379 | DB0 checkpoint/向量、DB1 broker、DB2 会话/缓存 |
+| redis | redis:8.10.0 | (无) | 6379 | DB0 checkpoint/向量、DB1 broker、DB2 会话/缓存 |
 | mysql | mysql:8.0.42 | (无) | 3306 | 业务数据库（自动导入 orange.sql）|
 
 开发环境不叠加生产编排，也不连接宿主机旧数据库：
