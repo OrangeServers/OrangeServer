@@ -127,6 +127,7 @@ def test_compose_does_not_force_global_container_names():
 
 def test_standard_compose_is_four_containers_with_one_redis():
     compose = (DEPLOY / "docker-compose.yml").read_text(encoding="utf-8")
+    redis_service = compose.split("  redis:\n", 1)[1].split("\n  mysql:\n", 1)[0]
     env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
     backend_env = (REPO_ROOT / "backend" / ".env.example").read_text(
         encoding="utf-8",
@@ -136,11 +137,11 @@ def test_standard_compose_is_four_containers_with_one_redis():
     assert "  autonomy-redis:" not in compose
     assert "redis:8.10.0" in compose
     assert "redis:8.10.0-alpine" not in compose
-    assert (
-        "yes --appendfsync everysec --maxmemory 512mb "
-        "--maxmemory-policy volatile-lru\n"
-        "        --requirepass \"$$OGS_REDIS_PASSWORD\""
-    ) in compose
+    assert "command:\n      - redis-server" in redis_service
+    assert "\n      - sh\n" not in redis_service
+    assert "--appendonly\n      - \"yes\"" in redis_service
+    assert "--maxmemory-policy\n      - volatile-lru" in redis_service
+    assert "--requirepass\n      - ${OGS_REDIS_PASSWORD:-}" in redis_service
     assert "app.ai.autonomy.celery_entry:celery_app" in compose
     assert compose.count(
         "OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-true}",
