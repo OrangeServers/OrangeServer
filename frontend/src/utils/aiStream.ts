@@ -117,7 +117,7 @@ export async function postAiStream(
 export async function aiJsonRequest<T>(
   url: string,
   options: {
-    method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
+    method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
     body?: Record<string, unknown>
     signal?: AbortSignal
   } = {},
@@ -129,7 +129,7 @@ export async function aiJsonRequest<T>(
     headers: {
       Accept: 'application/json',
       ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(method === 'POST' || method === 'PUT' || method === 'DELETE' ? csrfHeaders() : {}),
+      ...(method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE' ? csrfHeaders() : {}),
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
     signal: options.signal,

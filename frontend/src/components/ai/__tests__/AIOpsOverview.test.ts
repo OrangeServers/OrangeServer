@@ -44,7 +44,7 @@ describe('AIOpsOverview', () => {
       autonomy_concurrency: 2,
       active_runs: 1,
       queued_runs: 1,
-      knowledge_index_state: 'not_configured',
+      knowledge_index_state: 'empty',
       alertmanager_configured: true,
       prometheus_configured: true,
       pending_alerts: [{

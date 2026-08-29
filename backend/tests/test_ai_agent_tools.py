@@ -89,6 +89,27 @@ def test_admin_receives_account_and_audit_tools():
 
     assert "search_accounts" in names
     assert "search_audit_logs" in names
+    assert "search_knowledge" in names
+
+
+def test_admin_knowledge_tool_returns_bounded_references(monkeypatch):
+    from app.ai import knowledge
+
+    class FakeKnowledgeService:
+        def __init__(self, _session):
+            pass
+
+        def search(self, query, *, limit):
+            assert (query, limit) == ("disk full", 8)
+            return [{"citation_id": "K1", "title": "Disk runbook"}]
+
+    monkeypatch.setattr(knowledge, "KnowledgeService", FakeKnowledgeService)
+    _, _, registry = _registry(role="admin")
+    result = registry.execute("search_knowledge", {"query": "disk full"})
+    assert result == {
+        "knowledge_references": [{"citation_id": "K1", "title": "Disk runbook"}],
+        "count": 1,
+    }
 
 
 def test_asset_query_returns_result_set_reference_instead_of_full_context():

@@ -30,6 +30,7 @@ from app.core import config
 logger = logging.getLogger('autonomy_worker')
 
 DRIVE_RUN_TASK = 'ogs.autonomy.drive_run'
+REINDEX_KNOWLEDGE_TASK = 'ogs.knowledge.reindex'
 RECOVERY_SCAN_INTERVAL_SECONDS = 30
 
 RESULT_CLAIMED = 'claimed'
@@ -200,6 +201,18 @@ def _register_tasks(app):
             finally:
                 _remove_db_session(db)
 
+    @app.task(name=REINDEX_KNOWLEDGE_TASK)
+    def reindex_knowledge():
+        from app.app_factory import app as flask_app
+        from app.ai.knowledge import KnowledgeService
+        from app.core.db.database import db
+
+        with flask_app.app_context():
+            try:
+                return KnowledgeService(db.session).reindex()
+            finally:
+                _remove_db_session(db)
+
 
 def build_default_executor(session):
     """生产默认执行器：AutonomyDriver 驱动循环 + Tool Calling 规划器。
@@ -243,6 +256,15 @@ def dispatch_drive_run(run_id, celery_app=None):
     if celery_app is None:
         return False
     celery_app.send_task(DRIVE_RUN_TASK, args=[run_id])
+    return True
+
+
+def dispatch_knowledge_reindex(celery_app=None):
+    if celery_app is None:
+        celery_app = get_celery_app()
+    if celery_app is None:
+        return False
+    celery_app.send_task(REINDEX_KNOWLEDGE_TASK)
     return True
 
 

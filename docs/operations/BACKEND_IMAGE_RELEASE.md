@@ -103,7 +103,9 @@ wsl -d <wsl-发行版> -u root -e bash -c '
 ### 3.3 发布后验证
 
 两个 registry 都从未 `docker login` 的环境各做一次匿名拉取，确认平台为 `linux/amd64`、
-镜像能启动到 healthy。国内链路再跑一次「从零安装验证」（见第 4 节）。
+镜像能启动到 healthy，并在 app 容器内确认内置 BGE 模型文件存在且知识库重建可用。
+镜像构建阶段需要访问固定的 Qdrant FastEmbed 模型归档，并在解压前校验仓库固定的
+SHA-256；运行期不再下载模型。国内链路再跑一次「从零安装验证」（见第 4 节）。
 
 ## 4. 发布步骤 checklist
 
@@ -151,6 +153,8 @@ curl -fsSL https://github.com/OrangeServers/OrangeServer/releases/download/vX.Y.
 安装后验证：4 个产品容器全部 `Up`，app/worker/mysql/redis healthy；setup 完成
 前 worker 保持等待、不 crash-loop（见第 1 节）；`/local/health` 返回 200；完成
 `/setup` 后登录、资产、审计、AI Provider、只读诊断正常。
+随后新建一个无敏感信息的示例 Runbook，重建索引并完成一次带版本引用的检索；删除
+示例文档后再次重建，确认索引回到预期状态。
 
 ## 5. 已知坑（踩过，别重蹈）
 

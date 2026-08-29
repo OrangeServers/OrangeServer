@@ -58,3 +58,9 @@ openai==2.46.0
 celery==5.6.3
 langgraph==1.2.10
 langgraph-checkpoint-redis==0.5.1
+
+# --- Bounded knowledge retrieval (M2/S2) ---------------------------------
+# Keep only the standalone splitter; no LangChain agents or tracing stack.
+langchain-text-splitters==1.1.2
+# Local ONNX embeddings; the model is baked into the image separately.
+fastembed==0.8.0

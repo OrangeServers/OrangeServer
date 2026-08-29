@@ -131,6 +131,7 @@ def test_celery_app_uses_dedicated_broker_db1(worker_env):
     assert app.conf.worker_concurrency == 2
     assert app.conf.result_backend is None
     assert worker.DRIVE_RUN_TASK in app.tasks
+    assert worker.REINDEX_KNOWLEDGE_TASK in app.tasks
     assert app.tasks[worker.DRIVE_RUN_TASK].max_retries is None
     # 单例：重复获取是同一实例。
     assert worker.get_celery_app() is app
@@ -646,6 +647,12 @@ def test_dispatch_recoverable_enqueues_candidates(worker_env):
     )
     assert [c["run_id"] for c in candidates] == [queued["id"]]
     assert fake_app.sent == [(worker.DRIVE_RUN_TASK, (queued["id"],))]
+
+
+def test_dispatch_knowledge_reindex_uses_existing_worker(worker_env):
+    fake_app = FakeCeleryApp()
+    assert worker.dispatch_knowledge_reindex(celery_app=fake_app) is True
+    assert fake_app.sent == [(worker.REINDEX_KNOWLEDGE_TASK, ())]
 
 
 def test_dispatch_recoverable_sweeps_expired_before_dispatch(worker_env):

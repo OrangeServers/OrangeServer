@@ -569,6 +569,54 @@ def test_rev56_autonomy_evidence_table_matches_baseline_and_orm():
     ) < schema.index("DROP TABLE IF EXISTS `t_ai_autonomous_run`;")
 
 
+def test_rev58_knowledge_tables_match_fresh_schema_and_orm():
+    from app.core.db.database import db
+
+    migration = (
+        BACKEND / "mysqldir" / "rev58_ai_knowledge.sql"
+    ).read_text(encoding="utf-8")
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+
+    def columns(source, table):
+        match = re.search(
+            r"CREATE TABLE(?: IF NOT EXISTS)? `" + table
+            + r"` \((.*?)\)\s*ENGINE=",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        assert match, table
+        return set(re.findall(r"^\s*`([^`]+)`\s+", match.group(1), re.MULTILINE))
+
+    for table in ("t_ai_embedding_config", "t_ai_knowledge_document"):
+        assert columns(migration, table) == columns(schema, table)
+        assert columns(schema, table) == set(db.metadata.tables[table].columns.keys())
+    assert migration.count("CREATE TABLE IF NOT EXISTS") == 2
+    assert "INSERT IGNORE INTO `t_ai_embedding_config`" in migration
+    assert "BAAI/bge-small-zh-v1.5" in migration
+    assert "09b6e5dccb3cf9c17b68c4493ceb1cf6eb4c6980e8a429a8c3343d46932e75ec" in migration
+    assert "`content` longtext NOT NULL" in migration
+
+
+def test_dockerfile_pins_and_verifies_local_embedding_model():
+    dockerfile = (BACKEND / "Dockerfile").read_text(encoding="utf-8")
+    requirements = (BACKEND / "requirements.txt").read_text(encoding="utf-8")
+    assert "fastembed==0.8.0" in requirements
+    assert "langchain-text-splitters==1.1.2" in requirements
+    assert "fast-bge-small-zh-v1.5.tar.gz" in dockerfile
+    assert "bf023219b6029148fddf764d248808816c0ca1f107f058231bb1ae0fa526f83f" in dockerfile
+    assert "sha256sum -c -" in dockerfile
+    assert "libgomp1" in dockerfile
+    assert "OGS_AI_EMBEDDING_MODEL_PATH=/opt/orangeserver/models/fast-bge-small-zh-v1.5" in dockerfile
+    assert "PIP_EXTRA_INDEX_URL" not in dockerfile
+    compose = (REPO_ROOT / "deploy" / "docker-compose.yml").read_text(
+        encoding="utf-8",
+    )
+    assert compose.count(
+        "OGS_AI_EMBEDDING_MODEL_PATH: "
+        "/opt/orangeserver/models/fast-bge-small-zh-v1.5"
+    ) == 2
+
+
 def test_dockerfile_builds_from_committed_requirements_without_resolving_lock():
     dockerfile = (BACKEND / "Dockerfile").read_text(encoding="utf-8")
     assert "pip-compile" not in dockerfile
@@ -636,7 +684,19 @@ def test_autonomy_dev_overlay_uses_dedicated_redis8_and_worker():
     assert "app.ai.autonomy.celery_entry:celery_app" in overlay
     assert "--concurrency=1" not in overlay
     assert "OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}" in overlay
-    assert "inspect ping" in overlay
+    health_probe = (
+        "from app.ai.autonomy.readiness import checkpoint_readiness, "
+        "worker_readiness; raise SystemExit(0 if checkpoint_readiness() "
+        "and worker_readiness() else 1)"
+    )
+    assert health_probe in overlay
+    assert "inspect ping" not in overlay
+    assert health_probe in (
+        REPO_ROOT / "deploy" / "docker-compose.yml"
+    ).read_text(encoding="utf-8")
+    assert health_probe in (
+        REPO_ROOT / "deploy" / "docker-compose.s2-smoke.yml"
+    ).read_text(encoding="utf-8")
     assert "../backend:/app" in overlay
     assert overlay.count("condition: service_healthy") == 4
     assert "docker-compose.dev-autonomy.yml" in makefile

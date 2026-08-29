@@ -11,6 +11,7 @@ export default {
   webTerminal: 'Web 终端',
   aiAgent: 'AI 运维',
   aiRuns: '自治任务',
+  aiKnowledge: '运维知识库',
   authority: '权限管理',
   cron: '定时任务',
   fileTransfer: '文件传输',

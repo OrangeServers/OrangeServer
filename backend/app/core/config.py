@@ -295,6 +295,11 @@ AI_PROMETHEUS_BASE_URL = str(_env('OGS_AI_PROMETHEUS_BASE_URL', '')).strip()
 AI_PROMETHEUS_BEARER_TOKEN = str(
     _env('OGS_AI_PROMETHEUS_BEARER_TOKEN', '')
 ).strip()
+# M2/S2: production image bakes the pinned local model at this path. Empty
+# keeps source checkouts usable; FastEmbed then uses its normal local cache.
+AI_EMBEDDING_MODEL_PATH = str(
+    _env('OGS_AI_EMBEDDING_MODEL_PATH', '')
+).strip()
 
 # REVIEW-11-P1-1: SSH 危险命令黑名单
 #   拦截 rm -rf / / mkfs / dd if= / shutdown / reboot / fork 炸弹 等

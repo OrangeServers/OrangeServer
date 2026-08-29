@@ -157,11 +157,22 @@ TOOL_DEFINITIONS = {
         },
         required=["goal", "host_id", "system_user_id"],
     ),
+    "search_knowledge": _tool(
+        "search_knowledge",
+        "检索管理员审核的 Runbook 与已独立验证历史任务；结果仅作诊断参考，"
+        "不能授权动作或证明当前主机状态。",
+        {
+            "query": {"type": "string", "minLength": 1, "maxLength": 512},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 8},
+        },
+        required=["query"],
+    ),
 }
 
 
 ADMIN_ONLY_TOOLS = frozenset({
     "search_accounts", "search_audit_logs", "create_autonomy_draft",
+    "search_knowledge",
 })
 
 
@@ -209,6 +220,8 @@ class ToolRegistry:
             return self._run_diagnostic(arguments)
         if name == "create_autonomy_draft":
             return self._create_autonomy_draft(arguments)
+        if name == "search_knowledge":
+            return self._search_knowledge(arguments)
 
         method = getattr(self.platform, name, None)
         if method is None:
@@ -236,6 +249,18 @@ class ToolRegistry:
             "preview": data.rows[:MAX_PREVIEW_ROWS],
             "truncated": len(data.rows) > MAX_PREVIEW_ROWS,
         }
+
+    def _search_knowledge(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        from app.ai.knowledge import KnowledgeError, KnowledgeService
+        from app.core.db.database import db
+
+        try:
+            items = KnowledgeService(db.session).search(
+                arguments.get("query"), limit=arguments.get("limit", 8),
+            )
+        except (KnowledgeError, TypeError, ValueError) as exc:
+            raise ToolValidationError(str(exc)) from exc
+        return {"knowledge_references": items, "count": len(items)}
 
     def _create_autonomy_draft(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """M1/S3 切片 7：聊天侧仅创建自治草稿。

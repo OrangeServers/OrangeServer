@@ -198,10 +198,10 @@ services:
         read_only: true
     healthcheck:
       test:
-        - CMD-SHELL
-        - >-
-          celery -A app.ai.autonomy.celery_entry:celery_app inspect ping
-          --destination "celery@$$HOSTNAME" --timeout 3 | grep -q pong
+        - CMD
+        - python
+        - -c
+        - from app.ai.autonomy.readiness import checkpoint_readiness, worker_readiness; raise SystemExit(0 if checkpoint_readiness() and worker_readiness() else 1)
       interval: 4s
       timeout: 6s
       retries: 45

@@ -492,6 +492,19 @@ class AutonomyDriver:
             ).filter_by(
                 run_id=run_id, kind=StepKind.ACTION.value,
             ).count()
+            knowledge = []
+            try:
+                from app.ai.knowledge import KnowledgeService
+
+                knowledge = KnowledgeService(self.session).search(
+                    str(current_run.goal or ''),
+                    limit=4,
+                    scopes=('global', 'host:%d' % int(current_run.host_id)),
+                )
+            except Exception as exc:
+                # Retrieval is advisory; Redis/model failure must never change
+                # the server-owned authorization or stop incident handling.
+                logger.warning('knowledge retrieval unavailable: %s', exc)
             context = {
                 'run_id': run_id,
                 'owner': str(state.get('owner') or ''),
@@ -513,6 +526,7 @@ class AutonomyDriver:
                 # 大输出留在加密 Artifact；模型只读得到有界脱敏
                 # 的 Evidence 摘要（切片 4）。
                 'evidence': summarize_evidence(self.session, run_id),
+                'knowledge': knowledge,
                 'require_plan': self._planner_requires_plan(run_id),
             }
             proposed = list(self.planner(context) or [])

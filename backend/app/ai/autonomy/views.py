@@ -112,11 +112,21 @@ def _ops_capacity(owner, readiness=None):
     readiness = readiness or autonomy_readiness(enabled=is_autonomy_enabled())
     configured = int(readiness.get('worker_concurrency_configured') or 1)
     observed = readiness.get('worker_concurrency_observed')
+    from app.ai.knowledge import KnowledgeService
+
+    try:
+        knowledge_state = KnowledgeService(db.session).index_state()
+    except Exception as exc:
+        # A missing rev58 table during upgrade is itself an actionable state;
+        # keep the readiness endpoint usable and never misreport it as empty.
+        logger.warning('knowledge index state unavailable: %s', exc)
+        knowledge_state = 'error'
+
     summary.update({
         'web_worker_class': 'gevent',
         'autonomy_pool': readiness.get('worker_pool') or 'prefork',
         'autonomy_concurrency': int(observed or configured),
-        'knowledge_index_state': 'not_configured',
+        'knowledge_index_state': knowledge_state,
     })
     return summary
 
@@ -503,6 +513,117 @@ def list_evidence(run_id):
     except Exception as exc:
         db.session.rollback()
         return _handle(exc)
+
+
+# ----------------------------------------------------------------------
+# M2/S2: reviewed knowledge truth and rebuildable Redis vector index
+# ----------------------------------------------------------------------
+
+def _knowledge_service():
+    from app.ai.knowledge import KnowledgeService
+
+    return KnowledgeService(db.session)
+
+
+def _handle_knowledge(exc):
+    from app.ai.knowledge import (
+        KnowledgeConflict,
+        KnowledgeNotFound,
+        KnowledgeValidationError,
+    )
+
+    if isinstance(exc, KnowledgeNotFound):
+        return api_error(ApiCode.FORBIDDEN, str(exc), 404)
+    if isinstance(exc, KnowledgeValidationError):
+        return api_error(ApiCode.TYPE_ERROR, str(exc), 400)
+    if isinstance(exc, KnowledgeConflict):
+        return api_error(ApiCode.FORBIDDEN, str(exc), 409)
+    db.session.rollback()
+    logger.exception('knowledge request failed')
+    return api_error(ApiCode.INTERNAL_ERROR, '知识库处理失败，请查看服务端日志', 500)
+
+
+def knowledge_config():
+    """GET/PATCH embedding config; API keys are write-only."""
+    try:
+        service = _knowledge_service()
+        data = (
+            service.save_config(_payload())
+            if request.method == 'PATCH' else service.config()
+        )
+        return api_response(data=_jsonable(data))
+    except Exception as exc:
+        db.session.rollback()
+        return _handle_knowledge(exc)
+
+
+def knowledge_documents():
+    """GET approved documents or POST an administrator-reviewed runbook."""
+    _holder, owner, _role = _identity()
+    try:
+        service = _knowledge_service()
+        if request.method == 'POST':
+            return api_response(
+                data=_jsonable(service.create_document(owner, _payload())),
+                status=201,
+            )
+        return api_response(data={
+            'documents': _jsonable(service.list_documents()),
+        })
+    except Exception as exc:
+        db.session.rollback()
+        return _handle_knowledge(exc)
+
+
+def knowledge_document(document_id):
+    """GET/PATCH/DELETE one reviewed knowledge document."""
+    try:
+        service = _knowledge_service()
+        if request.method == 'DELETE':
+            service.delete_document(document_id)
+            return api_response(data={'deleted': True})
+        data = (
+            service.update_document(document_id, _payload())
+            if request.method == 'PATCH' else service.get_document(document_id)
+        )
+        return api_response(data=_jsonable(data))
+    except Exception as exc:
+        db.session.rollback()
+        return _handle_knowledge(exc)
+
+
+def knowledge_reindex():
+    """Queue a bounded Redis index rebuild on the existing prefork Worker."""
+    try:
+        from app.ai.autonomy.worker import dispatch_knowledge_reindex
+
+        service = _knowledge_service()
+        data = service.request_reindex()
+        try:
+            dispatched = dispatch_knowledge_reindex()
+        except Exception:
+            service.mark_index_error()
+            raise
+        if not dispatched:
+            service.mark_index_error()
+            return api_error(
+                ApiCode.FORBIDDEN, '自治 Worker 未就绪，无法重建知识索引', 503,
+            )
+        return api_response(data=_jsonable(data), status=202)
+    except Exception as exc:
+        db.session.rollback()
+        return _handle_knowledge(exc)
+
+
+def knowledge_capture_run(run_id):
+    """Promote one owned, resolved and independently verified Run."""
+    _holder, owner, _role = _identity()
+    try:
+        data = _knowledge_service().capture_run(owner, run_id)
+        return api_response(data=_jsonable(data), status=201)
+    except Exception as exc:
+        db.session.rollback()
+        return _handle_knowledge(exc)
 
 
 # ----------------------------------------------------------------------

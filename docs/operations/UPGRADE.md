@@ -175,6 +175,9 @@ mysql -h <mysql-host> -u <mysql-user> -p <database> \
 
 mysql -h <mysql-host> -u <mysql-user> -p <database> \
   < backend/mysqldir/rev57_ai_ops_trigger.sql
+
+mysql -h <mysql-host> -u <mysql-user> -p <database> \
+  < backend/mysqldir/rev58_ai_knowledge.sql
 ```
 
 顺序不可颠倒：rev49 修改 rev48 创建的 `t_ai_provider`，rev50 增加受控诊断的
@@ -183,9 +186,10 @@ zh-CN，存量行为不变），rev52 增加由管理界面维护的 SMTP 配置
 保存 Fernet 密文，rev53 为 AI 自治（M1/S1）增加资产环境列与 Run/Step/事件/
 产物四张表；rev54 为自治 Run 表追加 Worker 租约、一次性 fencing token、心跳与
 图版本列（M1/S2），rev55 为自治 Run 表追加可选的自定义权限档案列，rev56 增加
-  脱敏 Evidence 引用表（M1/S3），rev57 为 Run 增加触发类型、幂等引用和脱敏触发
-  摘要（M2/S1）。标准 bundled 栈会启动统一 Redis 8 与 Worker，
-  自治能力默认可用。
+脱敏 Evidence 引用表（M1/S3），rev57 为 Run 增加触发类型、幂等引用和脱敏触发
+摘要（M2/S1），rev58 增加 embedding 单例配置和已审核知识文档表（M2/S2）；
+Redis 向量是可重建数据，不需要数据库 chunk 表。标准 bundled 栈会启动统一 Redis 8
+与 Worker，自治能力默认可用。
 各脚本针对其自身变更设计了重复执行保护，但重复运行前仍应
 确认输出和目标数据库正确。
 
@@ -236,6 +240,8 @@ SHOW INDEX FROM t_ai_autonomous_run
 WHERE Key_name = 'uq_ai_auto_run_active_host';
 SHOW COLUMNS FROM t_ai_autonomous_run LIKE 'custom_profile_json';
 SHOW TABLES LIKE 't_ai_autonomous_evidence';
+SHOW TABLES LIKE 't_ai_embedding_config';
+SHOW TABLES LIKE 't_ai_knowledge_document';
 
 SELECT
     provider_code,
@@ -258,6 +264,8 @@ ORDER BY provider_code;
   `uq_ai_auto_run_active_host` 唯一索引；
 - `t_ai_autonomous_run.custom_profile_json` 和
   `t_ai_autonomous_evidence` 存在；Evidence 的 `trusted` 默认值为 `0`；
+- `t_ai_embedding_config` 只有默认本地模型配置，且
+  `t_ai_knowledge_document` 已创建；
 - 查询结果中不应出现明文 API Key。
 
 ## 5. 启动和冒烟验证
@@ -298,11 +306,12 @@ make docker-health
 2. 资产列表、授权、批量命令和审计页面可打开；
 3. WebSSH 能建立和关闭会话；
 4. “系统设置 → AI 模型服务”显示 256K/1M 能力；
-5. 已配置 API Key 显示掩码状态而非明文或空配置；
-6. Provider Tool Calling 测试成功；
-7. 新建 256K 会话，执行一次只读资产查询；
-8. 对测试资产运行一个固定只读诊断，检查进度、证据引用和报告；
-9. 创建批量命令计划，检查预览后取消，不在升级冒烟中执行破坏性命令。
+5. “运维知识库”可新建 Runbook、重建索引并显示 `ready`；
+6. 已配置 API Key 显示掩码状态而非明文或空配置；
+7. Provider Tool Calling 测试成功；
+8. 新建 256K 会话，执行一次只读资产查询；
+9. 对测试资产运行一个固定只读诊断，检查进度、证据引用和报告；
+10. 创建批量命令计划，检查预览后取消，不在升级冒烟中执行破坏性命令。
 
 ## 6. 回滚
 
@@ -310,7 +319,8 @@ make docker-health
 
 - 应用启动失败但 schema 向后兼容时，可先恢复上一镜像。
 - 如果旧应用不能识别新 schema，停止写入后恢复升级前 MySQL 备份。
-- rev48/rev49/rev50/rev53/rev54/rev55/rev56/rev57 不提供自动 down migration；不要在生产手工删除列或表。
+- rev48/rev49/rev50/rev53/rev54/rev55/rev56/rev57/rev58 不提供自动 down migration；
+  不要在生产手工删除列或表。rev58 的 Redis 向量可从 MySQL 文档重建。
 - 恢复数据库前先保留失败现场的日志和当前数据库快照。
 - Release bundle 安装可停止前后端，将当前安装目录移回
   `<安装目录>-next-<failed-version>`，再把保留的

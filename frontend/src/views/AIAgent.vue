@@ -1535,6 +1535,7 @@ const TOOL_LABEL_KEYS: Record<string, string> = {
   run_readonly_diagnostic: 'ai.tool.labels.runReadonlyDiagnostic',
   start_diagnostic: 'ai.tool.labels.runReadonlyDiagnostic',
   create_autonomy_draft: 'ai.tool.labels.createAutonomyDraft',
+  search_knowledge: 'ai.tool.labels.searchKnowledge',
 }
 
 function toolLabel(tool: string): string {

@@ -38,6 +38,7 @@ services:
       OGS_AI_ALERTMANAGER_OWNER: ${OGS_AI_ALERTMANAGER_OWNER:-}
       OGS_AI_PROMETHEUS_BASE_URL: ${OGS_AI_PROMETHEUS_BASE_URL:-}
       OGS_AI_PROMETHEUS_BEARER_TOKEN: ${OGS_AI_PROMETHEUS_BEARER_TOKEN:-}
+      OGS_AI_EMBEDDING_MODEL_PATH: /opt/orangeserver/models/fast-bge-small-zh-v1.5
       OGS_PROXY_LAYERS: "0"
       OGS_HTTPS: "${OGS_HTTPS:-false}"
     depends_on:
@@ -81,6 +82,7 @@ services:
       OGS_AI_AUTONOMY_REDIS_PORT: ${OGS_AI_AUTONOMY_REDIS_PORT:-6379}
       OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_REDIS_PASSWORD:-}
       OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}
+      OGS_AI_EMBEDDING_MODEL_PATH: /opt/orangeserver/models/fast-bge-small-zh-v1.5
     command:
       - celery
       - -A
@@ -98,10 +100,10 @@ services:
         required: false
     healthcheck:
       test:
-        - CMD-SHELL
-        - >-
-          celery -A app.ai.autonomy.celery_entry:celery_app inspect ping
-          --destination "celery@$$HOSTNAME" --timeout 2 | grep -q pong
+        - CMD
+        - python
+        - -c
+        - from app.ai.autonomy.readiness import checkpoint_readiness, worker_readiness; raise SystemExit(0 if checkpoint_readiness() and worker_readiness() else 1)
       interval: 10s
       timeout: 5s
       retries: 20

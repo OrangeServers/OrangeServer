@@ -276,12 +276,15 @@ make docker-dev-up
 > 如果宿主机的临时端口范围覆盖 8081/28001，请先将这两个监听端口加入
 > `net.ipv4.ip_local_reserved_ports`，或在 `.env.dev` 中改用已保留端口。
 
-### M1 自治栈
+### M2 AIOps 栈
 
 标准 `make docker-up` / 一键安装启动 app、Worker、MySQL 与统一 Redis 8 四个容器。
 Redis DB0 用于 checkpoint（以及 M2 可重建向量），DB1 用于 Celery broker，DB2 用于
 业务会话和缓存；自治任务默认可用，Worker 默认并发 2，可通过
 `OGS_AUTONOMY_WORKER_CONCURRENCY=1` 在受限机器降级。
+同一个 app/Worker 镜像层内置约 90 MB 的中文 BGE ONNX embedding 模型；知识向量仍
+写入统一 Redis DB0，不新增向量数据库或模型服务容器。生产运行镜像不包含 Node 和
+编译工具。
 
 开发覆盖层仍可用于源码热重载验收：
 

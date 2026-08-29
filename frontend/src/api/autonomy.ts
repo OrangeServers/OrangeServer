@@ -19,6 +19,9 @@ import type {
   AutonomyReadiness,
   AutonomyRun,
   AutonomySnapshot,
+  KnowledgeDocument,
+  KnowledgeDocumentPayload,
+  KnowledgeEmbeddingConfig,
 } from '@/types/autonomy'
 
 const BASE = '/ai/autonomous-runs'
@@ -37,6 +40,68 @@ export function getAutonomyStatus(): Promise<AutonomyReadiness> {
 /** 管理员 AIOps 首页聚合。 */
 export function getAIOpsStatus(): Promise<AIOpsStatus> {
   return envelopeData(aiJsonRequest<AutonomyEnvelope<AIOpsStatus>>('/ai/ops/status'))
+}
+
+const KNOWLEDGE_BASE = '/ai/knowledge'
+
+export function getKnowledgeConfig(): Promise<KnowledgeEmbeddingConfig> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeEmbeddingConfig>>(`${KNOWLEDGE_BASE}/config`))
+}
+
+export function saveKnowledgeConfig(
+  payload: Partial<KnowledgeEmbeddingConfig> & { api_key?: string },
+): Promise<KnowledgeEmbeddingConfig> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeEmbeddingConfig>>(
+    `${KNOWLEDGE_BASE}/config`, { method: 'PATCH', body: { ...payload } },
+  ))
+}
+
+export async function listKnowledgeDocuments(): Promise<KnowledgeDocument[]> {
+  const data = await envelopeData(aiJsonRequest<AutonomyEnvelope<{ documents: KnowledgeDocument[] }>>(
+    `${KNOWLEDGE_BASE}/documents`,
+  ))
+  return data.documents || []
+}
+
+export function getKnowledgeDocument(documentId: string): Promise<KnowledgeDocument> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeDocument>>(
+    `${KNOWLEDGE_BASE}/documents/${encodeURIComponent(documentId)}`,
+  ))
+}
+
+export function createKnowledgeDocument(payload: KnowledgeDocumentPayload): Promise<KnowledgeDocument> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeDocument>>(
+    `${KNOWLEDGE_BASE}/documents`, { method: 'POST', body: { ...payload } },
+  ))
+}
+
+export function updateKnowledgeDocument(
+  documentId: string,
+  payload: Partial<KnowledgeDocumentPayload>,
+): Promise<KnowledgeDocument> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeDocument>>(
+    `${KNOWLEDGE_BASE}/documents/${encodeURIComponent(documentId)}`,
+    { method: 'PATCH', body: { ...payload } },
+  ))
+}
+
+export function deleteKnowledgeDocument(documentId: string): Promise<{ deleted: boolean }> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<{ deleted: boolean }>>(
+    `${KNOWLEDGE_BASE}/documents/${encodeURIComponent(documentId)}`,
+    { method: 'DELETE' },
+  ))
+}
+
+export function reindexKnowledge(): Promise<KnowledgeEmbeddingConfig> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeEmbeddingConfig>>(
+    `${KNOWLEDGE_BASE}/reindex`, { method: 'POST', body: {} },
+  ))
+}
+
+export function captureRunKnowledge(runId: string): Promise<KnowledgeDocument> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeDocument>>(
+    `${BASE}/${encodeURIComponent(runId)}/knowledge`, { method: 'POST', body: {} },
+  ))
 }
 
 /** 当前用户的 Run 列表（owner 隔离） */

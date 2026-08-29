@@ -11,6 +11,11 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   conclusions, Worker capacity, and knowledge-index status. An optional
   Bearer-authenticated Alertmanager webhook creates idempotent `ask` runs and
   attaches bounded, server-owned Prometheus observations to their timeline.
+- An administrator-reviewed operations knowledge base indexes Markdown
+  runbooks and independently verified runs with a bundled Chinese BGE ONNX
+  model or a separate OpenAI-compatible embedding endpoint. Chat and the
+  Autonomy Planner return bounded, versioned citations without granting
+  permissions or replacing live evidence.
 
 ### Changed
 
@@ -24,6 +29,12 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Removed
 
 - The unused in-tree Ansible Runner and its `ansible-core` dependency.
+
+### Fixed
+
+- Worker health checks no longer leak long-lived Celery inspect processes;
+  the bounded probe now verifies checkpoint storage and Worker registration
+  in one directly managed process.
 
 ## [1.1.1] - 2026-08-19
 

@@ -89,6 +89,12 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/AiRunDetail.vue'),
         meta: { titleKey: 'menu.aiRuns' },
       },
+      {
+        path: 'ai-knowledge',
+        name: 'AiKnowledge',
+        component: () => import('@/views/AiKnowledge.vue'),
+        meta: { titleKey: 'menu.aiKnowledge' },
+      },
       { path: 'authority', name: 'Authority', component: () => import('@/views/Authority.vue'), meta: { titleKey: 'menu.authority' } },
       { path: 'cron', name: 'Cron', component: () => import('@/views/Cron.vue'), meta: { titleKey: 'menu.cron' } },
       { path: 'file', name: 'FileTransfer', component: () => import('@/views/FileTransfer.vue'), meta: { titleKey: 'menu.fileTransfer' } },
@@ -107,7 +113,7 @@ const router: Router = createRouter({
 })
 
 // 需要 admin 角色的路由
-const adminRoutes: readonly string[] = ['/authority', '/settings', '/user-list', '/user-group', '/sys-user', '/batch-script', '/ai-runs']
+const adminRoutes: readonly string[] = ['/authority', '/settings', '/user-list', '/user-group', '/sys-user', '/batch-script', '/ai-runs', '/ai-knowledge']
 // 需要 admin 或 audit 角色的路由
 const auditRoutes: readonly string[] = ['/log-login', '/log-exec', '/log-op']
 // 需要 admin 或 user 角色的运维路由

@@ -181,6 +181,45 @@ export interface AIOpsStatus extends AutonomyReadiness {
   recent_conclusions: AutonomyRun[]
 }
 
+export type KnowledgeIndexState = 'empty' | 'ready' | 'stale' | 'rebuilding' | 'error'
+
+export interface KnowledgeEmbeddingConfig {
+  provider_type: 'local' | 'openai_compatible'
+  base_url: string
+  model: string
+  dimension: number
+  api_key_configured: boolean
+  model_fingerprint: string
+  indexed_fingerprint: string | null
+  index_state: KnowledgeIndexState
+  indexed_chunks: number
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface KnowledgeDocument {
+  id: string
+  title: string
+  source_type: 'runbook' | 'verified_run'
+  source_ref: string | null
+  scope: string
+  content?: string
+  content_sha256: string
+  version: number
+  approved: boolean
+  indexed: boolean
+  chunk_count: number
+  created_by: string
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface KnowledgeDocumentPayload {
+  title: string
+  scope: string
+  content: string
+}
+
 /** 创建草稿请求体 */
 export interface AutonomyCreateRunPayload {
   goal: string

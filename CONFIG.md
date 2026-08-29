@@ -284,12 +284,17 @@ AI 运维会话默认使用 256K；只有能力标记为 1M 的 Provider 才能�
 | `OGS_AI_ALERTMANAGER_OWNER` | 空 | 启用告警入口时 ✅ | 告警 Run 的固定管理员所有者；必须是现存且未删除的 admin 账号 |
 | `OGS_AI_PROMETHEUS_BASE_URL` | 空 | ❌ | 可选 Prometheus 根地址；只执行服务端固定的 15 分钟可用性查询，不接受模型或 Webhook 提供 URL/PromQL |
 | `OGS_AI_PROMETHEUS_BEARER_TOKEN` | 空 | ❌ | 可选 Prometheus Bearer Token；不会进入模型、事件或 Evidence |
+| `OGS_AI_EMBEDDING_MODEL_PATH` | 空 | ❌ | 本地 embedding 模型目录；正式 Docker 镜像固定为 `/opt/orangeserver/models/fast-bge-small-zh-v1.5`，物理机留空时由 FastEmbed 管理模型缓存 |
 | `OGS_AI_AUTONOMY_LEASE_TTL_SECONDS` | `120` | ❌ | Worker 租约有效期，服务端硬下限 10 秒 |
 | `OGS_AI_AUTONOMY_APPROVAL_TTL_SECONDS` | `86400` | ❌ | draft 和待审批步骤有效期，服务端硬下限 60 秒 |
 
 标准 bundled Compose 会启动统一 Redis 8 与 Worker，自治默认可用。
 `OGS_AI_AUTONOMY_ENABLED=false` 只作为紧急关闭。见
 [部署手册](DEPLOY.md)与[AI 运维使用指南](docs/ai/USER_GUIDE.md)。
+
+运维知识库默认使用镜像内置的 512 维中文 BGE ONNX 模型。管理员也可在“运维知识库”
+页面配置独立的 OpenAI-compatible embedding 地址、模型、维度和 API Key；密钥使用
+`OGS_FERNET_KEYS` 加密保存在数据库，不配置为环境变量。切换模型或维度必须重建索引。
 
 默认支持 OpenAI、Anthropic、xAI、DeepSeek、MiniMax、Kimi、Qwen、GLM 和硅基流动。一个 Provider
 配置一个模型；管理员可以读取厂商模型列表，也可以直接填写模型 ID。Anthropic 原生 API 非

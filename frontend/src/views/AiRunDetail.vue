@@ -44,6 +44,12 @@
       </div>
       <div class="page-actions">
         <el-button
+          v-if="snapshot?.status === 'completed' && snapshot.outcome === 'resolved' && stepCounts.verificationSucceeded > 0"
+          plain :loading="capturingKnowledge" @click="captureKnowledge"
+        >
+          {{ t('aiRuns.detail.captureKnowledge') }}
+        </el-button>
+        <el-button
           v-if="snapshot?.status === 'draft'"
           type="primary" :loading="acting" @click="doStart"
         >
@@ -376,7 +382,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft, InfoFilled } from '@element-plus/icons-vue'
 import { t } from '@/i18n'
 import {
-  cancelAutonomyRun, decideAutonomyStep, getAutonomyArtifact, getAutonomySnapshot,
+  cancelAutonomyRun, captureRunKnowledge, decideAutonomyStep, getAutonomyArtifact, getAutonomySnapshot,
   listAutonomyArtifacts, listAutonomyEvidence, startAutonomyRun, streamAutonomyRun,
 } from '@/api/autonomy'
 import { isTerminalRunStatus } from '@/types/autonomy'
@@ -402,6 +408,7 @@ const snapshot = ref<AutonomySnapshot | null>(null)
 const snapshotError = ref('')
 const acting = ref(false)
 const deciding = ref(false)
+const capturingKnowledge = ref(false)
 
 const terminal = computed<boolean>(() => (
   snapshot.value ? isTerminalRunStatus(snapshot.value.status) : false
@@ -880,6 +887,18 @@ const budgetChips = computed<Array<{ key: string; value: number; unit: string }>
     }))
 })
 
+async function captureKnowledge(): Promise<void> {
+  capturingKnowledge.value = true
+  try {
+    await captureRunKnowledge(runId)
+    ElMessage.success(t('aiRuns.detail.captureKnowledgeDone'))
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('aiRuns.detail.captureKnowledgeFailed'))
+  } finally {
+    capturingKnowledge.value = false
+  }
+}
+
 // ===== 生命周期 =====
 onMounted(() => {
   loadSnapshot().then(() => {
@@ -922,6 +941,7 @@ onBeforeUnmount(() => {
   overflow: hidden;
   overflow-wrap: anywhere;
 }
+
 .run-goal-details {
   max-width: 760px;
   margin-top: 6px;

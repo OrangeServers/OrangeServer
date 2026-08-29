@@ -149,6 +149,60 @@ def test_routes_are_registered_with_expected_verbs():
     assert "GET" in rules[
         "/ai/autonomous-runs/<string:run_id>/stream"
     ]
+    assert {"GET", "PATCH"}.issubset(rules["/ai/knowledge/config"])
+    assert {"GET", "POST"}.issubset(rules["/ai/knowledge/documents"])
+    assert {"GET", "PATCH", "DELETE"}.issubset(rules[
+        "/ai/knowledge/documents/<string:document_id>"
+    ])
+    assert "POST" in rules["/ai/knowledge/reindex"]
+    assert "POST" in rules[
+        "/ai/autonomous-runs/<string:run_id>/knowledge"
+    ]
+
+
+def test_knowledge_routes_delegate_to_reviewed_service(api, monkeypatch):
+    client, _state = api
+
+    class FakeKnowledge:
+        def __init__(self):
+            self.calls = []
+
+        def config(self):
+            return {"index_state": "empty"}
+
+        def create_document(self, owner, payload):
+            self.calls.append(("create", owner, payload))
+            return {"id": "doc-1", **payload}
+
+        def request_reindex(self):
+            self.calls.append(("reindex",))
+            return {"index_state": "rebuilding", "indexed_chunks": 0}
+
+        def mark_index_error(self):
+            self.calls.append(("error",))
+
+        def capture_run(self, owner, run_id):
+            self.calls.append(("capture", owner, run_id))
+            return {"id": "doc-run", "source_ref": run_id}
+
+    service = FakeKnowledge()
+    monkeypatch.setattr(views, "_knowledge_service", lambda: service)
+    monkeypatch.setattr(
+        "app.ai.autonomy.worker.dispatch_knowledge_reindex", lambda: True,
+    )
+    assert client.get("/ai/knowledge/config").get_json()["data"]["index_state"] == "empty"
+    assert client.post("/ai/knowledge/documents", json={
+        "title": "Disk", "scope": "global", "content": "Check usage",
+    }).status_code == 201
+    assert client.post("/ai/knowledge/reindex", json={}).status_code == 202
+    assert client.post("/ai/autonomous-runs/run-1/knowledge", json={}).status_code == 201
+    assert service.calls == [
+        ("create", "admin", {
+            "content": "Check usage", "scope": "global", "title": "Disk",
+        }),
+        ("reindex",),
+        ("capture", "admin", "run-1"),
+    ]
 
 
 def test_status_probe_reports_flag_without_being_blocked(

@@ -80,6 +80,29 @@ def register_autonomy_routes(app: Any) -> None:
         _secure(views.list_evidence, *admins), methods=["GET"],
     )
     app.add_url_rule(
+        "/ai/knowledge/config", "ai_knowledge_config",
+        _secure(views.knowledge_config, *admins), methods=["GET", "PATCH"],
+    )
+    app.add_url_rule(
+        "/ai/knowledge/documents", "ai_knowledge_documents",
+        _secure(views.knowledge_documents, *admins), methods=["GET", "POST"],
+    )
+    app.add_url_rule(
+        "/ai/knowledge/documents/<string:document_id>",
+        "ai_knowledge_document",
+        _secure(views.knowledge_document, *admins),
+        methods=["GET", "PATCH", "DELETE"],
+    )
+    app.add_url_rule(
+        "/ai/knowledge/reindex", "ai_knowledge_reindex",
+        _secure(views.knowledge_reindex, *admins), methods=["POST"],
+    )
+    app.add_url_rule(
+        "/ai/autonomous-runs/<string:run_id>/knowledge",
+        "ai_autonomy_knowledge_capture",
+        _secure(views.knowledge_capture_run, *admins), methods=["POST"],
+    )
+    app.add_url_rule(
         "/ai/autonomous-runs/<string:run_id>/stream",
         "ai_autonomy_run_stream",
         _secure(views.stream_run, *admins), methods=["GET"],

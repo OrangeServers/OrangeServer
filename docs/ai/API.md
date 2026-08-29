@@ -135,6 +135,31 @@ Webhook 最大 256 KiB，首版每次只接受一条 Alertmanager alert。标签
 5 秒超时且最多保留 1000 个样本。Webhook 和模型都不能提供 URL、Header 或任意
 PromQL。返回的 Evidence/Artifact 不包含 Prometheus 地址、认证信息或原始指标标签。
 
+## M2 运维知识 API
+
+以下接口仅对管理员开放。MySQL 保存文档正文和版本，Redis DB0 中的 chunk/vector 是
+可删除并重建的派生索引；配置接口永不返回 API Key 明文。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET/PATCH | `/ai/knowledge/config` | 读取或更新本地/远程 embedding 配置；模型或维度变化将索引标记为 `stale` |
+| GET/POST | `/ai/knowledge/documents` | 列出文档元数据或新增管理员审核的 Markdown Runbook |
+| GET/PATCH/DELETE | `/ai/knowledge/documents/{id}` | 读取正文、更新版本或删除文档 |
+| POST | `/ai/knowledge/reindex` | 向现有 Celery Worker 提交重建任务，返回 `202`；最多生成 20,000 个 Redis 向量分片 |
+| POST | `/ai/autonomous-runs/{run_id}/knowledge` | 将当前管理员拥有、已解决且独立验证通过的 Run 沉淀为审核知识 |
+
+固定边界为：单文档 1 MiB、分片 400 字符并重叠 60、检索最多 8 条、注入模型上下文
+最多 16 KiB。只允许 `runbook` 和 `verified_run` 来源。列表接口不返回正文；读取或编辑
+时使用单文档接口。索引状态为 `empty | ready | stale | rebuilding | error`，只有
+`ready` 且文档版本、模型 fingerprint 一致时才返回引用。
+
+文档范围只接受 `global` 或 `host:<资产 ID>`。聊天检索仅使用 `global`；Autonomy
+Planner 仅使用 `global` 和当前 Run 的目标资产范围。
+
+聊天提供管理员工具 `search_knowledge`。Autonomy Planner 会用 Run 目标检索最多 4 条
+引用；系统提示固定说明这些引用只供假设，不能授权远程动作，也不能替代本次 Run 的
+实时 Evidence 和独立验证。
+
 ## M1 自治任务 API
 
 自治接口只对管理员开放。标准 bundled 栈启动统一 Redis 8 与 Worker，默认可用。
@@ -218,8 +243,9 @@ SSE 事件使用 MySQL 内的 Run 级单调 `sequence`。客户端断线后应�
 ### M1 持久化数据结构
 
 全新安装由 `backend/mysqldir/orange.sql` 一次创建；已有实例按
-[统一升级流程](../operations/UPGRADE.md) 依次执行 rev53、rev54、rev55、rev56、rev57。表是
-业务事实源，Redis 8 只保存 LangGraph checkpoint 和 Celery broker 数据。
+[统一升级流程](../operations/UPGRADE.md) 依次执行 rev53、rev54、rev55、rev56、rev57、
+rev58。表是业务事实源，Redis 8 保存 LangGraph checkpoint、Celery broker 和可重建
+知识向量。
 
 | 表/字段 | 用途 | 关键约束 |
 |---|---|---|
@@ -229,6 +255,8 @@ SSE 事件使用 MySQL 内的 Run 级单调 `sequence`。客户端断线后应�
 | `t_ai_autonomous_event` | Run 内追加式事件 | `(run_id, sequence)` 唯一且单调；payload 不保存凭据 |
 | `t_ai_autonomous_artifact` | 加密执行产物 | 输出清洗、脱敏、限长后以 Fernet 密文保存；正文单条读取并按 `expires_at` 过期 |
 | `t_ai_autonomous_evidence` | 观察索引 | 只保存有界摘要和同 Run Artifact ID 列表；`trusted` 恒为 `0`，不是结论凭据 |
+| `t_ai_embedding_config` | embedding 与索引状态 | 单例配置；远程 API Key 为 Fernet 密文，模型 fingerprint 绑定索引版本 |
+| `t_ai_knowledge_document` | 已审核知识正文 | MySQL 保存正文、来源、版本、范围和 hash；Redis 不作为文档事实源 |
 
 凭据、完整 Prompt、完整远端输出和可复用的授权不会写入 Graph State、Event payload
 或 Evidence 摘要。所有读取接口都会重新检查当前管理员和 Run 所有权；跨 Run 的

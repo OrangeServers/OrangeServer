@@ -744,6 +744,59 @@ class t_ai_autonomous_evidence(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=_utcnow)
 
 
+class t_ai_embedding_config(db.Model, TimestampMixin):
+    """M2/S2 singleton embedding/index configuration; secrets stay encrypted."""
+
+    __tablename__ = 't_ai_embedding_config'
+    id = db.Column(db.INTEGER, primary_key=True, default=1)
+    provider_type = db.Column(
+        db.String(24), nullable=False, default='local', server_default='local',
+    )
+    base_url = db.Column(db.String(255), nullable=True)
+    model = db.Column(db.String(128), nullable=False)
+    api_key_ciphertext = db.Column(db.String(1024), nullable=True)
+    dimension = db.Column(db.INTEGER, nullable=False, default=512)
+    model_fingerprint = db.Column(db.String(64), nullable=False)
+    indexed_fingerprint = db.Column(db.String(64), nullable=True)
+    index_state = db.Column(
+        db.String(16), nullable=False, default='empty', server_default='empty',
+    )
+    indexed_chunks = db.Column(
+        db.INTEGER, nullable=False, default=0, server_default='0',
+    )
+
+
+class t_ai_knowledge_document(db.Model, TimestampMixin):
+    """M2/S2 approved Markdown truth; Redis chunks are rebuildable derivatives."""
+
+    __tablename__ = 't_ai_knowledge_document'
+    __table_args__ = (
+        db.UniqueConstraint(
+            'source_type', 'source_ref', name='uq_ai_knowledge_source',
+        ),
+    )
+    id = db.Column(db.String(32), primary_key=True)
+    title = db.Column(db.String(128), nullable=False)
+    source_type = db.Column(db.String(16), nullable=False, index=True)
+    source_ref = db.Column(db.String(64), nullable=True)
+    scope = db.Column(
+        db.String(128), nullable=False, default='global', server_default='global',
+    )
+    content = db.Column(
+        db.Text().with_variant(LONGTEXT(), 'mysql'), nullable=False,
+    )
+    content_sha256 = db.Column(db.String(64), nullable=False)
+    version = db.Column(db.INTEGER, nullable=False, default=1, server_default='1')
+    approved = db.Column(
+        db.BOOLEAN, nullable=False, default=True, server_default='1', index=True,
+    )
+    indexed_fingerprint = db.Column(db.String(64), nullable=True)
+    chunk_count = db.Column(
+        db.INTEGER, nullable=False, default=0, server_default='0',
+    )
+    created_by = db.Column(db.String(24), nullable=False, index=True)
+
+
 class t_settings(db.Model):
     __tablename__ = 't_settings'
     id = db.Column(db.INTEGER, primary_key=True, autoincrement=True)
