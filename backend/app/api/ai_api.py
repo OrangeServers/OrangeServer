@@ -67,14 +67,6 @@ def register_ai_routes(app: Any) -> None:
         _secure(views.result_set_detail, *all_users), methods=["GET"],
     )
     app.add_url_rule(
-        "/ai/actions/<string:action_id>/approve", "ai_approve_action",
-        _secure(views.approve_action, *all_users), methods=["POST"],
-    )
-    app.add_url_rule(
-        "/ai/actions/<string:action_id>/cancel", "ai_cancel_action",
-        _secure(views.cancel_action, *all_users), methods=["POST"],
-    )
-    app.add_url_rule(
         "/ai/diagnostic-profiles", "ai_diagnostic_profiles",
         _secure(views.diagnostic_profiles, *all_users), methods=["GET"],
     )

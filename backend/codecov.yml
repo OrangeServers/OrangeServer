@@ -3,7 +3,7 @@
 # =============================================================================
 # 目标: ≥60% line + branch coverage
 # 当前: 14% 基线 (按 batch 2/3 累计, 全量数据待 CI runner 验证)
-# 排除: ansible_runner, __init__.py, 迁移 SQL
+# 排除: __init__.py, 迁移 SQL
 
 codecov:
   require_ci_to_pass: false
@@ -28,7 +28,6 @@ coverage:
 
 # 排除文件 (与 .coveragerc 一致, Codecov 会二次确认)
 ignore:
-  - "backend/app/tools/ansible_runner/**/*"
   - "backend/app/**/__init__.py"
   - "backend/app/__init__.py"
   - "backend/tests/**"

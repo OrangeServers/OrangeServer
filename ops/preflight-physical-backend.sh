@@ -184,7 +184,6 @@ import gunicorn
 import cryptography
 import bcrypt
 import PIL
-import ansible
 import pymysql
 import redis
 print('IMPORT_OK')

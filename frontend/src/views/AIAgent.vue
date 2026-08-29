@@ -155,93 +155,6 @@
                 :draft="item.value"
               />
 
-              <article
-                v-else
-                class="approval-card"
-                :class="[
-                  `is-${item.value.action.status}`,
-                  item.value.action.outcome ? `outcome-${item.value.action.outcome}` : '',
-                ]"
-              >
-                <header class="approval-strip">
-                  <el-icon v-if="item.value.action.status === 'running'" class="is-loading"><Loading /></el-icon>
-                  <el-icon v-else-if="item.value.action.outcome === 'success'"><CircleCheckFilled /></el-icon>
-                  <el-icon v-else><WarningFilled /></el-icon>
-                  <span class="approval-strip-label">{{ approvalKicker(item.value.action) }}</span>
-                  <el-tag :type="approvalTagType(item.value.action)" effect="light" size="small">
-                    {{ approvalBadgeLabel(item.value.action) }}
-                  </el-tag>
-                </header>
-                <div class="approval-content">
-                  <h3 class="approval-heading">{{ approvalTitle(item.value.action) }}</h3>
-                  <div class="command-preview">
-                    <span>{{ item.value.action.sys_user || '—' }}@batch:~$</span>
-                    <code>{{ item.value.action.command }}</code>
-                  </div>
-                  <dl class="approval-facts">
-                    <div>
-                      <dt>{{ $t('ai.approval.targetAssets') }}</dt>
-                      <dd><b>{{ item.value.action.target_count }}</b> {{ $t('common.unit.host') }}</dd>
-                    </div>
-                    <div>
-                      <dt>{{ $t('ai.approval.sysUser') }}</dt>
-                      <dd>{{ item.value.action.sys_user || '—' }}</dd>
-                    </div>
-                    <div>
-                      <dt>{{ $t('ai.approval.reason') }}</dt>
-                      <dd>{{ item.value.action.reason || $t('ai.approval.reasonMissing') }}</dd>
-                    </div>
-                  </dl>
-                  <div v-if="item.value.action.status === 'pending'" class="approval-actions">
-                    <el-button @click="cancelAction" :disabled="approving">{{ $t('ai.approval.cancelExec') }}</el-button>
-                    <el-button type="primary" @click="approveAction" :loading="approving">
-                      {{ $t('ai.approval.confirmExec') }}
-                    </el-button>
-                  </div>
-                  <div v-else class="approval-state">
-                    <el-icon v-if="item.value.action.status === 'running'" class="is-loading"><Loading /></el-icon>
-                    {{ approvalStatusLabel(item.value.action.status) }}
-                  </div>
-                  <div v-if="item.value.execution_items.length" class="inline-execution">
-                    <div class="inline-execution-summary">
-                      <span>
-                        <b>{{ item.value.execution_items.length }}</b>
-                        {{ $t('ai.approval.targets') }}
-                      </span>
-                      <span class="is-success">
-                        <b>{{ executionCount(item.value.execution_items, 'success') }}</b>
-                        {{ $t('common.status.success') }}
-                      </span>
-                      <span :class="{ 'is-failed': executionCount(item.value.execution_items, 'failed') > 0 }">
-                        <b>{{ executionCount(item.value.execution_items, 'failed') }}</b>
-                        {{ $t('common.status.fail') }}
-                      </span>
-                      <el-button v-if="isAdmin" text size="small" @click="openExecutionLog(item.value.action)">
-                        {{ $t('ai.approval.viewLog') }}
-                        <el-icon><ArrowRight /></el-icon>
-                      </el-button>
-                    </div>
-                    <div class="inline-execution-list">
-                      <details
-                        v-for="(result, index) in item.value.execution_items"
-                        :key="`${result.host}-${index}`"
-                        class="inline-execution-item"
-                        :class="`is-${result.status}`"
-                      >
-                        <summary>
-                          <span class="execution-dot" />
-                          <code>{{ result.host }}</code>
-                          <span>{{ executionStatusLabel(result.status) }}</span>
-                          <el-icon><ArrowRight /></el-icon>
-                        </summary>
-                        <pre v-if="result.output">{{ result.output }}</pre>
-                        <p v-if="result.error" class="execution-error">{{ result.error }}</p>
-                        <p v-if="!result.output && !result.error" class="execution-empty">{{ $t('ai.approval.noOutput') }}</p>
-                      </details>
-                    </div>
-                  </div>
-                </div>
-              </article>
             </div>
           </template>
 
@@ -272,7 +185,7 @@
                   popper-class="provider-select-popper"
                   :placeholder="$t('ai.composer.selectModel')"
                   size="small"
-                  :disabled="sending || approving"
+                  :disabled="sending"
                   @change="handleProviderChange"
                 >
                   <el-option
@@ -298,7 +211,7 @@
                   v-model="selectedContextMode"
                   size="small"
                   class="context-mode-toggle"
-                  :disabled="sending || approving"
+                  :disabled="sending"
                   @change="handleContextModeChange"
                 >
                   <el-radio-button value="standard_256k">256K</el-radio-button>
@@ -369,9 +282,6 @@
             <small>{{ providerName(conversation.provider_code || '') }} · {{ relativeTime(conversation.updated_at) }}</small>
             <small class="conversation-item-id">
               #{{ conversation.id.slice(0, 8) }}
-              <el-tag v-if="conversation.has_pending_action" size="small" type="warning" effect="plain">
-                {{ $t('ai.drawer.pendingAction') }}
-              </el-tag>
             </small>
           </span>
           <el-button
@@ -522,9 +432,7 @@ import {
   AI_CONTEXT_TOKENS_DEEP,
 } from '@/types/ai'
 import type {
-  AiActionHistory,
   AiApiResponse,
-  AiApproval,
   AiAutonomyDraft,
   AiChatMessage,
   AiConversation,
@@ -535,7 +443,6 @@ import type {
   AiDiagnosticReport,
   AiDiagnosticRun,
   AiDiagnosticStatus,
-  AiExecutionItem,
   AiProviderObservability,
   AiProvider,
   AiResultScope,
@@ -547,7 +454,6 @@ type TimelineItem =
   | { kind: 'message'; value: AiChatMessage }
   | { kind: 'tool'; value: AiToolEvent }
   | { kind: 'diagnostic'; value: AiDiagnosticRun }
-  | { kind: 'action'; value: AiActionHistory }
   | { kind: 'autonomy_draft'; value: AiAutonomyDraft }
 
 const PROVIDER_NAMES: Record<string, string> = {
@@ -578,14 +484,10 @@ const messages = ref<AiChatMessage[]>([])
 const toolEvents = ref<AiToolEvent[]>([])
 const autonomyDrafts = ref<AiAutonomyDraft[]>([])
 const resultScope = ref<AiResultScope | null>(null)
-const actionHistory = ref<AiActionHistory[]>([])
-const pendingApproval = ref<AiApproval | null>(null)
-const executionItems = ref<AiExecutionItem[]>([])
 const diagnosticRuns = ref<AiDiagnosticRun[]>([])
 const providerObservability = ref<AiProviderObservability | null>(null)
 const draft = ref('')
 const sending = ref(false)
-const approving = ref(false)
 const loadingConversation = ref(false)
 const conversationDrawer = ref(false)
 const contextDrawer = ref(false)
@@ -603,7 +505,6 @@ const selectedDiagnosticReport = ref<AiDiagnosticReport | null>(null)
 const selectedDiagnosticRunId = ref('')
 const messageScroller = ref<HTMLElement | null>(null)
 let activeController: AbortController | null = null
-let actionPollTimer: ReturnType<typeof setTimeout> | null = null
 let diagnosticPollTimer: ReturnType<typeof setTimeout> | null = null
 /** 最近一次已生效的模型/上下文选项，用于确认弹窗取消时回退。 */
 let lastAppliedProvider = ''
@@ -614,7 +515,6 @@ const timeline = computed<TimelineItem[]>(() => {
     ...messages.value.map(value => ({ kind: 'message' as const, value })),
     ...toolEvents.value.map(value => ({ kind: 'tool' as const, value })),
     ...diagnosticRuns.value.map(value => ({ kind: 'diagnostic' as const, value })),
-    ...actionHistory.value.map(value => ({ kind: 'action' as const, value })),
     ...autonomyDrafts.value.map(value => ({ kind: 'autonomy_draft' as const, value })),
   ]
   return items.sort((a, b) => timelineTime(a) - timelineTime(b))
@@ -636,7 +536,6 @@ const canChat = computed(() =>
   activeProviderReady.value
   && contextModeAvailable.value
   && !sending.value
-  && !approving.value
 )
 const hasStreamingMessage = computed(() => messages.value.some(message => message.streaming))
 /** 思考态：请求中或流式回复中 → 橘子旋转动画 */
@@ -673,18 +572,14 @@ const composerPlaceholder = computed(() => {
   if (!providers.value.length) return t('ai.composer.placeholder.noProvider')
   if (!activeProviderReady.value) return t('ai.composer.placeholder.unavailable', { reason: providerUnavailableReason(activeProvider.value) })
   if (!contextModeAvailable.value) return t('ai.composer.placeholder.deepUnsupported')
-  if (pendingApproval.value?.status === 'pending') return t('ai.composer.placeholder.pendingApproval')
   return t('ai.composer.placeholder.default')
 })
 const userInitial = computed(() =>
   (store.user.alias || store.user.username || 'U').trim().slice(0, 1).toUpperCase(),
 )
-const successCount = computed(() => executionItems.value.filter(item => item.status === 'success').length)
 const resultColumns = computed(() =>
   Object.keys(resultRows.value[0] || {}).filter(key => !['id', 'host_id'].includes(key)).slice(0, 7),
 )
-const failedCount = computed(() => executionItems.value.filter(item => item.status === 'failed').length)
-const runningCount = computed(() => executionItems.value.filter(item => item.status === 'running').length)
 
 function ContextView(): ReturnType<typeof h> {
   const scope = resultScope.value
@@ -694,23 +589,20 @@ function ContextView(): ReturnType<typeof h> {
     && (Number(rawBudget.effective_input_tokens) > 0 || Number(rawBudget.estimated_input_tokens) > 0)
     ? rawBudget
     : null
-  const hasExecution = executionItems.value.length > 0
-  const hasAnyData = Boolean(budget || scope || hasExecution)
+  const hasAnyData = Boolean(budget || scope)
 
   const sections: Array<ReturnType<typeof h> | null> = [
     h('section', { class: 'context-section' }, [
       h('span', { class: 'context-label' }, t('ai.context.runState')),
       h('div', { class: 'run-state' }, [
-        h('span', { class: ['run-state-dot', sending.value || approving.value || activeDiagnostic.value ? 'busy' : ''] }),
+        h('span', { class: ['run-state-dot', sending.value || activeDiagnostic.value ? 'busy' : ''] }),
         h('div', [
-          h('strong', approving.value
-            ? t('ai.context.stateAction')
-              : activeDiagnostic.value
-              ? t('ai.context.stateDiagnostic')
-              : sending.value
-                ? t('ai.context.stateProcessing')
-                : latestAutonomyDraft.value
-                  ? t('ai.context.stateDraft')
+          h('strong', activeDiagnostic.value
+            ? t('ai.context.stateDiagnostic')
+            : sending.value
+              ? t('ai.context.stateProcessing')
+              : latestAutonomyDraft.value
+                ? t('ai.context.stateDraft')
                 : latestDiagnostic.value
                   ? t('ai.context.stateDiagnosticDone')
                   : t('ai.context.stateIdle')),
@@ -801,18 +693,6 @@ function ContextView(): ReturnType<typeof h> {
     ]))
   }
 
-  if (hasExecution) {
-    sections.push(h('section', { class: 'context-section' }, [
-      h('span', { class: 'context-label' }, t('ai.context.executionResult')),
-      h('div', { class: 'execution-block' }, [
-        h('div', { class: 'execution-stats' }, [
-          h('span', { class: 'success' }, [h('b', String(successCount.value)), t('common.status.success')]),
-          h('span', { class: 'failed' }, [h('b', String(failedCount.value)), t('common.status.fail')]),
-          h('span', [h('b', String(runningCount.value)), t('common.status.running')]),
-        ]),
-      ]),
-    ]))
-  }
 
   if (!hasAnyData) {
     sections.push(h('div', { class: 'context-empty' }, [
@@ -941,9 +821,6 @@ function timeValue(value?: string): number {
 }
 
 function timelineTime(item: TimelineItem): number {
-  if (item.kind === 'action') {
-    return timeValue(item.value.action.created_at || item.value.action.updated_at)
-  }
   if (item.kind === 'diagnostic') {
     return timeValue(item.value.started_at || item.value.created_at || item.value.updated_at)
   }
@@ -951,7 +828,6 @@ function timelineTime(item: TimelineItem): number {
 }
 
 function timelineItemKey(item: TimelineItem): string {
-  if (item.kind === 'action') return `action-${item.value.action.action_id}`
   if (item.kind === 'diagnostic') return `diagnostic-${item.value.id}`
   if (item.kind === 'autonomy_draft') return `draft-${item.value.id || item.value.run_id}`
   return `${item.kind}-${item.value.id}`
@@ -1028,94 +904,6 @@ async function loadConversations(): Promise<void> {
     if (target) await openConversation(target.id, false)
   } catch (error) {
     ElMessage.error(errorMessage(error, t('ai.msg.loadConversationsFail')))
-  }
-}
-
-function normalizedExecutionItems(items: AiExecutionItem[] = []): AiExecutionItem[] {
-  return items.map(item => ({
-    ...item,
-    host: item.host || String((item as unknown as Record<string, unknown>).alias || ''),
-  }))
-}
-
-function applyActionState(detail: AiConversationDetail): void {
-  const history = (detail.action_history || []).map(entry => ({
-    action: approvalFromEvent(entry.action as unknown as Record<string, unknown>),
-    execution_items: normalizedExecutionItems(entry.execution_items || []),
-  }))
-  if (!history.length) {
-    const restoredAction = detail.latest_action || detail.pending_action
-    if (restoredAction) {
-      history.push({
-        action: approvalFromEvent(restoredAction as unknown as Record<string, unknown>),
-        execution_items: normalizedExecutionItems(detail.execution_items || []),
-      })
-    }
-  }
-  actionHistory.value = history
-  const latest = history[history.length - 1]
-  pendingApproval.value = latest?.action || null
-  executionItems.value = latest?.execution_items || []
-  scheduleActionPoll()
-}
-
-function stopActionPoll(): void {
-  if (actionPollTimer) {
-    clearTimeout(actionPollTimer)
-    actionPollTimer = null
-  }
-}
-
-function scheduleActionPoll(delay = 1600): void {
-  stopActionPoll()
-  const action = pendingApproval.value
-  const conversationId = currentConversationId.value
-  if (action?.status !== 'running' || !action.action_id || !conversationId) return
-  actionPollTimer = setTimeout(() => {
-    void pollRunningAction(conversationId, action.action_id)
-  }, delay)
-}
-
-async function pollRunningAction(conversationId: string, actionId: string): Promise<void> {
-  if (
-    currentConversationId.value !== conversationId
-    || pendingApproval.value?.action_id !== actionId
-  ) return
-  try {
-    const summaryPayload = await aiJsonRequest<AiApiResponse<AiConversationDetail> & { conversation?: AiConversationDetail }>(
-      `/ai/conversations/${encodeURIComponent(conversationId)}?action_summary=1`,
-    )
-    const summary = unwrapObject<AiConversationDetail>(summaryPayload, 'conversation')
-    if (!summary || currentConversationId.value !== conversationId) return
-    const rawAction = summary.latest_action || summary.pending_action
-    if (!rawAction || rawAction.action_id !== actionId) return
-    const summarizedAction = approvalFromEvent(rawAction as unknown as Record<string, unknown>)
-    if (summarizedAction.status === 'running') {
-      const existing = actionHistory.value.find(entry => entry.action.action_id === actionId)
-      if (existing) {
-        existing.action = summarizedAction
-        pendingApproval.value = existing.action
-        executionItems.value = existing.execution_items
-      } else {
-        const entry: AiActionHistory = { action: summarizedAction, execution_items: [] }
-        actionHistory.value = [...actionHistory.value, entry].slice(-5)
-        pendingApproval.value = entry.action
-        executionItems.value = entry.execution_items
-      }
-      scheduleActionPoll()
-      return
-    }
-
-    const payload = await aiJsonRequest<AiApiResponse<AiConversationDetail> & { conversation?: AiConversationDetail }>(
-      `/ai/conversations/${encodeURIComponent(conversationId)}`,
-    )
-    const detail = unwrapObject<AiConversationDetail>(payload, 'conversation')
-    if (!detail || currentConversationId.value !== conversationId) return
-    applyActionState(detail)
-    await refreshConversationList()
-    scrollToBottom()
-  } catch {
-    scheduleActionPoll(3000)
   }
 }
 
@@ -1356,8 +1144,7 @@ function removeDiagnosticToolEvents(data: Record<string, unknown>): void {
 }
 
 async function openConversation(id: string, closeDrawer = true): Promise<void> {
-  if (sending.value || approving.value) return
-  stopActionPoll()
+  if (sending.value) return
   stopDiagnosticPoll()
   resetScrollState()
   loadingConversation.value = true
@@ -1377,7 +1164,6 @@ async function openConversation(id: string, closeDrawer = true): Promise<void> {
     if (detail.result_scope) {
       updateResultScope({ result_scope: detail.result_scope as unknown as Record<string, unknown> })
     }
-    applyActionState(detail)
     if (detail.provider_code) selectedProvider.value = detail.provider_code
     selectedContextMode.value = detail.context_mode || AI_CONTEXT_MODE_STANDARD
     lastAppliedProvider = selectedProvider.value
@@ -1409,8 +1195,7 @@ async function refreshProviderObservability(conversationId: string): Promise<voi
 }
 
 function startNewConversation(): void {
-  if (sending.value || approving.value) return
-  stopActionPoll()
+  if (sending.value) return
   stopDiagnosticPoll()
   resetScrollState()
   currentConversationId.value = ''
@@ -1418,9 +1203,6 @@ function startNewConversation(): void {
   toolEvents.value = []
   autonomyDrafts.value = []
   resultScope.value = null
-  actionHistory.value = []
-  pendingApproval.value = null
-  executionItems.value = []
   diagnosticRuns.value = []
   providerObservability.value = null
   draft.value = ''
@@ -1598,43 +1380,6 @@ async function handleSseEvent(event: AiSseEvent): Promise<void> {
         }
       }
       break
-    case 'approval.required':
-      {
-        const action = approvalFromEvent(data)
-        const existing = actionHistory.value.find(
-          entry => entry.action.action_id === action.action_id,
-        )
-        if (existing) {
-          existing.action = action
-          pendingApproval.value = existing.action
-          executionItems.value = existing.execution_items
-        } else {
-          const entry: AiActionHistory = { action, execution_items: [] }
-          actionHistory.value.push(entry)
-          pendingApproval.value = entry.action
-          executionItems.value = entry.execution_items
-        }
-      }
-      updateResultScope(data)
-      break
-    case 'action.started':
-      if (pendingApproval.value) {
-        pendingApproval.value.status = 'running'
-        pendingApproval.value.updated_at = nowIso()
-      }
-      break
-    case 'action.progress':
-      updateExecutionProgress(data)
-      break
-    case 'action.completed':
-      if (pendingApproval.value) {
-        pendingApproval.value.status = 'completed'
-        pendingApproval.value.updated_at = nowIso()
-        updateApprovalResult(data)
-      }
-      stopActionPoll()
-      updateExecutionResults(data)
-      break
     case 'run.failed':
       finishStreamingMessage()
       messages.value.push({
@@ -1784,7 +1529,6 @@ const TOOL_LABEL_KEYS: Record<string, string> = {
   list_authorized_system_users: 'ai.tool.labels.listAuthorizedSystemUsers',
   search_accounts: 'ai.tool.labels.searchAccounts',
   search_audit_logs: 'ai.tool.labels.searchAuditLogs',
-  prepare_batch_command: 'ai.tool.labels.prepareBatchCommand',
   run_readonly_diagnostic: 'ai.tool.labels.runReadonlyDiagnostic',
   start_diagnostic: 'ai.tool.labels.runReadonlyDiagnostic',
   create_autonomy_draft: 'ai.tool.labels.createAutonomyDraft',
@@ -1808,146 +1552,6 @@ function updateResultScope(data: Record<string, unknown>): void {
     groups: Array.isArray(raw.groups) ? raw.groups.map(String) : undefined,
     sample: Array.isArray(raw.sample) ? raw.sample as Array<Record<string, unknown>> : undefined,
   }
-}
-
-function approvalFromEvent(data: Record<string, unknown>): AiApproval {
-  const source = data.action && typeof data.action === 'object'
-    ? data.action as Record<string, unknown>
-    : data
-  const rawStatus = String(source.status || 'pending')
-  const status: AiApproval['status'] = [
-    'pending', 'running', 'completed', 'approved', 'cancelled', 'failed', 'rejected', 'expired',
-  ].includes(rawStatus)
-    ? rawStatus as AiApproval['status']
-    : 'pending'
-  const rawSummary = source.result_summary && typeof source.result_summary === 'object'
-    ? source.result_summary as AiApproval['result_summary']
-    : undefined
-  const rawOutcome = String(source.outcome || rawSummary?.outcome || '')
-  const outcome = ['success', 'partial', 'failed'].includes(rawOutcome)
-    ? rawOutcome as AiApproval['outcome']
-    : undefined
-  return {
-    action_id: String(source.action_id || source.id || ''),
-    conversation_id: typeof source.conversation_id === 'string' ? source.conversation_id : currentConversationId.value,
-    command: String(source.command || ''),
-    sys_user: String(source.sys_user || source.system_user || ''),
-    target_count: Number(source.target_count || source.host_count || resultScope.value?.total || 0),
-    reason: typeof source.reason === 'string' ? source.reason : undefined,
-    risk_level: typeof source.risk_level === 'string' ? source.risk_level : 'medium',
-    expires_at: typeof source.expires_at === 'string' ? source.expires_at : undefined,
-    created_at: typeof source.created_at === 'string' ? source.created_at : undefined,
-    updated_at: typeof source.updated_at === 'string' ? source.updated_at : undefined,
-    status,
-    outcome,
-    result_summary: rawSummary,
-  }
-}
-
-function openExecutionLog(action: AiApproval): void {
-  const conversationId = action.conversation_id || currentConversationId.value
-  const auditRef = conversationId && action.action_id
-    ? `${conversationId}/${action.action_id}`
-    : ''
-  void router.push({
-    path: '/log-exec',
-    query: auditRef ? { audit_ref: auditRef } : {},
-  })
-}
-
-async function approveAction(): Promise<void> {
-  const action = pendingApproval.value
-  if (!action?.action_id || approving.value) return
-  approving.value = true
-  action.status = 'running'
-  executionItems.value = []
-  activeController = new AbortController()
-  let streamFailure = ''
-  try {
-    await postAiStream(`/ai/actions/${encodeURIComponent(action.action_id)}/approve`, {}, {
-      signal: activeController.signal,
-      onEvent: async (event) => {
-        if (event.type === 'run.failed') {
-          streamFailure = String(event.data.message || event.data.error || t('ai.msg.execFail'))
-        }
-        await handleSseEvent(event)
-      },
-    })
-    if (streamFailure) throw new Error(streamFailure)
-    if (action.outcome === 'failed') ElMessage.error(t('ai.msg.execFailed'))
-    else if (action.outcome === 'partial') ElMessage.warning(t('ai.msg.execPartial'))
-    else ElMessage.success(t('ai.msg.execDone'))
-  } catch (error) {
-    if (streamFailure) {
-      action.status = 'failed'
-      ElMessage.error(errorMessage(error, t('ai.msg.execFail')))
-    } else {
-      action.status = 'running'
-      scheduleActionPoll(800)
-      ElMessage.warning(t('ai.msg.execInterrupted'))
-    }
-  } finally {
-    approving.value = false
-    activeController = null
-    scrollToBottom()
-  }
-}
-
-async function cancelAction(): Promise<void> {
-  const action = pendingApproval.value
-  if (!action?.action_id) return
-  try {
-    await aiJsonRequest(`/ai/actions/${encodeURIComponent(action.action_id)}/cancel`, {
-      method: 'POST',
-      body: {},
-    })
-    action.status = 'cancelled'
-    action.updated_at = nowIso()
-    stopActionPoll()
-    ElMessage.success(t('ai.msg.cancelPlanDone'))
-  } catch (error) {
-    ElMessage.error(errorMessage(error, t('ai.msg.cancelFail')))
-  }
-}
-
-function updateExecutionProgress(data: Record<string, unknown>): void {
-  const host = String(data.host || data.hostname || data.alias || '')
-  if (!host) return
-  const rawStatus = String(data.status || 'running')
-  const status: AiExecutionItem['status'] = rawStatus === 'success'
-    ? 'success'
-    : rawStatus === 'failed' || rawStatus === 'error'
-      ? 'failed'
-      : 'running'
-  const existing = executionItems.value.find(item => item.host === host)
-  const patch: AiExecutionItem = {
-    host,
-    status,
-    output: typeof data.output === 'string' ? data.output : undefined,
-    error: typeof data.error === 'string' ? data.error : undefined,
-  }
-  if (existing) Object.assign(existing, patch)
-  else executionItems.value.push(patch)
-}
-
-function updateExecutionResults(data: Record<string, unknown>): void {
-  const results = Array.isArray(data.results) ? data.results : []
-  for (const raw of results) {
-    if (raw && typeof raw === 'object') updateExecutionProgress(raw as Record<string, unknown>)
-  }
-}
-
-function updateApprovalResult(data: Record<string, unknown>): void {
-  const action = pendingApproval.value
-  if (!action) return
-  const rawSummary = data.summary && typeof data.summary === 'object'
-    ? data.summary as AiApproval['result_summary']
-    : undefined
-  const rawOutcome = String(data.outcome || rawSummary?.outcome || '')
-  if (['success', 'partial', 'failed'].includes(rawOutcome)) {
-    action.outcome = rawOutcome as AiApproval['outcome']
-  }
-  action.result_summary = rawSummary
 }
 
 async function refreshConversationList(): Promise<void> {
@@ -2190,86 +1794,12 @@ function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? error.message : fallback
 }
 
-function riskLabel(level?: string): string {
-  const labels: Record<string, string> = {
-    low: t('ai.approval.risk.low'),
-    medium: t('ai.approval.risk.medium'),
-    high: t('ai.approval.risk.high'),
-    critical: t('ai.approval.risk.critical'),
-  }
-  return labels[level || ''] || t('ai.approval.risk.default')
-}
-
-function approvalStatusLabel(status: AiApproval['status']): string {
-  const labels: Record<AiApproval['status'], string> = {
-    pending: t('ai.approval.status.pending'),
-    running: t('ai.approval.status.running'),
-    completed: t('ai.approval.status.completed'),
-    approved: t('ai.approval.status.completed'),
-    cancelled: t('ai.approval.status.cancelled'),
-    failed: t('ai.approval.status.failed'),
-    rejected: t('ai.approval.status.rejected'),
-    expired: t('ai.approval.status.expired'),
-  }
-  return labels[status]
-}
-
-function approvalKicker(action: AiApproval): string {
-  if (action.status === 'pending') return t('ai.approval.kicker.pending')
-  if (action.status === 'running') return t('ai.approval.kicker.running')
-  return t('ai.approval.kicker.done')
-}
-
-function approvalTitle(action: AiApproval): string {
-  if (action.status === 'pending') return t('ai.approval.title.pending')
-  if (action.status === 'running') return t('ai.approval.title.running')
-  if (action.status === 'cancelled') return t('ai.approval.title.cancelled')
-  if (action.status === 'expired') return t('ai.approval.title.expired')
-  if (action.outcome === 'failed' || action.status === 'failed' || action.status === 'rejected') return t('ai.approval.title.failed')
-  if (action.outcome === 'partial') return t('ai.approval.title.partial')
-  return t('ai.approval.title.completed')
-}
-
-function approvalBadgeLabel(action: AiApproval): string {
-  if (action.status === 'pending') return riskLabel(action.risk_level)
-  if (action.status === 'running') return t('ai.approval.badge.running')
-  if (action.outcome === 'success') return t('ai.approval.badge.success')
-  if (action.outcome === 'partial') return t('ai.approval.badge.partial')
-  if (action.outcome === 'failed' || ['failed', 'rejected'].includes(action.status)) return t('ai.approval.badge.failed')
-  if (action.status === 'cancelled') return t('ai.approval.badge.cancelled')
-  if (action.status === 'expired') return t('ai.approval.badge.expired')
-  return t('ai.approval.badge.done')
-}
-
-function approvalTagType(action: AiApproval): 'success' | 'warning' | 'danger' | 'info' {
-  if (action.outcome === 'success') return 'success'
-  if (action.outcome === 'failed' || ['failed', 'rejected'].includes(action.status)) return 'danger'
-  if (action.status === 'cancelled' || action.status === 'expired') return 'info'
-  return 'warning'
-}
-
-function executionStatusLabel(status: AiExecutionItem['status']): string {
-  return status === 'success'
-    ? t('common.status.success')
-    : status === 'failed'
-      ? t('common.status.fail')
-      : t('common.status.running')
-}
-
-function executionCount(
-  items: AiExecutionItem[],
-  status: AiExecutionItem['status'],
-): number {
-  return items.filter(item => item.status === status).length
-}
-
 onMounted(async () => {
   await Promise.all([loadProviders(), loadConversations()])
 })
 
 onBeforeUnmount(() => {
   activeController?.abort()
-  stopActionPoll()
   stopDiagnosticPoll()
 })
 </script>
@@ -2566,11 +2096,6 @@ onBeforeUnmount(() => {
   align-items: flex-start;
   gap: 11px;
 }
-.timeline-row.is-action { display: block; }
-.timeline-row.is-action .approval-card {
-  width: calc(100% - 40px);
-  margin: 6px auto;
-}
 .message-avatar {
   width: 30px;
   height: 30px;
@@ -2799,174 +2324,6 @@ onBeforeUnmount(() => {
   line-height: 1.55;
 }
 
-.approval-card {
-  position: relative;
-  max-width: 820px;
-  margin: 28px auto;
-  overflow: hidden;
-  border: 1px solid var(--ogs-warning);
-  border-radius: var(--ogs-radius);
-  background: var(--ogs-bg-elevated);
-  box-shadow: 0 8px 24px var(--ogs-warning-soft);
-}
-/* pending 审批卡：保持浅色卡，权威感来自脉冲边框 + 发光确认按钮（不黑化） */
-.approval-card.is-pending {
-  animation: approval-pulse 1.6s ease-out 0.3s 3;
-}
-@keyframes approval-pulse {
-  0% { box-shadow: 0 8px 24px var(--ogs-warning-soft), 0 0 0 0 rgba(247,103,7,0.4); }
-  100% { box-shadow: 0 8px 24px var(--ogs-warning-soft), 0 0 0 18px rgba(247,103,7,0); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .approval-card.is-pending { animation: none; }
-}
-.approval-card.is-pending .approval-facts b { color: #F76707; }
-.approval-card.is-pending .approval-actions :deep(.el-button--primary) {
-  box-shadow: 0 2px 10px rgba(247,103,7,0.4);
-}
-.approval-strip {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
-  color: var(--ogs-warning);
-  background: var(--ogs-warning-soft);
-  border-bottom: 1px solid color-mix(in srgb, var(--ogs-warning) 25%, transparent);
-  font-size: 12px;
-  font-weight: 600;
-}
-.approval-strip-label { flex: 1; min-width: 0; }
-.approval-strip .el-icon { font-size: 14px; }
-.approval-content { min-width: 0; padding: 16px 18px; }
-.approval-heading { color: var(--ogs-text); font-size: 14px; }
-.command-preview {
-  margin-top: 12px;
-  padding: 12px 14px;
-  border-radius: var(--ogs-radius-sm);
-  color: rgba(255,255,255,.9);
-  background: #18181B;
-  font-family: var(--ogs-mono);
-  line-height: 1.6;
-}
-.command-preview span { color: var(--ogs-primary-light); font-size: 11px; }
-.command-preview code { display: block; margin-top: 2px; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
-.approval-facts {
-  margin-top: 14px;
-  display: grid;
-  grid-template-columns: .8fr 1fr 1.5fr;
-  gap: 12px;
-}
-.approval-facts div { min-width: 0; padding-right: 10px; border-right: 1px solid var(--ogs-border-subtle); }
-.approval-facts div:last-child { border-right: 0; }
-.approval-facts dt { color: var(--ogs-text-muted); font-size: 11px; }
-.approval-facts dd { margin-top: 4px; overflow: hidden; color: var(--ogs-text); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.approval-facts b { color: var(--ogs-primary); font-family: var(--ogs-mono); font-size: 16px; }
-.approval-actions { margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px; }
-.approval-state { margin-top: 14px; display: flex; justify-content: flex-end; align-items: center; gap: 7px; color: var(--ogs-text-secondary); font-size: 12px; }
-.approval-card.outcome-success {
-  border-color: var(--ogs-success);
-  box-shadow: 0 8px 24px var(--ogs-success-soft);
-}
-.approval-card.outcome-success .approval-strip {
-  color: var(--ogs-success);
-  background: var(--ogs-success-soft);
-  border-bottom-color: color-mix(in srgb, var(--ogs-success) 25%, transparent);
-}
-.approval-card.outcome-failed {
-  border-color: var(--ogs-danger);
-  box-shadow: 0 8px 24px var(--ogs-danger-soft);
-}
-.approval-card.outcome-failed .approval-strip {
-  color: var(--ogs-danger);
-  background: var(--ogs-danger-soft);
-  border-bottom-color: color-mix(in srgb, var(--ogs-danger) 25%, transparent);
-}
-.inline-execution {
-  margin-top: 16px;
-  overflow: hidden;
-  border: 1px solid var(--ogs-border-subtle);
-  border-radius: var(--ogs-radius-sm);
-  background: var(--ogs-surface);
-}
-.inline-execution-summary {
-  min-height: 42px;
-  padding: 0 12px;
-  display: flex;
-  align-items: center;
-  gap: 18px;
-  border-bottom: 1px solid var(--ogs-border-subtle);
-  color: var(--ogs-text-muted);
-  font-size: 11px;
-}
-.inline-execution-summary span {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 4px;
-}
-.inline-execution-summary b {
-  color: var(--ogs-text);
-  font-family: var(--ogs-mono);
-  font-size: 14px;
-}
-.inline-execution-summary .is-success b { color: var(--ogs-success); }
-.inline-execution-summary .is-failed b { color: var(--ogs-danger); }
-.inline-execution-summary .el-button { margin-left: auto; }
-.inline-execution-list { padding: 4px 11px; }
-.inline-execution-item { border-bottom: 1px solid var(--ogs-border-subtle); }
-.inline-execution-item:last-child { border-bottom: 0; }
-.inline-execution-item summary {
-  min-height: 38px;
-  display: grid;
-  grid-template-columns: 7px minmax(0, 1fr) auto 14px;
-  align-items: center;
-  gap: 8px;
-  color: var(--ogs-text-secondary);
-  cursor: pointer;
-  list-style: none;
-  font-size: 11px;
-}
-.inline-execution-item summary::-webkit-details-marker { display: none; }
-.inline-execution-item summary code {
-  overflow: hidden;
-  color: var(--ogs-text);
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.inline-execution-item summary > .el-icon {
-  color: var(--ogs-text-muted);
-  transition: transform .16s ease;
-}
-.inline-execution-item[open] summary > .el-icon { transform: rotate(90deg); }
-.execution-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--ogs-info);
-}
-.inline-execution-item.is-success .execution-dot { background: var(--ogs-success); }
-.inline-execution-item.is-failed .execution-dot { background: var(--ogs-danger); }
-.inline-execution-item pre,
-.inline-execution-item .execution-error,
-.inline-execution-item .execution-empty {
-  max-height: 190px;
-  margin: 0 0 10px 15px;
-  padding: 10px 12px;
-  overflow: auto;
-  border-radius: var(--ogs-radius-sm);
-  color: rgba(255,255,255,.88);
-  background: #18181B;
-  font-family: var(--ogs-mono);
-  font-size: 11px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.inline-execution-item .execution-error { color: #fecaca; }
-.inline-execution-item .execution-empty {
-  color: var(--ogs-text-muted);
-  background: var(--ogs-bg-sunken);
-}
 .thinking-row {
   max-width: 860px;
   margin: 0 auto 20px;
@@ -3216,17 +2573,6 @@ onBeforeUnmount(() => {
   font-size: 12px;
   line-height: 1.6;
 }
-.execution-block {
-  overflow: hidden;
-  border: 1px solid var(--ogs-border);
-  border-radius: var(--ogs-radius-sm);
-  background: var(--ogs-bg-elevated);
-}
-.execution-stats { padding: 10px 11px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
-.execution-stats span { color: var(--ogs-text-muted); font-size: 11px; text-align: center; }
-.execution-stats b { display: block; color: var(--ogs-text); font-family: var(--ogs-mono); font-size: 14px; }
-.execution-stats .success b { color: var(--ogs-success); }
-.execution-stats .failed b { color: var(--ogs-danger); }
 .safety-note { padding: 12px; display: flex; gap: 9px; border-radius: var(--ogs-radius-sm); border: 1px solid var(--ogs-border); background: var(--ogs-bg-elevated); color: var(--ogs-warning); }
 .safety-note > span { flex: 0 0 auto; }
 .safety-note > span svg { width: 15px; height: 15px; }
@@ -3380,15 +2726,6 @@ onBeforeUnmount(() => {
   .timeline-row { gap: 8px; }
   .message-body { max-width: calc(100% - 38px); }
   .tool-event { width: calc(100% - 38px); margin-left: 38px; }
-  .approval-content { padding: 15px 13px; }
-  .approval-facts { grid-template-columns: repeat(2, 1fr); }
-  .approval-facts div:last-child { grid-column: 1 / -1; padding-top: 8px; border-top: 1px solid var(--ogs-border-subtle); }
-  .inline-execution-summary { gap: 10px; }
-  .inline-execution-summary .el-button {
-    width: 28px;
-    padding-inline: 0;
-    overflow: hidden;
-  }
   .composer-shell { padding: 11px 12px 13px; }
   .composer-hint span:first-child { display: none; }
   .composer-hint { justify-content: flex-end; }

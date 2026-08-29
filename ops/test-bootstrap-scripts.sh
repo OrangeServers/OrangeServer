@@ -46,13 +46,9 @@ make_minimal_bundle() {
     local bundle_root="${stage}/orangeserver"
     local archive="${TEST_ROOT}/orangeserver-deploy-${version}.tar.gz"
 
-    mkdir -p "${bundle_root}/backend" "${bundle_root}/ops" \
-        "${bundle_root}/frontend/dist"
+    mkdir -p "${bundle_root}/backend" "${bundle_root}/ops"
     : > "${bundle_root}/.env.example"
     : > "${bundle_root}/backend/.env.example"
-    : > "${bundle_root}/frontend/dist/index.html"
-    chmod 700 "${bundle_root}/frontend" "${bundle_root}/frontend/dist"
-    chmod 600 "${bundle_root}/frontend/dist/index.html"
     cat > "${bundle_root}/ops/preflight-compose.sh" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -96,8 +92,6 @@ EOF
 cat > "${FAKE_BIN}/make" <<'EOF'
 #!/bin/bash
 [ "${1:-}" = "docker-up-image" ] || exit 1
-[ "$(stat -c %a frontend/dist)" = "755" ] || exit 1
-[ "$(stat -c %a frontend/dist/index.html)" = "644" ] || exit 1
 grep '^OGS_.*IMAGE=' .env > "${TEST_RECORD:?}"
 EOF
 chmod +x "${FAKE_BIN}/id" "${FAKE_BIN}/docker" "${FAKE_BIN}/openssl" "${FAKE_BIN}/make"
@@ -122,10 +116,8 @@ run_canonical() {
         fail "canonical installer failed for ${name}"
     fi
     expect_file_contains "$record" "OGS_BACKEND_IMAGE=${expected_image}"
-    expect_file_contains "$record" "OGS_NGINX_IMAGE=nginx:1.25-alpine"
-    expect_file_contains "$record" "OGS_REDIS_IMAGE=redis:7.4-alpine"
+    expect_file_contains "$record" "OGS_REDIS_IMAGE=redis:8.10.0-alpine"
     expect_file_contains "$record" "OGS_MYSQL_IMAGE=mysql:8.0.42"
-    expect_file_contains "$record" "OGS_AUTONOMY_REDIS_IMAGE=redis/redis-stack-server:7.4.0-v3"
 }
 
 run_canonical "canonical-default" \
@@ -142,16 +134,12 @@ TEST_RECORD="$custom_record" PATH="${FAKE_BIN}:${PATH}" "$CANONICAL_INSTALLER" \
     --bundle-file "$BUNDLE_FILE" \
     --checksum-file "$CHECKSUM_FILE" \
     --install-dir "${TEST_ROOT}/canonical-images" \
-    --nginx-image "mirror.example.test/nginx:1.25" \
     --redis-image "mirror.example.test/redis@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
     --mysql-image "registry.example.test:5000/mysql:8.0" \
-    --autonomy-redis-image "mirror.example.test/redis-stack-server:7.4.0-v3" \
     >"${TEST_ROOT}/canonical-images.out" 2>&1 \
     || fail "canonical installer failed for image overrides"
-expect_file_contains "$custom_record" "OGS_NGINX_IMAGE=mirror.example.test/nginx:1.25"
 expect_file_contains "$custom_record" "OGS_REDIS_IMAGE=mirror.example.test/redis@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 expect_file_contains "$custom_record" "OGS_MYSQL_IMAGE=registry.example.test:5000/mysql:8.0"
-expect_file_contains "$custom_record" "OGS_AUTONOMY_REDIS_IMAGE=mirror.example.test/redis-stack-server:7.4.0-v3"
 
 expect_failure "--backend-image must be an untagged lowercase container image path" \
     "$CANONICAL_INSTALLER" \
@@ -165,18 +153,10 @@ expect_failure "--backend-image must be an untagged lowercase container image pa
     "$CANONICAL_INSTALLER" \
     --version "$VERSION" \
     --backend-image "GHCR.IO/orangeservers/orangeserver-backend"
-expect_failure "--nginx-image must be a lowercase tagged or digest-pinned container image reference" \
-    "$CANONICAL_INSTALLER" \
-    --version "$VERSION" \
-    --nginx-image "https://example.invalid/nginx:latest"
 expect_failure "--mysql-image must be a lowercase tagged or digest-pinned container image reference" \
     "$CANONICAL_INSTALLER" \
     --version "$VERSION" \
     --mysql-image "registry.example.test:5000/mysql"
-expect_failure "--autonomy-redis-image must be a lowercase tagged or digest-pinned container image reference" \
-    "$CANONICAL_INSTALLER" \
-    --version "$VERSION" \
-    --autonomy-redis-image "https://example.invalid/redis-stack-server:latest"
 
 cat > "${FAKE_BIN}/git" <<'EOF'
 #!/bin/bash
@@ -242,14 +222,10 @@ expect_file_contains "$CN_BUILD_ARGS" "--version"
 expect_file_contains "$CN_BUILD_ARGS" "$VERSION"
 expect_file_contains "$CN_INSTALL_ARGS" "--backend-image"
 expect_file_contains "$CN_INSTALL_ARGS" "ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend"
-expect_file_contains "$CN_INSTALL_ARGS" "--nginx-image"
-expect_file_contains "$CN_INSTALL_ARGS" "m.daocloud.io/docker.io/library/nginx@sha256:516475cc129da42866742567714ddc681e5eed7b9ee0b9e9c015e464b4221a00"
 expect_file_contains "$CN_INSTALL_ARGS" "--redis-image"
-expect_file_contains "$CN_INSTALL_ARGS" "m.daocloud.io/docker.io/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2"
+expect_file_contains "$CN_INSTALL_ARGS" "m.daocloud.io/docker.io/library/redis:8.10.0-alpine"
 expect_file_contains "$CN_INSTALL_ARGS" "--mysql-image"
 expect_file_contains "$CN_INSTALL_ARGS" "m.daocloud.io/docker.io/library/mysql@sha256:63823b8e2cbe4ae0c558155e02d00beba56130fbc3d147efccbdb328ae2dbb9e"
-expect_file_contains "$CN_INSTALL_ARGS" "--autonomy-redis-image"
-expect_file_contains "$CN_INSTALL_ARGS" "m.daocloud.io/docker.io/redis/redis-stack-server@sha256:7d8e657d60d525534d6abe96e7645ab30ef1b4f1ffedc6eeb2d4d4283b3a49b9"
 expect_file_contains "$CN_INSTALL_ARGS" "--bundle-file"
 expect_file_contains "$CN_INSTALL_ARGS" "--checksum-file"
 expect_file_contains "$CN_INSTALL_ARGS" "--install-dir"
@@ -262,19 +238,15 @@ expect_file_contains "$CN_INSTALL_ARGS" "orangeserver_cn"
 TEST_GIT_ARGS="${TEST_ROOT}/cn-override-git-args" \
 TEST_BUILD_ARGS="${TEST_ROOT}/cn-override-build-args" \
 TEST_INSTALL_ARGS="${TEST_ROOT}/cn-override-installer-args" \
-OGS_CN_NGINX_IMAGE="mirror.example.test/nginx:1.25" \
 OGS_CN_REDIS_IMAGE="mirror.example.test/redis:7.4" \
 OGS_CN_MYSQL_IMAGE="mirror.example.test/mysql:8.0" \
-OGS_CN_AUTONOMY_REDIS_IMAGE="mirror.example.test/redis-stack-server:7.4.0-v3" \
 PATH="${FAKE_BIN}:${PATH}" \
 "$CN_INSTALLER" \
     --version "$VERSION" \
     >"${TEST_ROOT}/cn-override.out" 2>&1 \
     || fail "China entry point failed for dependency image overrides"
-expect_file_contains "${TEST_ROOT}/cn-override-installer-args" "mirror.example.test/nginx:1.25"
 expect_file_contains "${TEST_ROOT}/cn-override-installer-args" "mirror.example.test/redis:7.4"
 expect_file_contains "${TEST_ROOT}/cn-override-installer-args" "mirror.example.test/mysql:8.0"
-expect_file_contains "${TEST_ROOT}/cn-override-installer-args" "mirror.example.test/redis-stack-server:7.4.0-v3"
 
 expect_failure "unknown argument: --backend-image" \
     "$CN_INSTALLER" --version "$VERSION" --backend-image example.invalid/image

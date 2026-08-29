@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """M1/S2 autonomy infrastructure readiness.
 
-The public status response contains booleans and fixed machine-readable reason
-codes only.  Connection errors, Redis URLs, credentials, worker names and
-private host details must never cross the API boundary.
+The public status response contains booleans, fixed machine-readable reason
+codes, and bounded worker capacity fields only.  Connection errors, Redis
+URLs, credentials, worker names and private host details must never cross the
+API boundary.
 """
+from collections.abc import Mapping
 from urllib.parse import quote
 import uuid
 
@@ -18,10 +20,11 @@ REASON_FEATURE_DISABLED = 'feature_disabled'
 REASON_REDIS_NOT_CONFIGURED = 'redis_not_configured'
 REASON_CHECKPOINT_UNAVAILABLE = 'checkpoint_unavailable'
 REASON_WORKER_UNAVAILABLE = 'worker_unavailable'
+WORKER_POOL = 'prefork'
 
 
 def autonomy_redis_url(database: int) -> str:
-    """Build a credential-safe URL for the dedicated autonomy Redis.
+    """Build a credential-safe URL for the configured autonomy Redis.
 
     Passwords are encoded as URI user-info.  The host is configuration rather
     than model input, but rejecting URL delimiters prevents it from changing
@@ -52,7 +55,7 @@ def autonomy_redis_url(database: int) -> str:
 
 
 def autonomy_redis_configured() -> bool:
-    """Return whether a structurally valid dedicated Redis target exists."""
+    """Return whether a structurally valid Redis target exists."""
     try:
         autonomy_redis_url(0)
     except (TypeError, ValueError):
@@ -96,15 +99,83 @@ def checkpoint_readiness(timeout: float = READINESS_TIMEOUT_SECONDS) -> bool:
                 pass
 
 
-def worker_readiness(timeout: float = READINESS_TIMEOUT_SECONDS) -> bool:
-    """Confirm a worker on the dedicated broker registered drive_run."""
+def _configured_worker_concurrency() -> int | None:
+    try:
+        value = int(config.AI_AUTONOMY_WORKER_CONCURRENCY)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _normalise_worker_pool(value) -> str | None:
+    """Map Celery's implementation string to a non-sensitive pool name."""
+    text = str(value or '').lower()
+    for name in ('prefork', 'gevent', 'eventlet', 'threads', 'solo'):
+        if name in text:
+            return name
+    return None
+
+
+def _worker_stats_summary(stats) -> tuple[str | None, int | None]:
+    """Extract only pool type and slot counts from inspect.stats()."""
+    if not isinstance(stats, Mapping):
+        return None, None
+
+    pools = set()
+    observed = []
+    for details in stats.values():
+        if not isinstance(details, Mapping):
+            continue
+        pool = details.get('pool')
+        if not isinstance(pool, Mapping):
+            continue
+        pool_name = _normalise_worker_pool(
+            pool.get('implementation') or pool.get('pool')
+        )
+        if pool_name:
+            pools.add(pool_name)
+        raw_count = pool.get('max-concurrency')
+        if raw_count is None:
+            raw_count = pool.get('max_concurrency')
+        if raw_count is None and isinstance(
+            pool.get('processes'), (list, tuple, set)
+        ):
+            raw_count = len(pool['processes'])
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            observed.append(count)
+
+    pool_name = next(iter(pools)) if len(pools) == 1 else (
+        'mixed' if pools else None
+    )
+    return pool_name, sum(observed) if observed else None
+
+
+def worker_readiness_details(
+    timeout: float = READINESS_TIMEOUT_SECONDS,
+) -> dict:
+    """Return safe worker readiness and runtime capacity details."""
     connection = None
+    result = {
+        'ready': False,
+        'worker_pool': WORKER_POOL,
+        'worker_concurrency_configured': _configured_worker_concurrency(),
+        'worker_concurrency_observed': None,
+    }
     try:
         from app.ai.autonomy.worker import DRIVE_RUN_TASK, get_celery_app
 
         celery_app = get_celery_app()
         if celery_app is None:
-            return False
+            return result
+        configured_pool = _normalise_worker_pool(
+            getattr(getattr(celery_app, 'conf', None), 'worker_pool', None)
+        )
+        if configured_pool:
+            result['worker_pool'] = configured_pool
         connection = celery_app.connection_for_read(
             connect_timeout=timeout,
             transport_options={
@@ -119,22 +190,41 @@ def worker_readiness(timeout: float = READINESS_TIMEOUT_SECONDS) -> bool:
         connection.ensure_connection(max_retries=0, timeout=timeout)
         registered = celery_app.control.inspect(
             timeout=timeout, connection=connection,
-        ).registered()
-        if not isinstance(registered, dict):
-            return False
-        return any(
+        )
+        registered_tasks = registered.registered()
+        if not isinstance(registered_tasks, dict):
+            return result
+        result['ready'] = any(
             isinstance(tasks, (list, tuple, set))
             and DRIVE_RUN_TASK in tasks
-            for tasks in registered.values()
+            for tasks in registered_tasks.values()
         )
+        stats = getattr(registered, 'stats', None)
+        if callable(stats):
+            try:
+                pool_name, observed = _worker_stats_summary(stats())
+                if pool_name:
+                    result['worker_pool'] = pool_name
+                if observed is not None:
+                    result['worker_concurrency_observed'] = observed
+            except Exception:
+                # Registration is sufficient for worker readiness; stats are
+                # supplementary and must not make a healthy worker unavailable.
+                pass
+        return result
     except Exception:
-        return False
+        return result
     finally:
         if connection is not None:
             try:
                 connection.release()
             except Exception:
                 pass
+
+
+def worker_readiness(timeout: float = READINESS_TIMEOUT_SECONDS) -> bool:
+    """Confirm a worker on the configured broker registered drive_run."""
+    return bool(worker_readiness_details(timeout)['ready'])
 
 
 def autonomy_readiness(
@@ -153,6 +243,9 @@ def autonomy_readiness(
         'configured': configured,
         'checkpoint_ready': False,
         'worker_ready': False,
+        'worker_pool': WORKER_POOL,
+        'worker_concurrency_configured': _configured_worker_concurrency(),
+        'worker_concurrency_observed': None,
         'ready': False,
         'reason': REASON_FEATURE_DISABLED,
     }
@@ -163,13 +256,42 @@ def autonomy_readiness(
         return result
 
     checkpoint_probe = checkpoint_probe or checkpoint_readiness
-    worker_probe = worker_probe or worker_readiness
+    worker_probe = worker_probe or worker_readiness_details
     try:
         result['checkpoint_ready'] = bool(checkpoint_probe())
     except Exception:
         result['checkpoint_ready'] = False
     try:
-        result['worker_ready'] = bool(worker_probe())
+        worker_status = worker_probe()
+        if isinstance(worker_status, Mapping):
+            result['worker_ready'] = bool(worker_status.get('ready'))
+            pool_name = _normalise_worker_pool(
+                worker_status.get('worker_pool') or worker_status.get('pool')
+            )
+            if pool_name:
+                result['worker_pool'] = pool_name
+            configured = worker_status.get(
+                'worker_concurrency_configured',
+                worker_status.get('configured_concurrency'),
+            )
+            try:
+                configured = int(configured)
+            except (TypeError, ValueError):
+                configured = None
+            if configured is not None and configured > 0:
+                result['worker_concurrency_configured'] = configured
+            observed = worker_status.get(
+                'worker_concurrency_observed',
+                worker_status.get('observed_concurrency'),
+            )
+            try:
+                observed = int(observed)
+            except (TypeError, ValueError):
+                observed = None
+            if observed is not None and observed > 0:
+                result['worker_concurrency_observed'] = observed
+        else:
+            result['worker_ready'] = bool(worker_status)
     except Exception:
         result['worker_ready'] = False
 

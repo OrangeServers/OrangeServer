@@ -133,7 +133,6 @@ required = [
     ('PIL',            'Pillow'),
     ('gunicorn',       'gunicorn (生产 WSGI)'),
     ('dotenv',         'python-dotenv'),
-    ('ansible',        'ansible-core'),
 ]
 failed = []
 for mod, desc in required:

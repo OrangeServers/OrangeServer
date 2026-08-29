@@ -1,16 +1,17 @@
 # =============================================================================
 # OrangeServer Backend Dockerfile (REVIEW-15 P1-5/P1-6/P1-7 精修版 + ti3-DOCKER)
 # =============================================================================
-# 构建:   docker build -t orangeserver-backend:$(date +%Y%m%d) -f backend/Dockerfile backend/
+# 构建:   docker build -t orangeserver-backend:$(date +%Y%m%d) -f backend/Dockerfile .
 # 运行:   docker run -d --name ogs-backend -p 28000:28000 \
 #             -e OGS_FLASK_SECRET_KEY=xxx -e OGS_MYSQL_PASSWORD=xxx \
 #             -e OGS_FERNET_KEYS=xxx -e OGS_REDIS_HOST=redis_host \
 #             orangeserver-backend:latest
 #
-# 镜像分层（3 stage，多阶段构建）：
+# 镜像分层（4 stage，多阶段构建）：
 #   1. base:    slim Python 3.12 + 统一镜像源/运行环境
-#   2. builder: 依据已提交的 requirements.txt 一次性构建 wheelhouse
-#   3. runtime: 从 wheelhouse 离线安装，只保留 runtime deps
+#   2. frontend: Node 构建 SPA
+#   3. builder: 依据已提交的 requirements.txt 一次性构建 wheelhouse
+#   4. runtime: 从 wheelhouse 离线安装，只保留 runtime deps
 #
 # P1-5: 不引用 requirements-dev.txt（pip-audit/bandit/pytest 仅开发用）
 # P1-6: COPY 全部代码但配合 .dockerignore 排除 _archive/data/verify 脚本
@@ -46,7 +47,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     LC_ALL=C.UTF-8
 
 
-# ---------- Stage 2: builder ----------
+# ---------- Stage 2: frontend ----------
+FROM node:22.22.1-alpine AS frontend-builder
+
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+RUN npm run build
+
+
+# ---------- Stage 3: Python builder ----------
 FROM base AS builder
 
 # build 阶段需要的编译工具链
@@ -65,7 +76,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 # requirements.txt 是镜像构建的唯一依赖输入；依赖更新在开发/CI 阶段完成。
-COPY requirements.txt requirements.txt
+COPY backend/requirements.txt requirements.txt
 
 # 预构建全部直接和传递依赖的 wheel；runtime 不再访问包索引或现场解析。
 RUN pip install --upgrade pip \
@@ -73,7 +84,7 @@ RUN pip install --upgrade pip \
     && echo "[BUILD] dependency wheelhouse ready"
 
 
-# ---------- Stage 3: runtime ----------
+# ---------- Stage 4: runtime ----------
 FROM base AS runtime
 
 # runtime 只需要 base lib，不要 -dev
@@ -93,14 +104,15 @@ RUN groupadd -r ogs && useradd -r -g ogs -d /app -s /sbin/nologin ogs
 WORKDIR /app
 
 # 从 builder 复制 wheelhouse，离线安装 runtime 依赖。
-COPY requirements.txt /app/requirements.txt
+COPY backend/requirements.txt /app/requirements.txt
 RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels,ro \
     pip install --no-index --find-links=/wheels -r requirements.txt \
     && pip check \
     && echo "[RUNTIME] Python deps installed"
 
 # 复制业务代码（配合 .dockerignore 排除 _archive / data / verify 脚本）
-COPY --chown=ogs:ogs . /app/
+COPY --chown=ogs:ogs backend/ /app/
+COPY --from=frontend-builder --chown=ogs:ogs /frontend/dist/ /app/app/static/
 
 # 预创建运行时目录
 #   avatars/         = 用户头像上传

@@ -3,6 +3,21 @@
 Notable user-visible changes are recorded here. This project follows the
 principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- Chat now handles query, explanation, diagnosis, and Autonomy Run drafts;
+  every remote write is executed through the existing approval-gated Run path.
+- The Autonomy Worker keeps Celery prefork and defaults to two configurable
+  execution slots. DeepSeek reasoning is preserved across tool-call turns.
+- The standard Compose deployment now serves the bundled SPA from the app
+  image and uses four product containers with one Redis 8 service.
+
+### Removed
+
+- The unused in-tree Ansible Runner and its `ansible-core` dependency.
+
 ## [1.1.1] - 2026-08-19
 
 ### Added

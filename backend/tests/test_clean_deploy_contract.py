@@ -54,7 +54,7 @@ def test_backend_image_publish_is_guarded_while_repository_is_private():
     assert "linux/amd64" in workflow
     assert "release:" not in workflow.split("permissions:", 1)[0]
     assert "workflow_dispatch:" in workflow
-    assert "npm run build" in workflow
+    assert "context: ." in workflow
     assert "ops/build-deploy-bundle.sh" in workflow
     assert "gh release upload" in workflow
     assert "gh release view" in workflow
@@ -103,13 +103,13 @@ def test_compose_bootstrap_is_a_versioned_checksumming_thin_wrapper():
     assert "openssl rand -hex" in bootstrap
     assert "OGS_FLASK_SECRET_KEY \"\"" in bootstrap
     assert "OGS_FERNET_KEYS \"\"" in bootstrap
-    assert 'autonomy_redis_password="$(openssl rand -hex 24)"' in bootstrap
     assert 'set_key .env OGS_AI_AUTONOMY_ENABLED true' in bootstrap
-    assert 'set_key .env OGS_AI_AUTONOMY_REDIS_HOST autonomy-redis' in bootstrap
+    assert 'set_key .env OGS_AI_AUTONOMY_REDIS_HOST redis' in bootstrap
     assert (
         'set_key .env OGS_AI_AUTONOMY_REDIS_PASSWORD '
-        '"$autonomy_redis_password"'
+        '"$redis_password"'
     ) in bootstrap
+    assert 'set_key .env OGS_AUTONOMY_WORKER_CONCURRENCY 2' in bootstrap
     assert "docker volume inspect" in bootstrap
     assert "docker build" not in bootstrap
     assert "down -v" not in bootstrap
@@ -125,23 +125,27 @@ def test_compose_does_not_force_global_container_names():
     assert "container_name:" not in compose
 
 
-def test_standard_compose_starts_autonomy_redis_and_worker():
+def test_standard_compose_is_four_containers_with_one_redis():
     compose = (DEPLOY / "docker-compose.yml").read_text(encoding="utf-8")
     env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
     backend_env = (REPO_ROOT / "backend" / ".env.example").read_text(
         encoding="utf-8",
     )
-    assert "  autonomy-redis:" in compose
-    assert "  autonomy-worker:" in compose
-    assert "redis/redis-stack-server:7.4.0-v3" in compose
+    assert all(f"  {service}:" in compose for service in ("app", "worker", "redis", "mysql"))
+    assert "  frontend:" not in compose
+    assert "  autonomy-redis:" not in compose
+    assert "redis:8.10.0-alpine" in compose
     assert "app.ai.autonomy.celery_entry:celery_app" in compose
     assert compose.count(
         "OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-true}",
     ) == 2
-    assert "OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-autonomy-redis}" in compose
+    assert compose.count("OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-redis}") == 2
+    assert compose.count("OGS_REDIS_DB: ${OGS_REDIS_DB:-2}") == 2
+    assert 'OGS_PROXY_LAYERS: "0"' in compose
+    assert "OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}" in compose
     assert "autonomy-redis-data:" in compose
     assert "OGS_AI_AUTONOMY_ENABLED=" in env_example
-    assert "OGS_AI_AUTONOMY_REDIS_PASSWORD=" in env_example
+    assert "OGS_AI_AUTONOMY_REDIS_PASSWORD=" not in env_example
     assert "OGS_AI_AUTONOMY_ENABLED=" in backend_env
 
 
@@ -153,15 +157,13 @@ def test_release_bundle_contains_all_compose_runtime_inputs():
         "backend/.env.example",
         "backend/mysqldir/orange.sql",
         "deploy/docker-compose.yml",
-        "deploy/nginx/frontend_container.conf",
-        "deploy/nginx/ogs_proxy_common.conf",
-        "frontend/dist/index.html",
         "ops/preflight-compose.sh",
         "ops/bootstrap-compose.sh",
     ):
         assert f'"{path}"' in builder
     assert "sha256sum" in builder
-    assert "references missing file" in builder
+    assert "frontend/dist" not in builder
+    assert "deploy/nginx" not in builder
     assert '"CHANGELOG.md"' in builder
     assert '"docs/operations/UPGRADE.md"' in builder
     assert '"${ROOT}/backend/mysqldir/"*.sql' in builder
@@ -558,9 +560,12 @@ def test_rev56_autonomy_evidence_table_matches_baseline_and_orm():
 def test_dockerfile_builds_from_committed_requirements_without_resolving_lock():
     dockerfile = (BACKEND / "Dockerfile").read_text(encoding="utf-8")
     assert "pip-compile" not in dockerfile
-    assert "COPY requirements.txt" in dockerfile
+    assert "COPY backend/requirements.txt" in dockerfile
     assert "pip wheel" in dockerfile
     assert "FROM base AS runtime" in dockerfile
+    assert "FROM node:22.22.1-alpine AS frontend-builder" in dockerfile
+    assert "npm ci --no-audit --no-fund" in dockerfile
+    assert "COPY --from=frontend-builder" in dockerfile
     assert "/app/.gunicorn" in dockerfile
 
 
@@ -613,10 +618,12 @@ def test_autonomy_dev_overlay_uses_dedicated_redis8_and_worker():
         "${OGS_DEV_AUTONOMY_BACKEND_TAG:-local}"
     )
     assert overlay.count("image: " + image) == 2
-    assert overlay.count("context: ../backend") == 2
+    assert overlay.count("context: ..") == 2
+    assert overlay.count("dockerfile: backend/Dockerfile") == 2
     assert overlay.count("pull_policy: never") == 2
     assert "app.ai.autonomy.celery_entry:celery_app" in overlay
-    assert "--concurrency=1" in overlay
+    assert "--concurrency=1" not in overlay
+    assert "OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}" in overlay
     assert "inspect ping" in overlay
     assert "../backend:/app" in overlay
     assert overlay.count("condition: service_healthy") == 4

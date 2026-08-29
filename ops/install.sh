@@ -147,7 +147,7 @@ pip3 install --upgrade pip setuptools wheel
 pip3 install -i "${PIP_INDEX_URL}" -r "${installdir}/backend/requirements.txt"
 
 # =============================================================================
-# 7. 导入自检 (14 个关键模块)
+# 7. 导入自检 (13 个关键模块)
 # =============================================================================
 echo '>>> 导入自检...'
 python3 << 'PYEOF'
@@ -166,7 +166,6 @@ required = [
     ('PIL',            'Pillow (P1-5 captcha 后端化必需)'),
     ('gunicorn',       'gunicorn (生产 WSGI)'),
     ('dotenv',         'python-dotenv (.env 加载)'),
-    ('ansible',        'ansible-core (批量执行)'),
 ]
 failed = []
 for mod, desc in required:

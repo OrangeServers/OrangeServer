@@ -207,35 +207,6 @@ class TestP0LowRegressionBaseline:
 class TestP0LowCleanupAdditional:
     """P0 LOW 深度清理: 测试残留 print / 调试代码 / 静默吞错审查"""
 
-    def test_display_py_no_test_residue_print(self):
-        """ansible_runner/display.py 不应残留 print(1) 等测试残留"""
-        path = os.path.join(ROOT, 'app', 'tools', 'ansible_runner', 'display.py')
-        with open(path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        actual_prints = []
-        for l in content.split('\n'):
-            if l.strip().startswith('#'):
-                continue
-            for m in re.finditer(r'(?<![\w.])print\s*\(', l):
-                actual_prints.append(l.strip())
-        assert not actual_prints, f"display.py 不应有 print 残留: {actual_prints}"
-
-    def test_display_py_log_path_always_defined(self):
-        """AdHocDisplay.__init__ 必须确保 log_path 被赋值 (否则 open() 抛 NameError)"""
-        path = os.path.join(ROOT, 'app', 'tools', 'ansible_runner', 'display.py')
-        with open(path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        match = re.search(
-            r'def\s+__init__\s*\(\s*self\s*,\s*execution_id[^)]*\)\s*:(.*?)(?=\n    def\s|\nclass\s)',
-            content, re.DOTALL,
-        )
-        assert match, "未找到 AdHocDisplay.__init__ 方法"
-        body = match.group(1)
-        if_branch = re.search(r'if\s+execution_id\s*:(.*?)(?=else:)', body, re.DOTALL)
-        else_branch = re.search(r'else\s*:(.*?)(?=\n        self\.log_file)', body, re.DOTALL)
-        assert if_branch and 'log_path' in if_branch.group(1), "if execution_id 分支必须给 log_path 赋值"
-        assert else_branch and 'log_path' in else_branch.group(1), "else 分支必须给 log_path 赋值"
-
     def test_sendmail_silent_except_is_acceptable(self):
         """sendmail.py 中的 except 都是 SMTP 连接关闭/解码容忍, 业内惯例, 不必改"""
         path = os.path.join(ROOT, 'app', 'tools', 'sendmail.py')

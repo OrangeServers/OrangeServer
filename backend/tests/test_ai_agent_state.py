@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import fnmatch
-import time
 
 
 class FakeRedis:
@@ -122,20 +121,15 @@ def test_conversation_context_mode_defaults_to_standard_and_persists_deep_mode()
     assert listed[deep["id"]]["context_mode"] == DEEP_CONTEXT_MODE
 
 
-def test_deleting_conversation_invalidates_results_and_pending_actions():
+def test_deleting_conversation_invalidates_result_sets():
     from app.ai.storage import AgentStore, AgentStoreNotFound
 
-    redis = FakeRedis()
-    store = AgentStore(redis)
+    store = AgentStore(FakeRedis())
     conversation = store.create_conversation("alice", "siliconflow", "demo-model")
     result = store.create_result_set(
         "alice", conversation["id"], "assets",
         rows=[{"id": 1, "alias": "web-01"}],
         resource_ids=[1],
-    )
-    action = store.create_action(
-        "alice", conversation["id"], result["id"],
-        sys_user="ops", command="df -h", reason="巡检",
     )
 
     store.delete_conversation("alice", conversation["id"])
@@ -143,7 +137,6 @@ def test_deleting_conversation_invalidates_results_and_pending_actions():
     for getter, args in (
         (store.get_conversation, ("alice", conversation["id"])),
         (store.get_result_set, ("alice", result["id"])),
-        (store.get_action, ("alice", action["id"])),
     ):
         try:
             getter(*args)
@@ -151,213 +144,6 @@ def test_deleting_conversation_invalidates_results_and_pending_actions():
             pass
         else:
             raise AssertionError("deleted conversation descendants must be invalidated")
-
-
-def test_action_can_only_be_claimed_once_by_its_owner():
-    from app.ai.storage import AgentStore, AgentStoreConflict, AgentStoreNotFound
-
-    store = AgentStore(FakeRedis())
-    conversation = store.create_conversation("alice", "minimax", "demo")
-    result = store.create_result_set(
-        "alice", conversation["id"], "assets", rows=[], resource_ids=[1]
-    )
-    action = store.create_action(
-        "alice", conversation["id"], result["id"],
-        sys_user="ops", command="df -h", reason="巡检",
-    )
-
-    try:
-        store.claim_action("bob", action["id"])
-    except AgentStoreNotFound:
-        pass
-    else:
-        raise AssertionError("another user must not observe or claim an action")
-
-    claimed = store.claim_action("alice", action["id"])
-    assert claimed["status"] == "running"
-    assert store.redis.ttls[store._action_key(action["id"])] >= 60 * 60
-
-    try:
-        store.claim_action("alice", action["id"])
-    except AgentStoreConflict:
-        pass
-    else:
-        raise AssertionError("an action must not execute twice")
-
-
-def test_listing_conversations_prunes_missing_pending_actions():
-    from app.ai.storage import AgentStore
-
-    redis = FakeRedis()
-    store = AgentStore(redis)
-    conversation = store.create_conversation("alice", "minimax", "demo")
-    result = store.create_result_set(
-        "alice", conversation["id"], "assets", rows=[], resource_ids=[1]
-    )
-    action = store.create_action(
-        "alice", conversation["id"], result["id"],
-        sys_user="ops", command="df -h", reason="巡检",
-    )
-    redis.delete(store._action_key(action["id"]))
-
-    [listed] = store.list_conversations("alice")
-
-    assert listed["has_pending_action"] is False
-    assert listed["pending_action_ids"] == []
-    assert store.get_conversation("alice", conversation["id"])["pending_action_ids"] == []
-
-
-def test_listing_conversations_expires_stale_pending_actions():
-    from app.ai.storage import AgentStore
-
-    redis = FakeRedis()
-    current_time = [100.0]
-    store = AgentStore(redis, now=lambda: current_time[0], action_ttl=10)
-    conversation = store.create_conversation("alice", "minimax", "demo")
-    result = store.create_result_set(
-        "alice", conversation["id"], "assets", rows=[], resource_ids=[1]
-    )
-    action = store.create_action(
-        "alice", conversation["id"], result["id"],
-        sys_user="ops", command="df -h", reason="巡检",
-    )
-    current_time[0] = 111.0
-
-    [listed] = store.list_conversations("alice")
-
-    assert listed["has_pending_action"] is False
-    assert listed["pending_action_ids"] == []
-    assert store.get_action("alice", action["id"])["status"] == "expired"
-
-
-def test_cleanup_can_remove_conversation_with_missing_pending_action():
-    from app.ai.storage import AgentStore, AgentStoreNotFound
-
-    redis = FakeRedis()
-    current_time = [100.0]
-    store = AgentStore(
-        redis,
-        now=lambda: current_time[0],
-        max_conversations=1,
-    )
-    old_conversation = store.create_conversation("alice", "minimax", "old")
-    result = store.create_result_set(
-        "alice", old_conversation["id"], "assets", rows=[], resource_ids=[1]
-    )
-    action = store.create_action(
-        "alice", old_conversation["id"], result["id"],
-        sys_user="ops", command="df -h", reason="巡检",
-    )
-    redis.delete(store._action_key(action["id"]))
-    current_time[0] = 200.0
-
-    new_conversation = store.create_conversation("alice", "minimax", "new")
-
-    try:
-        store.get_conversation("alice", old_conversation["id"])
-    except AgentStoreNotFound:
-        pass
-    else:
-        raise AssertionError("a missing action must not protect an old conversation")
-    assert [row["id"] for row in store.list_conversations("alice")] == [
-        new_conversation["id"]
-    ]
-
-
-def test_conversation_rejects_a_second_live_action():
-    from app.ai.storage import AgentStore, AgentStoreConflict
-
-    store = AgentStore(FakeRedis())
-    conversation = store.create_conversation("alice", "minimax", "demo")
-    first_result = store.create_result_set(
-        "alice", conversation["id"], "assets", rows=[], resource_ids=[1]
-    )
-    second_result = store.create_result_set(
-        "alice", conversation["id"], "assets", rows=[], resource_ids=[2]
-    )
-    first_action = store.create_action(
-        "alice", conversation["id"], first_result["id"],
-        sys_user="ops", command="df -h", reason="巡检",
-    )
-
-    try:
-        store.create_action(
-            "alice", conversation["id"], second_result["id"],
-            sys_user="ops", command="free -m", reason="巡检",
-        )
-    except AgentStoreConflict:
-        pass
-    else:
-        raise AssertionError("one conversation must not have two live actions")
-
-    refreshed = store.get_conversation("alice", conversation["id"])
-    assert refreshed["pending_action_ids"] == [first_action["id"]]
-
-
-def test_expired_action_does_not_block_a_replacement():
-    from app.ai.storage import AgentStore
-
-    current_time = [100.0]
-    store = AgentStore(
-        FakeRedis(),
-        now=lambda: current_time[0],
-        action_ttl=10,
-    )
-    conversation = store.create_conversation("alice", "minimax", "demo")
-    first_result = store.create_result_set(
-        "alice", conversation["id"], "assets", rows=[], resource_ids=[1]
-    )
-    second_result = store.create_result_set(
-        "alice", conversation["id"], "assets", rows=[], resource_ids=[2]
-    )
-    expired_action = store.create_action(
-        "alice", conversation["id"], first_result["id"],
-        sys_user="ops", command="df -h", reason="巡检",
-    )
-    current_time[0] = 111.0
-
-    replacement = store.create_action(
-        "alice", conversation["id"], second_result["id"],
-        sys_user="ops", command="free -m", reason="巡检",
-    )
-
-    refreshed = store.get_conversation("alice", conversation["id"])
-    assert refreshed["pending_action_ids"] == [replacement["id"]]
-    assert refreshed["action_ids"] == [expired_action["id"], replacement["id"]]
-    assert store.get_action("alice", expired_action["id"])["status"] == "expired"
-
-
-def test_cancel_and_approve_share_one_action_lock():
-    from app.ai.storage import AgentStore, AgentStoreConflict
-
-    redis = FakeRedis()
-    store = AgentStore(redis)
-    conversation = store.create_conversation("alice", "minimax", "demo")
-    result = store.create_result_set(
-        "alice", conversation["id"], "assets", rows=[], resource_ids=[1]
-    )
-    action = store.create_action(
-        "alice", conversation["id"], result["id"],
-        sys_user="ops", command="df -h", reason="巡检",
-    )
-    lock_key = store._action_lock_key(action["id"])
-    redis.set(lock_key, "approver", ex=30, nx=True)
-
-    try:
-        store.cancel_action("alice", action["id"])
-    except AgentStoreConflict:
-        pass
-    else:
-        raise AssertionError("cancel must not race an approval claim")
-
-    redis.delete(lock_key)
-    store.claim_action("alice", action["id"])
-    try:
-        store.cancel_action("alice", action["id"])
-    except AgentStoreConflict:
-        pass
-    else:
-        raise AssertionError("running action must not be cancelled")
 
 
 def test_conversation_run_lock_blocks_parallel_runs_and_releases_by_token():
@@ -399,7 +185,6 @@ def test_context_compression_keeps_last_four_rounds_and_structured_state():
         "messages": messages,
         "summary": "",
         "state": {"last_result_set_id": "result-123"},
-        "pending_action_ids": [],
     }
     captured = {}
 
@@ -455,28 +240,6 @@ def test_context_manager_default_window_is_256k():
     assert ContextManager().context_window == STANDARD_CONTEXT_TOKENS
 
 
-def test_context_does_not_compress_while_approval_is_pending():
-    from app.ai.context import ContextManager
-
-    conversation = {
-        "messages": [
-            {"role": "user", "content": "x" * 500},
-            {"role": "assistant", "content": "y" * 500},
-        ],
-        "summary": "",
-        "state": {},
-        "pending_action_ids": ["action-1"],
-    }
-    manager = ContextManager(context_window=10, threshold_ratio=0.5)
-
-    untouched = manager.compress(
-        conversation,
-        lambda *_: (_ for _ in ()).throw(AssertionError("must not summarize")),
-    )
-
-    assert untouched == conversation
-
-
 def test_context_compression_keeps_history_when_summary_fails():
     from app.ai.context import ContextManager
 
@@ -490,7 +253,6 @@ def test_context_compression_keeps_history_when_summary_fails():
         "messages": messages,
         "summary": "previous summary",
         "state": {"last_result_set_id": "result-123"},
-        "pending_action_ids": [],
     }
     manager = ContextManager(context_window=80, threshold_ratio=0.5, keep_rounds=4)
 
@@ -515,7 +277,6 @@ def test_context_compression_keeps_history_when_summary_is_empty():
         "messages": messages,
         "summary": "",
         "state": {"last_result_set_id": "result-123"},
-        "pending_action_ids": [],
     }
     manager = ContextManager(context_window=80, threshold_ratio=0.5, keep_rounds=4)
 

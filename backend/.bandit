@@ -15,7 +15,7 @@
 #   B324: hashlib weak SHA1 (user.py:299 已用 usedforsecurity=False 修)
 #
 # 排除目录 (与 pytest CI 一致):
-#   tests / data / _archive / app/tools/ansible_runner / frontend
+#   tests / data / _archive / frontend
 
 skips:
   - B101
@@ -30,5 +30,4 @@ exclude_dirs:
   - tests
   - data
   - _archive
-  - app/tools/ansible_runner
   - frontend

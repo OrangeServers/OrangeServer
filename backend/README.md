@@ -102,7 +102,6 @@ backend/
 │   │   ├── shellcmd.py        # SSH 连接工厂
 │   │   ├── sendmail.py        # 邮件发送
 │   │   ├── ws_helper.py       # WebSocket 握手辅助
-│   │   ├── ansible_runner/    # ansible 批量执行
 │   │   ├── auto_update.py     # 自动更新
 │   │   ├── SqlListTool.py     # 列表/字典处理
 │   │   └── migrate_comma_to_junction.py  # 旧数据迁移脚本
@@ -247,10 +246,8 @@ ROUTES = [
 | `/ai/admin/providers/<code>/clear-key` | POST | 清除密钥并禁用 Provider |
 | `/ai/conversations` | GET / POST | 会话列表与创建 |
 | `/ai/conversations/<id>` | GET / DELETE | 恢复或删除会话 |
-| `/ai/chat` | POST SSE | 模型增量、工具和审批事件 |
+| `/ai/chat` | POST SSE | 模型增量、只读工具和自治草稿引用 |
 | `/ai/results/<id>` | GET | 权威结果集分页 |
-| `/ai/actions/<id>/approve` | POST SSE | 重新鉴权并逐台执行 |
-| `/ai/actions/<id>/cancel` | POST | 取消待审批操作 |
 | `/ai/diagnostic-profiles` | GET | 服务端固定只读诊断档案 |
 | `/ai/diagnostics` | POST | 启动受控诊断 |
 | `/ai/diagnostics/<id>` | GET | 权威诊断 Run 快照 |
@@ -258,8 +255,8 @@ ROUTES = [
 | `/ai/diagnostics/<id>/evidence` | GET | 所有者可见的脱敏证据 |
 | `/ai/diagnostics/<id>/report` | GET | 确定性规则报告 |
 
-会话、结果集和 Action 使用 Redis 保存；聊天 TTL 7 天、每用户最多 20 个会话，
-Pending Action 默认 10 分钟过期。聊天记录不永久写入数据库。
+会话和结果集使用 Redis 保存；聊天 TTL 7 天、每用户最多 20 个会话。聊天记录不
+永久写入数据库，远程写操作只允许通过 Autonomy Run 执行。
 诊断 Run、事件、加密证据和报告写入 MySQL；证据默认保留 7 天，报告、Run 与
 事件默认保留 90 天并级联清理，保留期可配置。服务端固定探针不接受模型提交的
 Shell。

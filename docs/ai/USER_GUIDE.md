@@ -2,7 +2,7 @@
 
 OrangeServer AI 运维是权限受控的自然语言入口。聊天适合查询平台中的结构化数据，
 以及准备需要用户审批的批量命令；聊天不会获得任意数据库、SSH 或 Shell 权限。
-单资产受控自治在独立工作台 `/ai-runs` 中提供，默认关闭，见下文。
+单资产受控自治在独立工作台 `/ai-runs` 中提供；标准 bundled 安装默认启用，见下文。
 
 ## 使用前准备
 
@@ -91,11 +91,11 @@ Agent 只创建待审批动作。执行卡会展示命令、目标数量、系�
 
 启用 M1 自治功能后，管理员可以在 `/ai-runs` 创建和查看单资产自治任务，
 并在 `/ai-runs/:runId` 查看服务端权威的计划、执行、审批、证据、验证和结论。
-标准 bundled 安装会启动专用 Redis Stack 与 Worker，自治任务默认可用。
+标准 bundled 安装会启动统一 Redis 8 与 Worker，自治任务默认可用。
 基础设施未就绪时服务端会阻止启动。
 
 开始前确认：管理员账号、已通过 Tool Calling 测试的 Provider、一个明确标记为
-`production`、`staging` 或 `lab` 的测试资产、已授权系统用户，以及与业务 Redis 7
+`production`、`staging` 或 `lab` 的测试资产、已授权系统用户，以及与生产统一 Redis
 分离的自治 Redis 8。`auto` 模式只允许 `lab` 资产；`ask`、`ai_review` 和 `custom`
 仍受服务端动作白名单、审批规则、预算和永久拒绝清单约束。
 

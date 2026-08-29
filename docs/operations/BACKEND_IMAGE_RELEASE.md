@@ -28,14 +28,14 @@ pwsh -File ops/check-docs.ps1
 bash ops/test-bootstrap-scripts.sh
 
 cd backend
-python -m pytest tests/ -q --ignore=app/tools/ansible_runner
+python -m pytest tests/ -q
 cd ../frontend
 npm ci --no-audit --no-fund
 npm run build
 cd ..
 ```
 
-M1 自治还要用隔离的 MySQL、业务 Redis、自治 Redis Stack、Worker 和 SSH 测试资产做
+M1/M2 自治还要用隔离的 MySQL、Redis 8、Worker 和 SSH 测试资产做
 smoke；从零安装必须能直接使用自治工作台并看到就绪状态，不要把「容器已启动」当成
 自治闭环。入口：
 
@@ -87,9 +87,9 @@ GitHub Release 存在（draft 或已发布均可）且 GHCR 同名 tag 不存在
 ```bash
 wsl -d <wsl-发行版> -u root -e bash -c '
   rm -rf /root/ogs-build && mkdir -p /root/ogs-build
-  cp -r /mnt/<源码路径>/backend /root/ogs-build/
+  cp -r /mnt/<源码路径>/. /root/ogs-build/
   cd /root/ogs-build
-  docker build -t ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend:vX.Y.Z backend/
+  docker build -f backend/Dockerfile -t ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend:vX.Y.Z .
   docker push ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend:vX.Y.Z
 '
 ```
@@ -148,7 +148,7 @@ curl -fsSL https://github.com/OrangeServers/OrangeServer/releases/download/vX.Y.
   | sudo bash -s -- --version vX.Y.Z
 ```
 
-安装后验证：6 容器全部 `Up`，backend/mysql/redis/autonomy-redis healthy；setup 完成
+安装后验证：4 个产品容器全部 `Up`，app/worker/mysql/redis healthy；setup 完成
 前 worker 保持等待、不 crash-loop（见第 1 节）；`/local/health` 返回 200；完成
 `/setup` 后登录、资产、审计、AI Provider、只读诊断正常。
 

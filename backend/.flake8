@@ -14,7 +14,6 @@
 #   - _archive: 历史代码冻结, 不参与新评审
 #   - data: 运行时数据目录
 #   - tests: 已有专门测试规范
-#   - app/tools/ansible_runner: 子进程测试不稳定, CI pytest 也已 --ignore
 #   - build / dist / frontend: 打包产物 / 前端代码
 # =============================================================================
 
@@ -69,7 +68,6 @@ exclude =
     _archive,
     data,
     tests,
-    app/tools/ansible_runner,
     build,
     dist,
     frontend

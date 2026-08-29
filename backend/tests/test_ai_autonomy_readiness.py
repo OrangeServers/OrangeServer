@@ -25,6 +25,9 @@ def test_disabled_feature_does_not_probe_infrastructure(monkeypatch):
         'configured': True,
         'checkpoint_ready': False,
         'worker_ready': False,
+        'worker_pool': 'prefork',
+        'worker_concurrency_configured': 2,
+        'worker_concurrency_observed': None,
         'ready': False,
         'reason': 'feature_disabled',
     }
@@ -69,6 +72,9 @@ def test_readiness_reports_fixed_reason_codes_only(monkeypatch):
         'configured': True,
         'checkpoint_ready': True,
         'worker_ready': True,
+        'worker_pool': 'prefork',
+        'worker_concurrency_configured': 2,
+        'worker_concurrency_observed': None,
         'ready': True,
         'reason': 'ready',
     }
@@ -186,3 +192,62 @@ def test_worker_probe_requires_registered_drive_task(monkeypatch):
     monkeypatch.setattr(worker, 'get_celery_app', lambda: app)
     assert readiness.worker_readiness(timeout=0.25) is False
     assert app.connection.released is True
+
+
+def test_readiness_reports_safe_pool_and_concurrency(monkeypatch):
+    _configure(monkeypatch)
+    from app.ai.autonomy import worker
+
+    class Inspect:
+        def registered(self):
+            return {'worker-with-secret-name': [worker.DRIVE_RUN_TASK]}
+
+        def stats(self):
+            return {
+                'worker-with-secret-name': {
+                    'broker': {'hostname': 'redis://:private-secret@example'},
+                    'pool': {
+                        'implementation': (
+                            'celery.concurrency.prefork.TaskPool'
+                        ),
+                        'max-concurrency': 2,
+                    },
+                },
+            }
+
+    class Control:
+        def inspect(self, timeout, connection):
+            return Inspect()
+
+    class Connection:
+        def ensure_connection(self, **kwargs):
+            pass
+
+        def release(self):
+            pass
+
+    class App:
+        control = Control()
+        conf = type('Conf', (), {'worker_pool': 'prefork'})()
+
+        def connection_for_read(self, **kwargs):
+            return Connection()
+
+    monkeypatch.setattr(worker, 'get_celery_app', lambda: App())
+
+    details = readiness.worker_readiness_details(timeout=0.25)
+    assert details == {
+        'ready': True,
+        'worker_pool': 'prefork',
+        'worker_concurrency_configured': 2,
+        'worker_concurrency_observed': 2,
+    }
+    result = readiness.autonomy_readiness(
+        checkpoint_probe=lambda: True,
+        worker_probe=lambda: details,
+    )
+    assert result['ready'] is True
+    assert result['worker_pool'] == 'prefork'
+    assert result['worker_concurrency_configured'] == 2
+    assert result['worker_concurrency_observed'] == 2
+    assert 'private-secret' not in str(result)

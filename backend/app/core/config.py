@@ -134,7 +134,7 @@ MYSQL_URI = "mysql+pymysql://{}:{}@{}:{}/{}?charset=utf8mb4".format(
 # REV46-H12/H13/H14: Redis 完整配置（password / db / max_connections / socket_keepalive / socket_timeout）
 #   生产环境建议配置：
 #     OGS_REDIS_PASSWORD=<your-redis-password>      # 必填, 防止未授权访问
-#     OGS_REDIS_DB=0                                # 0=默认库, 不建议用 10 (业务库隔离建议走 key prefix)
+#     OGS_REDIS_DB=2                                # bundled 栈的业务会话和缓存库
 #     OGS_REDIS_SOCKET_TIMEOUT=5                    # 单次操作超时, 防 hang
 #     OGS_REDIS_SOCKET_KEEPALIVE=true               # 启用 TCP keepalive, 防长连接被中间设备切断
 REDIS_CONF = {
@@ -143,7 +143,7 @@ REDIS_CONF = {
     # H12: 密码为空时 redis-py 传 None = 不认证（仅当 Redis 未设 requirepass 时可用）
     'password': _env('OGS_REDIS_PASSWORD', ''),
     # H13: db 索引配置化, 避免测试/生产共用 db=10 导致 key 冲突
-    'db': int(_env('OGS_REDIS_DB', '0')),
+    'db': int(_env('OGS_REDIS_DB', '2')),
     # 连接池上限
     'max_connections': int(_env('OGS_REDIS_MAX_CONNECTIONS', '10')),
     # H14: socket 维度的 timeout / keepalive, 防止单次操作 hang 或长连接被切断
@@ -250,13 +250,27 @@ AI_AUTONOMY_ENABLED = str(_env('OGS_AI_AUTONOMY_ENABLED', '')).strip().lower() i
     '1', 'true', 'yes', 'on',
 )
 
-# M1/S2: 自治专用 Redis 8 接线（与业务 Redis 7 完全隔离）。
-#   DB 0 存 LangGraph checkpoint，DB 1 作为 Celery broker；
-#   服务端要求 AOF + noeviction + 持久卷（部署层保证）。
+# M1/S2: 自治 Redis 8 接线。标准部署与业务缓存共用实例但隔离 DB：
+#   DB 0 存 LangGraph checkpoint/向量，DB 1 作为 Celery broker，DB 2 缓存；
+#   服务端要求 AOF + volatile-lru + 持久卷（部署层保证）。
 #   主机留空视为接线未完成，自治 Worker 不启动，等价于禁用。
 AI_AUTONOMY_REDIS_HOST = str(_env('OGS_AI_AUTONOMY_REDIS_HOST', '')).strip()
 AI_AUTONOMY_REDIS_PORT = int(_env('OGS_AI_AUTONOMY_REDIS_PORT', '6379'))
 AI_AUTONOMY_REDIS_PASSWORD = str(_env('OGS_AI_AUTONOMY_REDIS_PASSWORD', ''))
+# M2/S0: Celery prefork worker slots.  Reject invalid values at startup so a
+# typo cannot silently turn the worker into an effectively serial process.
+try:
+    AI_AUTONOMY_WORKER_CONCURRENCY = int(
+        _env('OGS_AUTONOMY_WORKER_CONCURRENCY', '2')
+    )
+except (TypeError, ValueError) as exc:
+    raise RuntimeError(
+        'OGS_AUTONOMY_WORKER_CONCURRENCY must be a positive integer'
+    ) from exc
+if AI_AUTONOMY_WORKER_CONCURRENCY < 1:
+    raise RuntimeError(
+        'OGS_AUTONOMY_WORKER_CONCURRENCY must be a positive integer'
+    )
 #   Worker 租约有效期；心跳必须显著短于此（执行器切片负责心跳）。
 AI_AUTONOMY_LEASE_TTL_SECONDS = max(
     10, int(_env('OGS_AI_AUTONOMY_LEASE_TTL_SECONDS', '120')),

@@ -120,7 +120,7 @@ Run 的权威状态为 `queued`、`running`、`completed`、`partial`、`failed`
 
 ## M1 自治任务 API
 
-自治接口只对管理员开放。标准 bundled 栈启动专用 Redis 与 Worker，默认可用。
+自治接口只对管理员开放。标准 bundled 栈启动统一 Redis 8 与 Worker，默认可用。
 未同时满足进程启用、checkpoint 和 Worker 就绪条件时，Run 不能启动。聊天只拥有
 创建草稿引用卡的能力，不能启动、审批或取消 Run。
 
@@ -128,7 +128,7 @@ Run 的权威状态为 `queued`、`running`、`completed`、`partial`、`failed`
 
 | 方法 | 路径 | 角色 | 说明 |
 |---|---|---|---|
-| GET | `/ai/autonomy/status` | admin/user | 返回 `enabled`、专用 Redis 配置、checkpoint、Worker 和 `ready` 布尔值，以及固定 `reason` 码 |
+| GET | `/ai/autonomy/status` | admin/user | 返回 `enabled`、Redis checkpoint、Worker pool/并发和 `ready` 布尔值，以及固定 `reason` 码 |
 | POST | `/ai/autonomous-runs` | admin | 校验目标资产、系统用户、模式和预算，创建 `draft` |
 | GET | `/ai/autonomous-runs` | admin | 当前管理员的 Run 列表 |
 | GET | `/ai/autonomous-runs/{run_id}` | admin | 当前管理员的权威快照、步骤和 `allowed_operations` |
@@ -245,13 +245,13 @@ data: {"type":"assistant.delta","run_id":"...","content":"..."}
 | `assistant.delta` | `run_id`, `content` | 模型文本增量 |
 | `tool.started` | `id`, `tool`, `arguments` | 工具开始 |
 | `tool.completed` | `id`, `tool`, `result`/`error` | 同一工具完成 |
-| `approval.required` | `action_id`, `expires_at` | 需要用户确认 |
 | `diagnostic_started` | `event_seq`, `run_id`, `profile_id` | 只读诊断开始 |
 | `diagnostic_progress` | `event_seq`, `run_id`, `asset` | 逐资产探针进度 |
 | `diagnostic_evidence` | `event_seq`, `run_id`, `evidence_id` | 新证据已保存 |
 | `diagnostic_completed` | `event_seq`, `run_id`, `report` | 完成或部分完成 |
 | `diagnostic_failed` | `event_seq`, `run_id`, `message` | 失败或取消 |
-| `run.completed` | `waiting_for_approval` | 本轮正常结束 |
+| `autonomy.draft_created` | `run_id`, `goal`, `status` | 已创建自治任务草稿 |
+| `run.completed` | `conversation_id` | 本轮正常结束 |
 | `run.failed` | `message` | 本轮失败 |
 
 `tool.started` 和对应的 `tool.completed` 使用相同 `id`。客户端应更新同一条时间线
@@ -259,40 +259,18 @@ data: {"type":"assistant.delta","run_id":"...","content":"..."}
 会话详情和诊断 Run 快照。诊断事件带递增 `event_seq`，Run 的
 `latest_event_seq` 可用于客户端判断快照新旧；当前没有公开事件重放接口。
 
-同一会话一次只允许一个运行锁；单轮最多执行有限个工具步骤，同一轮最多创建一个
-待审批批量动作。
-
-## 动作审批
-
-| 方法 | 路径 | 响应 |
-|---|---|---|
-| POST | `/ai/actions/{id}/approve` | SSE |
-| POST | `/ai/actions/{id}/cancel` | JSON |
-
-审批 SSE：
-
-| 事件 | 关键字段 | 含义 |
-|---|---|---|
-| `action.progress` | `action_id`, `alias`, `status`, `output`, `error` | 单资产进度 |
-| `action.completed` | `summary`, `outcome`, `results`, `status` | 最终聚合结果 |
-| `run.completed` | `action_id` | 审批流完成 |
-| `run.failed` | `action_id`, `message` | 校验或执行失败 |
-
-`action.completed.results` 只返回资产别名，不返回主机 ID/IP。单项输出限制为 8,192
-字符，错误限制为 2,048 字符；截断项带 `truncated: true`。
-
-审批不是对模型建议的盲信。服务端会原子认领动作并重新验证所有权、有效期、
-`result_set_id`、资产权限、系统用户权限、目标数量和危险命令规则。
+同一会话一次只允许一个运行锁，单轮最多执行有限个工具步骤。聊天工具只提供查询、
+固定只读诊断和 `create_autonomy_draft`；所有远程写操作必须进入 Autonomy Run，
+聊天侧没有启动、审批、取消或执行接口。
 
 ## 保留和并发
 
 - AI 会话和结果集默认 TTL：7 天。
 - 每用户最多会话：20。
-- 待审批动作默认 TTL：10 分钟。
 - 会话展示事件最多保留最近 200 条。
 - 诊断原始证据默认写入 7 天到期时间，过期后证据接口不再返回；结构化报告、
   Run 快照和事件默认在 90 天后级联删除。管理员可通过环境变量调整两类保留期。
-- 会话删除时如果仍有待审批动作会返回冲突。
+- 删除会话会同时删除其临时结果集；已经创建的 Autonomy Run 不属于聊天临时状态。
 
 ## OpenAPI
 

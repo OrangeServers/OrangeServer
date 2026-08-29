@@ -20,8 +20,8 @@ launcher first. For source-based and host deployments, see
 ## China mainland route
 
 This route is available from v1.0.3. Its fixed-tag Gitee launcher uses the
-Tencent Cloud TCR backend image and digest-pinned
-DaoCloud public mirrors for the official Nginx, Redis, and MySQL images:
+Tencent Cloud TCR application image and DaoCloud public mirrors for the
+official Redis and MySQL images:
 
 ```bash
 set -o pipefail
@@ -30,8 +30,8 @@ curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.1.1/ops/bootstrap
 ```
 
 DaoCloud is a community public mirror without an availability SLA. Override
-its full image references with `OGS_CN_NGINX_IMAGE`, `OGS_CN_REDIS_IMAGE`, and
-`OGS_CN_MYSQL_IMAGE` when needed.
+its full image references with `OGS_CN_REDIS_IMAGE` and `OGS_CN_MYSQL_IMAGE`
+when needed.
 
 Open `http://<server>:8080`. There is no default administrator account or
 password.

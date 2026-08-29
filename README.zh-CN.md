@@ -121,9 +121,9 @@ curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.1.1/ops/bootstrap
   | sudo bash -s -- --version v1.1.1
 ```
 
-大陆线路会从 DaoCloud 匿名公共镜像拉取固定 digest 的 Nginx、Redis、MySQL 官方
-镜像。该社区公共服务不承诺可用性 SLA；可用 `OGS_CN_NGINX_IMAGE`、
-`OGS_CN_REDIS_IMAGE`、`OGS_CN_MYSQL_IMAGE` 分别覆盖完整镜像引用。
+大陆线路会从 DaoCloud 匿名公共镜像拉取 Redis、MySQL 官方镜像。该社区公共服务
+不承诺可用性 SLA；可用 `OGS_CN_REDIS_IMAGE`、`OGS_CN_MYSQL_IMAGE` 分别覆盖完整
+镜像引用。
 
 浏览器打开 `http://<服务器地址>:8080`。应用未配置时会进入 `/setup`，请使用
 向导创建的管理员登录；仅跳过向导并保留基线种子时才存在 `admin/admin`，必须

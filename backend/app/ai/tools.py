@@ -4,12 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
-from app.ai.storage import AgentStore, AgentStoreConflict
+from app.ai.storage import AgentStore
 
 
 MAX_QUERY_ROWS = 200
 MAX_PREVIEW_ROWS = 10
-MAX_BATCH_HOSTS = 50
 
 
 class ToolError(RuntimeError):
@@ -102,17 +101,6 @@ TOOL_DEFINITIONS = {
             "limit": {"type": "integer", "minimum": 1, "maximum": 50},
         },
         required=["log_type"],
-    ),
-    "prepare_batch_command": _tool(
-        "prepare_batch_command",
-        "为已有资产查询结果创建待用户确认的批量 SSH 命令计划。该工具不会直接执行命令。",
-        {
-            "result_set_id": {"type": "string"},
-            "sys_user": {"type": "string"},
-            "command": {"type": "string", "minLength": 1, "maxLength": 255},
-            "reason": {"type": "string", "minLength": 1, "maxLength": 120},
-        },
-        required=["result_set_id", "sys_user", "command", "reason"],
     ),
     "run_diagnostic": _tool(
         "run_diagnostic",
@@ -217,8 +205,6 @@ class ToolRegistry:
             raise ToolNotAllowed(f"unknown tool: {name}")
         if name in ADMIN_ONLY_TOOLS and self.role != "admin":
             raise ToolNotAllowed(f"tool requires admin role: {name}")
-        if name == "prepare_batch_command":
-            return self._prepare_batch_command(arguments)
         if name == "run_diagnostic":
             return self._run_diagnostic(arguments)
         if name == "create_autonomy_draft":
@@ -249,58 +235,6 @@ class ToolRegistry:
             "summary": data.summary,
             "preview": data.rows[:MAX_PREVIEW_ROWS],
             "truncated": len(data.rows) > MAX_PREVIEW_ROWS,
-        }
-
-    def _prepare_batch_command(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        required = ("result_set_id", "sys_user", "command", "reason")
-        missing = [name for name in required if not str(arguments.get(name) or "").strip()]
-        if missing:
-            raise ToolValidationError("missing required fields: " + ", ".join(missing))
-        result = self.store.get_result_set(self.owner, str(arguments["result_set_id"]))
-        if result.get("conversation_id") != self.conversation_id:
-            raise ToolValidationError("result set belongs to another conversation")
-        if result.get("kind") != "assets":
-            raise ToolValidationError("batch command requires an asset result set")
-        asset_ids = list(result.get("resource_ids") or [])
-        if not asset_ids:
-            raise ToolValidationError("asset result set is empty")
-        if len(asset_ids) > MAX_BATCH_HOSTS:
-            raise ToolValidationError(f"too many hosts (max {MAX_BATCH_HOSTS})")
-        if not self.platform.validate_asset_ids(asset_ids):
-            raise ToolValidationError("asset permission changed; query again")
-
-        sys_user = str(arguments["sys_user"]).strip()
-        if not self.platform.validate_asset_sys_user_pair(asset_ids, sys_user):
-            raise ToolValidationError(
-                "system user is not authorized for every target asset"
-            )
-        command = str(arguments["command"]).strip()
-        if len(command) > 255:
-            raise ToolValidationError("command is too long")
-        danger = self.command_checker(command)
-        if danger:
-            raise ToolValidationError(f"dangerous command blocked: {danger}")
-        reason = str(arguments["reason"]).strip()[:120]
-        try:
-            action = self.store.create_action(
-                self.owner,
-                self.conversation_id,
-                result["id"],
-                sys_user=sys_user,
-                command=command,
-                reason=reason,
-            )
-        except AgentStoreConflict as exc:
-            raise ToolValidationError(str(exc)) from exc
-        return {
-            "action_id": action["id"],
-            "status": action["status"],
-            "target_count": len(asset_ids),
-            "command": command,
-            "sys_user": sys_user,
-            "reason": reason,
-            "expires_at": action["expires_at"],
-            "requires_approval": True,
         }
 
     def _create_autonomy_draft(self, arguments: Dict[str, Any]) -> Dict[str, Any]:

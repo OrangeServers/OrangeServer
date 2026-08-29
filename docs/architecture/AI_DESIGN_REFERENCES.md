@@ -4,7 +4,7 @@ OrangeServer 的 AI 运维能力优先复用现有资产、凭据、SSH、审批
 下列成熟项目用于校验设计方向，不是运行时依赖，也不会被直接嵌入服务。
 
 > 本文同时讨论当前实现和未来方向。已发布能力包括固定只读诊断、人工审批动作，
-> 以及默认关闭的 M1 受控自治；监控、Docker 和 Kubernetes Adapter 仍属于
+> 以及 M1 受控自治；监控、Docker 和 Kubernetes Adapter 仍属于
 > [AI 运维路线图](../ai/ROADMAP.md)中的规划能力。
 
 ## 参考项目
@@ -33,7 +33,7 @@ toolset，并支持 Runbook 驱动的调查流程。OrangeServer 借鉴其“工
 
 [LangGraph persistence](https://docs.langchain.com/oss/python/langgraph/persistence)
 和 [interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts) 提供 checkpoint、
-暂停和恢复语义，用于已实现、默认关闭的长任务自治工作流。OrangeServer 不迁移现有聊天 Runner；
+暂停和恢复语义，用于已实现的长任务自治工作流。OrangeServer 不迁移现有聊天 Runner；
 LangGraph 只负责流程游标，MySQL 继续保存权威业务状态。
 
 [Celery](https://docs.celeryq.dev/en/stable/getting-started/introduction.html) 只负责把有界工作

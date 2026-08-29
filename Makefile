@@ -7,7 +7,7 @@
 #   make help         显示所有命令
 #   make install      安装前后端依赖
 #   make dev          启动开发模式（前后端 dev server）
-#   make build        构建生产产物（前端 dist + 后端 Docker 镜像）
+#   make build        构建生产镜像（镜像内完成前端构建）
 #   make build-frontend   仅构建前端（CI 拆分任务 / 部署前前端预编译）
 #   make build-backend    仅构建后端 Docker 镜像
 #   make test         跑测试
@@ -17,9 +17,7 @@
 #   make docker-down  docker compose 停止
 #   make clean        清理构建产物
 #
-# ⓘ 预编译原则：前端 dist/ 是 pre-build 产物，部署机不需 node/npm
-#   正式源码包/Release 应包含 dist；修改前端后由开发者或 CI 跑 make build-frontend
-#   部署机只挂载 frontend/dist/，不再跑 npm build
+# ⓘ 生产镜像在多阶段构建中生成前端 dist，Node 不进入运行镜像。
 # =============================================================================
 
 .PHONY: help install dev dev-backend dev-frontend build build-frontend build-backend test lint health docker-up docker-up-image docker-up-host docker-down docker-ps docker-logs docker-health setup-token docker-check docs-check docker-dev-init docker-dev-up docker-dev-autonomy-up docker-dev-autonomy-down docker-dev-autonomy-ps docker-dev-autonomy-logs docker-dev-down docker-dev-reset docker-dev-ps docker-dev-logs clean
@@ -65,7 +63,7 @@ dev-backend: ## 启动后端 dev server (:28000, 阻塞)
 dev-frontend: ## 启动前端 dev server (:5173, 阻塞)
 	cd $(FRONTEND) && npm run dev
 
-build: build-frontend build-backend ## 一站式构建（前端 dist + 后端 Docker 镜像）
+build: build-backend ## 一站式构建生产镜像
 
 build-frontend: ## 仅构建前端（CI 拆分任务 / 部署前前端预编译）
 	@echo ">>> 构建前端 dist (输出到 $(FRONTEND)/dist)..."
@@ -74,7 +72,7 @@ build-frontend: ## 仅构建前端（CI 拆分任务 / 部署前前端预编译�
 
 build-backend: ## 仅构建后端 Docker 镜像
 	@echo ">>> 构建后端 Docker 镜像..."
-	docker build -t orangeserver-backend:latest $(BACKEND)
+	docker build -t orangeserver-backend:latest -f "$(BACKEND)/Dockerfile" "$(ROOT)"
 	@echo "[OK] 后端镜像构建完成: orangeserver-backend:latest"
 
 test: ## 跑测试
@@ -95,7 +93,7 @@ docs-check: ## 文档链接与隐私检查 (需要 pwsh + ripgrep)
 	pwsh -File "$(OPS)/check-docs.ps1"
 
 docker-up: docker-check ## docker compose 启动 (生产, bundled 模式)
-	$(COMPOSE) --profile bundled up -d --build
+	$(COMPOSE) --profile bundled up -d --build --remove-orphans
 	@echo "[OK] 服务已启动，查看 make docker-ps"
 
 docker-up-image: docker-check ## 拉取已发布后端镜像并启动 (公开发布后使用)
@@ -110,14 +108,14 @@ docker-up-image: docker-check ## 拉取已发布后端镜像并启动 (公开发
 		exit 1; \
 	fi
 	$(IMAGE_COMPOSE) --profile bundled pull
-	$(IMAGE_COMPOSE) --profile bundled up -d --no-build
+	$(IMAGE_COMPOSE) --profile bundled up -d --no-build --remove-orphans
 	@echo "[OK] 已使用预构建后端镜像启动，查看 make docker-ps"
 
 # DEPLOY-AUDIT P1-1: host 模式 (外部 MySQL/Redis) 需要叠加 host.yml 提供
 #   host.docker.internal 解析; 之前文档给的裸命令缺该文件且绕过预检
 docker-up-host: ## docker compose 启动 (host 模式, 连接外部 MySQL/Redis)
 	@bash "$(OPS)/preflight-compose.sh" host
-	$(COMPOSE) -f "$(DEPLOY)/docker-compose.host.yml" up -d --build backend frontend
+	$(COMPOSE) -f "$(DEPLOY)/docker-compose.host.yml" up -d --build --remove-orphans app worker
 	@echo "[OK] host 模式已启动 (外部 MySQL/Redis)"
 
 docker-down: ## docker compose 停止
@@ -176,7 +174,7 @@ docker-health: ## docker compose 健康检查 (经前端端口)
 	curl -fsS "http://127.0.0.1:$${port:-8080}/local/health"
 
 setup-token: ## 读取首次初始化向导的一次性 Token
-	@$(COMPOSE) exec -T backend cat /app/data/setup_token.txt
+	@$(COMPOSE) exec -T app cat /app/data/setup_token.txt
 
 clean: ## 清理构建产物 (frontend/dist 是入仓制品, 不删)
 	find $(ROOT) -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

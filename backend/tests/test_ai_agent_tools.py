@@ -1,4 +1,4 @@
-"""AI Agent 工具注册与待审批动作的公开行为测试。"""
+"""AI Agent tool registration and read-only result-set behavior tests."""
 from __future__ import annotations
 
 from test_ai_agent_state import FakeRedis
@@ -80,7 +80,7 @@ def test_normal_user_does_not_receive_admin_only_tools():
     assert "search_accounts" not in names
     assert "search_audit_logs" not in names
     assert "search_assets" in names
-    assert "prepare_batch_command" in names
+    assert "prepare_batch_command" not in names
 
 
 def test_admin_receives_account_and_audit_tools():
@@ -279,75 +279,3 @@ def test_platform_overview_reads_online_status_in_one_batch(monkeypatch):
     assert requested == [[11, 12]]
     assert result.summary["online_count"] == 1
     assert result.summary["offline_count"] == 1
-
-
-def test_batch_command_creates_pending_action_from_server_result_set():
-    store, _, registry = _registry(allowed_ids=[1, 2])
-    query = registry.execute("search_assets", {})
-
-    response = registry.execute(
-        "prepare_batch_command",
-        {
-            "result_set_id": query["result_set_id"],
-            "sys_user": "ops",
-            "command": "df -h",
-            "reason": "磁盘巡检",
-        },
-    )
-
-    action = store.get_action("alice", response["action_id"])
-    assert action["status"] == "pending"
-    assert action["command"] == "df -h"
-    assert response["target_count"] == 2
-
-
-def test_batch_command_rejects_dangerous_command_and_unknown_sys_user():
-    from app.ai.tools import ToolValidationError
-
-    store, conversation, registry = _registry(allowed_ids=[1])
-    query = registry.execute("search_assets", {})
-    registry.command_checker = lambda command: "reboot" if "reboot" in command else None
-
-    for arguments in (
-        {
-            "result_set_id": query["result_set_id"],
-            "sys_user": "ops",
-            "command": "reboot",
-            "reason": "bad",
-        },
-        {
-            "result_set_id": query["result_set_id"],
-            "sys_user": "root-no-auth",
-            "command": "df -h",
-            "reason": "bad",
-        },
-    ):
-        try:
-            registry.execute("prepare_batch_command", arguments)
-        except ToolValidationError:
-            pass
-        else:
-            raise AssertionError("unsafe action must be rejected")
-
-
-def test_batch_command_rejects_cross_rule_asset_credential_pair():
-    from app.ai.tools import ToolValidationError
-
-    _, _, registry = _registry(allowed_ids=[1])
-    query = registry.execute("search_assets", {})
-    registry.platform.validate_asset_sys_user_pair = lambda _ids, _user: False
-
-    try:
-        registry.execute(
-            "prepare_batch_command",
-            {
-                "result_set_id": query["result_set_id"],
-                "sys_user": "ops",
-                "command": "df -h",
-                "reason": "跨规则凭据不应被允许",
-            },
-        )
-    except ToolValidationError:
-        pass
-    else:
-        raise AssertionError("asset and credential must share an authorization rule")

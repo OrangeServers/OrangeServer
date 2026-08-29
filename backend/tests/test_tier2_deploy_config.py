@@ -219,13 +219,12 @@ class TestDockerCompose:
     def compose(self):
         return (DEPLOY / "docker-compose.yml").read_text(encoding="utf-8")
 
-    def test_01_compose_has_core_and_autonomy_services(self, compose):
-        """bundled 栈含业务四件套与自治 Redis/Worker"""
-        for svc in (
-            "backend", "frontend", "redis", "mysql",
-            "autonomy-redis", "autonomy-worker",
-        ):
+    def test_01_compose_has_four_product_services(self, compose):
+        """bundled 栈仅含 app、worker、Redis 和 MySQL。"""
+        for svc in ("app", "worker", "redis", "mysql"):
             assert f"  {svc}:" in compose, f"docker-compose 缺服务: {svc}"
+        assert "  frontend:" not in compose
+        assert "  autonomy-redis:" not in compose
 
     def test_02_compose_has_internal_network(self, compose):
         """必须有内部 network (backend/redis/mysql 隔离)"""
@@ -252,22 +251,18 @@ class TestDockerCompose:
         """mysql 必须 utf8mb4 (emoji + 中文)"""
         assert "utf8mb4" in compose
 
-    def test_07_compose_backend_binds_to_backend_network(self, compose):
-        """backend 不能直接暴露 28000 到公网 (仅 expose)"""
-        # 找 backend 段: 找到 "  backend:" 行, 直到下一个 "  <service>:" 行
-        backend_idx = compose.find("  backend:")
-        if backend_idx < 0:
-            pytest.skip("backend service not found")
-        # 找到下一个 service 段开头 (2 空格 + 单词 + 冒号)
-        # 跳过 backend 自身到下一行
-        body_start = compose.find("\n", backend_idx) + 1
+    def test_07_compose_app_publishes_the_http_port(self, compose):
+        """app 直接提供 API、WebSocket 和内置 SPA。"""
+        app_idx = compose.find("  app:")
+        assert app_idx >= 0
+        body_start = compose.find("\n", app_idx) + 1
         # 找下一个 "  <word>:" 段开头
         service_re = re.compile(r'\n  \w[\w-]*:\s', re.MULTILINE)
         m = service_re.search(compose, body_start)
         next_service = m.start() if m else len(compose)
-        backend_section = compose[backend_idx:next_service]
-        # 必须有 expose (仅 network 可见)
-        assert "expose:" in backend_section, "backend 服务必须用 expose 而非 ports"
+        app_section = compose[app_idx:next_service]
+        assert "ports:" in app_section
+        assert '"${OGS_HTTP_PORT:-8080}:28000"' in app_section
 
 
 # =============================================================================
