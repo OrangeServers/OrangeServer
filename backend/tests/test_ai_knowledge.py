@@ -12,6 +12,7 @@ from app.ai.knowledge import (
     KnowledgeService,
     KnowledgeValidationError,
     _chunks,
+    _missing_index_error,
 )
 from app.core.db.database import (
     db,
@@ -72,6 +73,15 @@ def test_markdown_splitter_is_bounded_and_overlapping():
     assert len(chunks) >= 3
     assert all(0 < len(item['text']) <= CHUNK_SIZE for item in chunks)
     assert chunks[0]['text'][-CHUNK_OVERLAP:] == chunks[1]['text'][:CHUNK_OVERLAP]
+
+
+@pytest.mark.parametrize(('message', 'expected'), [
+    ('Unknown Index name', True),
+    ('SEARCH_INDEX_NOT_FOUND Index not found: vectors', True),
+    ('authentication required', False),
+])
+def test_missing_index_error_supports_redis_versions(message, expected):
+    assert _missing_index_error(RuntimeError(message)) is expected
 
 
 def test_document_lifecycle_reindex_and_search_filter(knowledge_env):

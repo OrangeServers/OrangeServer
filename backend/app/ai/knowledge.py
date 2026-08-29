@@ -191,6 +191,11 @@ def _embed(row: Any, texts: Iterable[str]) -> list[list[float]]:
     return vectors
 
 
+def _missing_index_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return 'unknown index name' in message or 'index not found' in message
+
+
 @contextmanager
 def _redis_store(row: Any, *, reset: bool = False):
     from langgraph.store.redis import RedisStore
@@ -211,7 +216,7 @@ def _redis_store(row: Any, *, reset: bool = False):
                 try:
                     store._redis.execute_command('FT.DROPINDEX', index_name, 'DD')
                 except ResponseError as exc:
-                    if 'unknown index name' not in str(exc).lower():
+                    if not _missing_index_error(exc):
                         raise
         store.setup()
         yield store
