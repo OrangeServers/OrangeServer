@@ -732,6 +732,20 @@ def test_stream_delivers_incrementally_until_terminal(api, monkeypatch):
     assert repo.list_events_cursors == [0, 2]
 
 
+def test_stream_keepalive_flushes_idle_running_connection(api, monkeypatch):
+    client, state = api
+    _enable(monkeypatch, True)
+    monkeypatch.setattr(views, "STREAM_POLL_SECONDS", 0.001)
+    repo = StreamRepo(_stream_events(), status="running", flips_after=2)
+    state["repo"] = repo
+
+    response = client.get("/ai/autonomous-runs/r1/stream")
+    body = response.get_data(as_text=True)
+
+    assert ": keepalive\n\n" in body
+    assert "event: terminal" in body
+
+
 def test_stream_closes_on_max_lifetime_even_when_still_running(
     api, monkeypatch,
 ):

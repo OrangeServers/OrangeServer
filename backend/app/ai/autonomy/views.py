@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # M1/S3 切片 5：可续传 SSE 的轮询参数。事件回放靠 MySQL 单调
 # sequence，重连不重复业务转换；连接到期即关闭，客户端携
 # Last-Event-ID 重连续传。测试可调为 0/极小值。
-STREAM_POLL_SECONDS = 1.0
+STREAM_POLL_SECONDS = 2.0
 STREAM_MAX_SECONDS = 300.0
 
 
@@ -705,6 +705,9 @@ def _stream_generator(owner, run_id, after_seq):
         finally:
             _drain_db_session()
         if STREAM_POLL_SECONDS > 0:
+            # Standard SSE comment: flushes the connection and detects peers
+            # that disappeared while no business event was emitted.
+            yield ': keepalive\n\n'
             time.sleep(STREAM_POLL_SECONDS)
 
 
