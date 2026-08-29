@@ -144,8 +144,8 @@ REDIS_CONF = {
     'password': _env('OGS_REDIS_PASSWORD', ''),
     # H13: db 索引配置化, 避免测试/生产共用 db=10 导致 key 冲突
     'db': int(_env('OGS_REDIS_DB', '2')),
-    # 连接池上限
-    'max_connections': int(_env('OGS_REDIS_MAX_CONNECTIONS', '10')),
+    # 连接池上限；覆盖 100 路 SSE 与普通 API 的并发会话校验峰值。
+    'max_connections': int(_env('OGS_REDIS_MAX_CONNECTIONS', '256')),
     # H14: socket 维度的 timeout / keepalive, 防止单次操作 hang 或长连接被切断
     'socket_timeout': float(_env('OGS_REDIS_SOCKET_TIMEOUT', '5')),
     'socket_connect_timeout': float(_env('OGS_REDIS_CONNECT_TIMEOUT', '5')),

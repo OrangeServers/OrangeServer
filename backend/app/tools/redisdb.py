@@ -26,7 +26,7 @@ _REDIS_RETRY_LOGGER = 'redis_retry'
 #      - db: 避免测试/生产共用 db=10 冲突
 #      - socket_keepalive/socket_timeout/socket_connect_timeout: 防 hang 与长连接切断
 #   4) decode_responses=True: 业务层拿到 str, 不需每次 .decode(), 与 ORM 字符串语义一致
-#   5) max_connections 默认 50 (从 REDIS_CONF 读): 单实例峰值并发不会触发 'Too many connections'
+#   5) max_connections 默认 256 (从 REDIS_CONF 读): 覆盖 100 路 SSE 与普通 API 的并发会话校验峰值
 # =============================================================================
 _shared_pool = redis.ConnectionPool(
     host=REDIS_CONF['host'],

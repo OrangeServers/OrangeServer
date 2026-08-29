@@ -147,10 +147,14 @@ def test_standard_compose_is_four_containers_with_one_redis():
     ) == 2
     assert compose.count("OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-redis}") == 2
     assert compose.count("OGS_REDIS_DB: ${OGS_REDIS_DB:-2}") == 2
+    assert compose.count(
+        "OGS_REDIS_MAX_CONNECTIONS: ${OGS_REDIS_MAX_CONNECTIONS:-256}",
+    ) == 2
     assert 'OGS_PROXY_LAYERS: "0"' in compose
     assert "OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}" in compose
     assert "autonomy-redis-data:" in compose
     assert "OGS_AI_AUTONOMY_ENABLED=" in env_example
+    assert "OGS_REDIS_MAX_CONNECTIONS=256" in env_example
     assert "OGS_AI_AUTONOMY_REDIS_PASSWORD=" not in env_example
     assert "OGS_AI_AUTONOMY_ENABLED=" in backend_env
 
