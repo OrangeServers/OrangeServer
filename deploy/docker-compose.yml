@@ -117,17 +117,12 @@ services:
     environment:
       OGS_REDIS_PASSWORD: ${OGS_REDIS_PASSWORD:-}
     command:
-      - redis-server
-      - --appendonly
-      - "yes"
-      - --appendfsync
-      - everysec
-      - --maxmemory
-      - 512mb
-      - --maxmemory-policy
-      - volatile-lru
-      - --requirepass
-      - ${OGS_REDIS_PASSWORD:-}
+      - sh
+      - -c
+      - >-
+        exec docker-entrypoint.sh redis-server --appendonly yes --appendfsync everysec
+        --maxmemory 512mb --maxmemory-policy volatile-lru --requirepass
+        "$$OGS_REDIS_PASSWORD"
     volumes:
       # Keep the M1 volume name so existing LangGraph checkpoints survive.
       - autonomy-redis-data:/data

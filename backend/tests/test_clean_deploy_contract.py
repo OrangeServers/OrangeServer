@@ -137,11 +137,10 @@ def test_standard_compose_is_four_containers_with_one_redis():
     assert "  autonomy-redis:" not in compose
     assert "redis:8.10.0" in compose
     assert "redis:8.10.0-alpine" not in compose
-    assert "command:\n      - redis-server" in redis_service
-    assert "\n      - sh\n" not in redis_service
-    assert "--appendonly\n      - \"yes\"" in redis_service
-    assert "--maxmemory-policy\n      - volatile-lru" in redis_service
-    assert "--requirepass\n      - ${OGS_REDIS_PASSWORD:-}" in redis_service
+    assert "docker-entrypoint.sh redis-server --appendonly yes" in redis_service
+    assert "--maxmemory-policy volatile-lru" in redis_service
+    assert '"$$OGS_REDIS_PASSWORD"' in redis_service
+    assert "--requirepass\n      - ${OGS_REDIS_PASSWORD:-}" not in redis_service
     assert "app.ai.autonomy.celery_entry:celery_app" in compose
     assert compose.count(
         "OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-true}",
