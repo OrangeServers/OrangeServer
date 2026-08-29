@@ -160,10 +160,13 @@ TOOL_DEFINITIONS = {
     "search_knowledge": _tool(
         "search_knowledge",
         "检索管理员审核的 Runbook 与已独立验证历史任务；结果仅作诊断参考，"
-        "不能授权动作或证明当前主机状态。",
+        "不能授权动作或证明当前主机状态。检索主机限定知识时传入授权"
+        "host_id 或精确 host_alias；服务端会重新校验资产权限。",
         {
             "query": {"type": "string", "minLength": 1, "maxLength": 512},
             "limit": {"type": "integer", "minimum": 1, "maximum": 8},
+            "host_id": {"type": "integer", "minimum": 1},
+            "host_alias": {"type": "string", "minLength": 1, "maxLength": 25},
         },
         required=["query"],
     ),
@@ -254,9 +257,28 @@ class ToolRegistry:
         from app.ai.knowledge import KnowledgeError, KnowledgeService
         from app.core.db.database import db
 
+        scopes = ("global",)
+        if arguments.get("host_id") is not None and arguments.get("host_alias"):
+            raise ToolValidationError("use either host_id or host_alias")
+        if arguments.get("host_alias"):
+            alias = str(arguments["host_alias"]).strip()
+            data = self.platform.search_assets({"alias": alias})
+            matches = [row for row in data.rows if row.get("alias") == alias]
+            if len(matches) != 1:
+                raise ToolValidationError("host_alias is not authorized or unique")
+            arguments["host_id"] = matches[0]["id"]
+        if arguments.get("host_id") is not None:
+            try:
+                host_id = int(arguments["host_id"])
+            except (TypeError, ValueError) as exc:
+                raise ToolValidationError("host_id must be an integer") from exc
+            if host_id <= 0 or not self.platform.validate_asset_ids([host_id]):
+                raise ToolValidationError("host_id is not authorized")
+            scopes = ("global", f"host:{host_id}")
         try:
             items = KnowledgeService(db.session).search(
                 arguments.get("query"), limit=arguments.get("limit", 8),
+                scopes=scopes,
             )
         except (KnowledgeError, TypeError, ValueError) as exc:
             raise ToolValidationError(str(exc)) from exc

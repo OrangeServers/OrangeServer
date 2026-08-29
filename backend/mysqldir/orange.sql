@@ -163,6 +163,7 @@ CREATE TABLE `t_ai_autonomous_run` (
   `custom_profile_json` text DEFAULT NULL,
   `status` varchar(20) NOT NULL,
   `outcome` varchar(16) DEFAULT NULL,
+  `conclusion_json` text DEFAULT NULL,
   `revision` int NOT NULL DEFAULT 0,
   `budget_json` text NOT NULL,
   `latest_event_seq` int NOT NULL DEFAULT 0,

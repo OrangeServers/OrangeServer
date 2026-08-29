@@ -178,6 +178,12 @@ mysql -h <mysql-host> -u <mysql-user> -p <database> \
 
 mysql -h <mysql-host> -u <mysql-user> -p <database> \
   < backend/mysqldir/rev58_ai_knowledge.sql
+
+mysql -h <mysql-host> -u <mysql-user> -p <database> \
+  < backend/mysqldir/rev59_ai_autonomy_conclusion.sql
+
+mysql -h <mysql-host> -u <mysql-user> -p <database> \
+  < backend/mysqldir/rev60_admin_all_permissions.sql
 ```
 
 顺序不可颠倒：rev49 修改 rev48 创建的 `t_ai_provider`，rev50 增加受控诊断的
@@ -187,9 +193,13 @@ zh-CN，存量行为不变），rev52 增加由管理界面维护的 SMTP 配置
 产物四张表；rev54 为自治 Run 表追加 Worker 租约、一次性 fencing token、心跳与
 图版本列（M1/S2），rev55 为自治 Run 表追加可选的自定义权限档案列，rev56 增加
 脱敏 Evidence 引用表（M1/S3），rev57 为 Run 增加触发类型、幂等引用和脱敏触发
-摘要（M2/S1），rev58 增加 embedding 单例配置和已审核知识文档表（M2/S2）；
+摘要（M2/S1），rev58 增加 embedding 单例配置和已审核知识文档表（M2/S2），
+rev59 为 Run 增加结构化结论详情（M2），rev60 幂等回填存量管理员到现有
+“所有权限”规则，避免自定义管理员名仍沿用旧 `admin` 权限关系；
 Redis 向量是可重建数据，不需要数据库 chunk 表。标准 bundled 栈会启动统一 Redis 8
 与 Worker，自治能力默认可用。
+embedding 模型、维度或向量索引布局变化时，知识库会自动显示“索引待更新”；管理员
+执行一次知识库重建后才恢复检索，旧布局不会被误报为可用。
 各脚本针对其自身变更设计了重复执行保护，但重复运行前仍应
 确认输出和目标数据库正确。
 
@@ -239,6 +249,7 @@ SHOW COLUMNS FROM t_ai_autonomous_run LIKE 'active_host_id';
 SHOW INDEX FROM t_ai_autonomous_run
 WHERE Key_name = 'uq_ai_auto_run_active_host';
 SHOW COLUMNS FROM t_ai_autonomous_run LIKE 'custom_profile_json';
+SHOW COLUMNS FROM t_ai_autonomous_run LIKE 'conclusion_json';
 SHOW TABLES LIKE 't_ai_autonomous_evidence';
 SHOW TABLES LIKE 't_ai_embedding_config';
 SHOW TABLES LIKE 't_ai_knowledge_document';
@@ -251,6 +262,17 @@ SELECT
     context_window_tokens
 FROM t_ai_provider
 ORDER BY provider_code;
+
+SELECT admin_user.name AS admin_without_all_permissions
+FROM t_acc_user AS admin_user
+LEFT JOIN t_auth_host AS all_auth
+  ON all_auth.name = '所有权限' AND all_auth.is_deleted = 0
+LEFT JOIN t_auth_host_user AS binding
+  ON binding.auth_id = all_auth.id
+ AND binding.user_name = admin_user.name
+WHERE admin_user.usrole = 'admin' AND admin_user.is_deleted = 0
+GROUP BY admin_user.name
+HAVING COUNT(binding.id) = 0;
 ```
 
 预期：
@@ -263,9 +285,11 @@ ORDER BY provider_code;
 - `t_ai_autonomous_run.active_host_id` 是生成列，且存在
   `uq_ai_auto_run_active_host` 唯一索引；
 - `t_ai_autonomous_run.custom_profile_json` 和
+  `t_ai_autonomous_run.conclusion_json` 存在；
   `t_ai_autonomous_evidence` 存在；Evidence 的 `trusted` 默认值为 `0`；
 - `t_ai_embedding_config` 只有默认本地模型配置，且
   `t_ai_knowledge_document` 已创建；
+- `admin_without_all_permissions` 查询返回空结果；
 - 查询结果中不应出现明文 API Key。
 
 ## 5. 启动和冒烟验证
@@ -319,7 +343,7 @@ make docker-health
 
 - 应用启动失败但 schema 向后兼容时，可先恢复上一镜像。
 - 如果旧应用不能识别新 schema，停止写入后恢复升级前 MySQL 备份。
-- rev48/rev49/rev50/rev53/rev54/rev55/rev56/rev57/rev58 不提供自动 down migration；
+- rev48/rev49/rev50/rev53/rev54/rev55/rev56/rev57/rev58/rev59 不提供自动 down migration；
   不要在生产手工删除列或表。rev58 的 Redis 向量可从 MySQL 文档重建。
 - 恢复数据库前先保留失败现场的日志和当前数据库快照。
 - Release bundle 安装可停止前后端，将当前安装目录移回

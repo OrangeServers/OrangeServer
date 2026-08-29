@@ -463,7 +463,7 @@ def test_rev54_autonomy_migration_matches_baseline_and_orm():
 
 
 def test_autonomy_run_migrations_match_baseline_and_orm():
-    """rev53+rev54+rev55+rev57、orange.sql 与 ORM 列集合一致。"""
+    """自治 Run 迁移、orange.sql 与 ORM 列集合一致。"""
     from app.core.db.database import db
 
     def migration_columns(path):
@@ -502,12 +502,14 @@ def test_autonomy_run_migrations_match_baseline_and_orm():
     assert rev57_added == {
         "trigger_type", "trigger_ref", "trigger_summary",
     }
+    rev59_added = migration_columns("rev59_ai_autonomy_conclusion.sql")
+    assert rev59_added == {"conclusion_json"}
     baseline_columns = create_columns(schema, "t_ai_autonomous_run")
     orm_columns = set(
         db.metadata.tables["t_ai_autonomous_run"].columns.keys()
     )
     assert (
-        rev53_columns | rev54_added | added | rev57_added
+        rev53_columns | rev54_added | added | rev57_added | rev59_added
         == baseline_columns == orm_columns
     )
 
@@ -518,6 +520,7 @@ def test_autonomy_run_migrations_match_baseline_and_orm():
     )
     assert run_ddl, "orange.sql must define t_ai_autonomous_run"
     assert "`custom_profile_json` text DEFAULT NULL" in run_ddl.group(1)
+    assert "`conclusion_json` text DEFAULT NULL" in run_ddl.group(1)
     assert "UNIQUE KEY `uq_ai_auto_run_trigger`" in run_ddl.group(1)
 
     rev57 = (
@@ -605,6 +608,18 @@ def test_rev58_knowledge_tables_match_fresh_schema_and_orm():
     assert "BAAI/bge-small-zh-v1.5" in migration
     assert "09b6e5dccb3cf9c17b68c4493ceb1cf6eb4c6980e8a429a8c3343d46932e75ec" in migration
     assert "`content` longtext NOT NULL" in migration
+
+
+def test_rev60_backfills_all_active_admins_into_all_permissions():
+    migration = (
+        BACKEND / "mysqldir" / "rev60_admin_all_permissions.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "SET NAMES utf8mb4;" in migration
+    assert "INSERT IGNORE INTO `t_auth_host_user`" in migration
+    assert "admin_user.`usrole` = 'admin'" in migration
+    assert "admin_user.`is_deleted` = 0" in migration
+    assert "all_auth.`name` = '所有权限'" in migration
 
 
 def test_dockerfile_pins_and_verifies_local_embedding_model():

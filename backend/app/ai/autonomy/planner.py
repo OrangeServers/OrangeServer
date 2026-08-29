@@ -220,7 +220,10 @@ def _repair_message(tool_name, context=None):
             'inconclusive，evidence_ids 必须是非空数组，并且只能逐字引用'
             '已有 Evidence 摘要中标记为 id= 的同一 Run Evidence ID；不要引用'
             'artifact ID、step ID、digest 或自行编造 ID。若无法确定结果，'
-            '使用 inconclusive，但仍引用最近的验证观察 Evidence。'
+            '使用 inconclusive，但仍引用最近的验证观察 Evidence。还必须提供'
+            ' confirmed_facts、impact_scope、root_cause_hypothesis、confidence、'
+            'unknowns 和 recommended_actions；无法确认的内容明确写“未知”，'
+            '不要省略字段。'
             + evidence_hint
         )
     return ''
@@ -426,7 +429,37 @@ def proposal_tool_schemas(context=None):
                             'maxItems': CONCLUSION_MAX_CITATIONS,
                             'items': finish_evidence_items,
                         },
+                        'confirmed_facts': {
+                            'type': 'array', 'maxItems': 8,
+                            'items': {'type': 'string', 'maxLength': 240},
+                        },
+                        'impact_scope': {
+                            'type': 'string', 'minLength': 1,
+                            'maxLength': 512,
+                        },
+                        'root_cause_hypothesis': {
+                            'type': 'string', 'minLength': 1,
+                            'maxLength': 512,
+                        },
+                        'confidence': {
+                            'type': 'string',
+                            'enum': ['low', 'medium', 'high'],
+                        },
+                        'unknowns': {
+                            'type': 'array', 'maxItems': 8,
+                            'items': {'type': 'string', 'maxLength': 240},
+                        },
+                        'recommended_actions': {
+                            'type': 'array', 'maxItems': 8,
+                            'items': {'type': 'string', 'maxLength': 240},
+                        },
                     },
+                    'required': [
+                        'outcome', 'evidence_ids', 'confirmed_facts',
+                        'impact_scope', 'root_cause_hypothesis', 'confidence',
+                        'unknowns', 'recommended_actions',
+                    ],
+                    'additionalProperties': False,
                 },
             },
         },
@@ -693,18 +726,20 @@ class ToolCallingPlanner:
     def _conclude(self, context, arguments):
         """收尾可附带终局结论；权威复核全在 repository.conclude_run。
 
-        纯 finish（无结论字段）保持旧语义：服务端默认兜底。结论
-        结构非法或引用不存在的证据一律 fail-closed，绝不落半截
-        结论。
+        finish 必须携带完整结论；结构非法或引用不存在的证据一律
+        fail-closed，绝不落半截结论。
         """
         outcome = arguments.get('outcome')
         evidence_ids = arguments.get('evidence_ids')
-        if outcome is None and evidence_ids is None:
-            return
+        detail_fields = (
+            'confirmed_facts', 'impact_scope', 'root_cause_hypothesis',
+            'confidence', 'unknowns', 'recommended_actions',
+        )
         if (
             str(outcome or '') not in CONCLUSION_OUTCOMES
             or not isinstance(evidence_ids, list)
             or not evidence_ids
+            or any(field not in arguments for field in detail_fields)
         ):
             raise PlannerProposalError(
                 REASON_MALFORMED_PROPOSAL,
@@ -717,6 +752,7 @@ class ToolCallingPlanner:
                 str(context.get('run_id') or ''),
                 str(outcome),
                 [str(item) for item in evidence_ids],
+                {field: arguments[field] for field in detail_fields},
             )
         except AutonomyValidationError as exc:
             logger.info(

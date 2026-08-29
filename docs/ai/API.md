@@ -151,9 +151,11 @@ PromQL。返回的 Evidence/Artifact 不包含 Prometheus 地址、认证信息�
 固定边界为：单文档 1 MiB、分片 400 字符并重叠 60、检索最多 8 条、注入模型上下文
 最多 16 KiB。只允许 `runbook` 和 `verified_run` 来源。列表接口不返回正文；读取或编辑
 时使用单文档接口。索引状态为 `empty | ready | stale | rebuilding | error`，只有
-`ready` 且文档版本、模型 fingerprint 一致时才返回引用。
+`ready` 且文档版本、模型及索引布局 fingerprint 一致时才返回引用；布局变化会
+自动显示为 `stale`，重建完成前不会查询旧布局。
 
-文档范围只接受 `global` 或 `host:<资产 ID>`。聊天检索仅使用 `global`；Autonomy
+文档范围只接受 `global` 或 `host:<资产 ID>`。聊天检索默认使用 `global`；工具参数提供
+当前管理员有权访问的 `host_id` 或精确 `host_alias` 时，也使用对应资产范围。Autonomy
 Planner 仅使用 `global` 和当前 Run 的目标资产范围。
 
 聊天提供管理员工具 `search_knowledge`。Autonomy Planner 会用 Run 目标检索最多 4 条
@@ -222,7 +224,10 @@ Planner 仅使用 `global` 和当前 Run 的目标资产范围。
 Run 快照包含目标和凭据的服务端绑定、权限模式、预算、状态、三态结论、`trigger_type`、
 脱敏的 `trigger_summary`、`revision`、
 `graph_version`、最新事件序号、取消请求和时间戳；每个 Step 包含 `kind`、状态、顺序、
-人类可读摘要、动作 digest 和受限备注。`GET /ai/autonomous-runs/{run_id}` 返回的
+人类可读摘要、动作 digest 和受限备注；待审批计划还返回从签名快照生成的
+`plan_actions` 完整动作参数，操作者不需要从被截断的模型摘要猜测实际动作。参数不含
+凭据引用；文件补丁内容命中常见密码、Token、Authorization 或私钥模式时服务端直接拒绝。
+`GET /ai/autonomous-runs/{run_id}` 返回的
 `steps` 按 `seq` 排序，`allowed_operations` 为空表示当前没有待决策操作。
 
 状态集合：
@@ -238,19 +243,22 @@ SSE 事件使用 MySQL 内的 Run 级单调 `sequence`。客户端断线后应�
 
 结论由服务端 Planner/Worker 写入，不提供客户端直接改写结论的接口。`resolved` 必须
 至少引用同一 Run 的 `verification_observation`；存在 `outcome_unknown` 写动作或缺少
-独立验证时，服务端会降级为 `inconclusive`，绝不自动重放写动作。
+独立验证时，服务端会降级为 `inconclusive`，绝不自动重放写动作。`conclusion`
+对新结论固定包含已确认事实、影响范围、根因假设、置信度、未知项、推荐动作、最终
+状态和同 Run Evidence ID 引用；所有文本和列表均有服务端上限并经过凭据脱敏。rev59
+以前已结束的历史 Run 没有这些字段时，`conclusion` 为 `null`。
 
 ### M1 持久化数据结构
 
 全新安装由 `backend/mysqldir/orange.sql` 一次创建；已有实例按
 [统一升级流程](../operations/UPGRADE.md) 依次执行 rev53、rev54、rev55、rev56、rev57、
-rev58。表是业务事实源，Redis 8 保存 LangGraph checkpoint、Celery broker 和可重建
+rev58、rev59。表是业务事实源，Redis 8 保存 LangGraph checkpoint、Celery broker 和可重建
 知识向量。
 
 | 表/字段 | 用途 | 关键约束 |
 |---|---|---|
 | `t_host.ai_environment` | 资产环境 | `production\|staging\|lab`，默认 `production`，仅管理员维护 |
-| `t_ai_autonomous_run` | Run 权威快照 | 目标资产/系统用户、`mode`/`custom_profile_json`、触发类型/幂等引用/脱敏摘要、状态/结论、预算、`revision`/事件游标、租约 fencing、心跳和 `graph_version`；活动状态按 `active_host_id` 唯一约束封住同资产并行 Run |
+| `t_ai_autonomous_run` | Run 权威快照 | 目标资产/系统用户、`mode`/`custom_profile_json`、触发类型/幂等引用/脱敏摘要、状态/`conclusion_json`、预算、`revision`/事件游标、租约 fencing、心跳和 `graph_version`；活动状态按 `active_host_id` 唯一约束封住同资产并行 Run |
 | `t_ai_autonomous_step` | 有序计划、动作和验证 | `(run_id, seq)` 唯一；保存不可变动作摘要/digest、审批状态和有限备注 |
 | `t_ai_autonomous_event` | Run 内追加式事件 | `(run_id, sequence)` 唯一且单调；payload 不保存凭据 |
 | `t_ai_autonomous_artifact` | 加密执行产物 | 输出清洗、脱敏、限长后以 Fernet 密文保存；正文单条读取并按 `expires_at` 过期 |

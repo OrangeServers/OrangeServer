@@ -122,6 +122,14 @@
             {{ t('aiRuns.detail.conclusion.evidenceFact') }}
           </span>
         </div>
+        <dl v-if="conclusionDetails.length" class="run-conclusion-details">
+          <div v-for="item in conclusionDetails" :key="item.key">
+            <dt>{{ t(`aiRuns.detail.conclusion.${item.key}`) }}</dt>
+            <dd :class="{ 'run-mono': item.mono }">
+              {{ item.values.length ? item.values.join('；') : '—' }}
+            </dd>
+          </div>
+        </dl>
       </section>
 
       <!-- 流程光标轨：六阶段完全由服务端快照推导 -->
@@ -190,6 +198,11 @@
           <el-tag size="small" effect="plain">{{ stepKindLabel(waitingStep.kind) }}</el-tag>
           <span class="run-approval-summary">{{ waitingStep.summary }}</span>
         </div>
+        <ol v-if="waitingStep.plan_actions?.length" class="run-approval-plan">
+          <li v-for="(action, index) in waitingStep.plan_actions" :key="`${index}:${action}`">
+            <code>{{ action }}</code>
+          </li>
+        </ol>
         <div v-if="waitingStep.action_digest" class="run-approval-digest run-mono">
           sha256:{{ waitingStep.action_digest }}
         </div>
@@ -579,6 +592,28 @@ const conclusionSummary = computed(() => {
     case 'inconclusive': return t('aiRuns.detail.conclusion.inconclusiveSummary', params)
     default: return t('aiRuns.detail.conclusion.pendingSummary', params)
   }
+})
+
+const conclusionDetails = computed<Array<{
+  key: string
+  values: string[]
+  mono?: boolean
+}>>(() => {
+  const conclusion = snapshot.value?.conclusion
+  if (!conclusion) return []
+  return [
+    { key: 'confirmedFacts', values: conclusion.confirmed_facts },
+    { key: 'impactScope', values: [conclusion.impact_scope] },
+    { key: 'rootCauseHypothesis', values: [conclusion.root_cause_hypothesis] },
+    {
+      key: 'confidence',
+      values: [t(`aiRuns.detail.conclusion.confidenceValue.${conclusion.confidence}`)],
+    },
+    { key: 'unknowns', values: conclusion.unknowns },
+    { key: 'recommendedActions', values: conclusion.recommended_actions },
+    { key: 'finalStatus', values: [t(`aiRuns.outcome.${conclusion.final_status}`)] },
+    { key: 'evidenceRefs', values: conclusion.evidence_ids, mono: true },
+  ]
 })
 
 function stepForId(stepId: string | null): AutonomyStep | null {
@@ -1026,6 +1061,23 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 .run-conclusion-facts strong { color: var(--ogs-text); font-family: var(--ogs-mono); }
+.run-conclusion-details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 18px;
+  margin: 14px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--ogs-border);
+}
+.run-conclusion-details div { min-width: 0; }
+.run-conclusion-details dt { color: var(--ogs-text-tertiary); font-size: 12px; }
+.run-conclusion-details dd {
+  margin: 3px 0 0;
+  color: var(--ogs-text);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
 
 /* ---- 流程光标轨（signature）：六阶段服务端推导，活动阶段脉冲 ---- */
 .phase-rail {
@@ -1157,6 +1209,9 @@ onBeforeUnmount(() => {
 .run-approval-hint { font-size: 12px; color: var(--ogs-text-secondary); }
 .run-approval-step { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .run-approval-summary { font-size: 13px; color: var(--ogs-text); }
+.run-approval-plan { margin: 0; padding-left: 24px; color: var(--ogs-text); }
+.run-approval-plan li + li { margin-top: 6px; }
+.run-approval-plan code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .run-approval-digest {
   font-size: 11px;
   color: var(--ogs-text-tertiary);
@@ -1409,6 +1464,7 @@ onBeforeUnmount(() => {
 
 @media (max-width: 640px) {
   .run-conclusion { padding: 14px; }
+  .run-conclusion-details { grid-template-columns: 1fr; }
   .run-conclusion-head { flex-direction: column; gap: 8px; }
   .run-conclusion-title { font-size: 16px; }
   .run-step { padding: 10px 12px; gap: 8px; }

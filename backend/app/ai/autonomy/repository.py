@@ -68,6 +68,7 @@ from app.ai.autonomy.state import (
     assert_run_transition,
     assert_step_transition,
 )
+from app.ai.diagnostic_adapters import sanitize_evidence
 
 
 class AutonomyError(Exception):
@@ -111,6 +112,10 @@ EVIDENCE_KINDS = frozenset({
 })
 EVIDENCE_SUMMARY_CHARS = 500
 MAX_EVIDENCE_CITATIONS = 16
+CONCLUSION_ITEM_LIMIT = 8
+CONCLUSION_ITEM_CHARS = 240
+CONCLUSION_TEXT_CHARS = 512
+CONCLUSION_CONFIDENCE = frozenset({'low', 'medium', 'high'})
 RUN_TRIGGER_TYPES = frozenset({'manual', 'chat', 'alertmanager'})
 
 
@@ -175,6 +180,65 @@ def _is_trigger_unique_violation(exc: IntegrityError) -> bool:
 def sanitize_text(value: str) -> str:
     """清洗控制字符（保留换行/制表），防 ANSI 注入。"""
     return _CONTROL_CHARS_RE.sub('', str(value or ''))
+
+
+def _conclusion_text(value: Any, field: str) -> str:
+    text = sanitize_evidence(value).strip()
+    if not text:
+        raise AutonomyValidationError('%s is required' % field)
+    return text[:CONCLUSION_TEXT_CHARS]
+
+
+def _conclusion_items(value: Any, field: str) -> List[str]:
+    if not isinstance(value, list) or len(value) > CONCLUSION_ITEM_LIMIT:
+        raise AutonomyValidationError('%s must be a bounded list' % field)
+    return [
+        _conclusion_text(item, field)[:CONCLUSION_ITEM_CHARS]
+        for item in value
+    ]
+
+
+def normalize_conclusion_details(value: Any) -> Dict[str, Any]:
+    """Validate the model-authored, operator-facing conclusion fields."""
+    if not isinstance(value, dict):
+        raise AutonomyValidationError('conclusion details must be an object')
+    required = {
+        'confirmed_facts', 'impact_scope', 'root_cause_hypothesis',
+        'confidence', 'unknowns', 'recommended_actions',
+    }
+    if set(value) != required:
+        raise AutonomyValidationError('conclusion details fields mismatch')
+    confidence = str(value.get('confidence') or '')
+    if confidence not in CONCLUSION_CONFIDENCE:
+        raise AutonomyValidationError('unknown conclusion confidence')
+    return {
+        'confirmed_facts': _conclusion_items(
+            value.get('confirmed_facts'), 'confirmed_facts',
+        ),
+        'impact_scope': _conclusion_text(
+            value.get('impact_scope'), 'impact_scope',
+        ),
+        'root_cause_hypothesis': _conclusion_text(
+            value.get('root_cause_hypothesis'), 'root_cause_hypothesis',
+        ),
+        'confidence': confidence,
+        'unknowns': _conclusion_items(value.get('unknowns'), 'unknowns'),
+        'recommended_actions': _conclusion_items(
+            value.get('recommended_actions'), 'recommended_actions',
+        ),
+    }
+
+
+def fallback_conclusion_details() -> Dict[str, Any]:
+    """Return the bounded fail-closed conclusion used without model details."""
+    return {
+        'confirmed_facts': ['结论由服务端根据当前终态收口'],
+        'impact_scope': '未确认影响范围',
+        'root_cause_hypothesis': '未形成根因假设',
+        'confidence': 'low',
+        'unknowns': ['未生成有效的结构化结论详情'],
+        'recommended_actions': ['查看 Evidence 与任务事件后人工复核'],
+    }
 
 
 def _truncate_utf8(text: str, max_bytes: int):
@@ -389,6 +453,10 @@ class AutonomyRepository:
             ),
             'status': row.status,
             'outcome': row.outcome,
+            'conclusion': (
+                json.loads(row.conclusion_json)
+                if getattr(row, 'conclusion_json', None) else None
+            ),
             'revision': int(row.revision or 0),
             'graph_version': row.graph_version,
             'budget': json.loads(row.budget_json or '{}'),
@@ -400,7 +468,7 @@ class AutonomyRepository:
         }
 
     def _step_to_dict(self, row) -> Dict[str, Any]:
-        return {
+        result = {
             'id': row.id,
             'run_id': row.run_id,
             'kind': row.kind,
@@ -411,6 +479,16 @@ class AutonomyRepository:
             'note': row.note or '',
             'created_at': getattr(row, 'created_at', None),
         }
+        if row.kind == StepKind.PLAN.value:
+            try:
+                snapshot = parse_plan_snapshot(row.action_json or '')
+                result['plan_actions'] = [
+                    redacted_summary(action_from_dict(item), max_chars=None)
+                    for item in snapshot['actions']
+                ]
+            except (ActionValidationError, PlanAuthorizationError):
+                result['plan_actions'] = []
+        return result
 
     # ------------------------------------------------------------------
     # Run 生命周期
@@ -1578,6 +1656,7 @@ class AutonomyRepository:
         run_id: str,
         outcome: str,
         evidence_ids: List[str],
+        details: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """落库唯一终局 Outcome：必须引用同一 Run 的 Evidence。
 
@@ -1621,6 +1700,9 @@ class AutonomyRepository:
             raise AutonomyValidationError(
                 'conclusion may only cite same-run evidence'
             )
+        normalized_details = normalize_conclusion_details(
+            details or fallback_conclusion_details(),
+        )
 
         requested = str(outcome)
         forced = ''
@@ -1639,6 +1721,11 @@ class AutonomyRepository:
             forced = 'verification_missing'
 
         run.outcome = outcome
+        run.conclusion_json = json.dumps({
+            **normalized_details,
+            'final_status': outcome,
+            'evidence_ids': ids,
+        }, ensure_ascii=False, separators=(',', ':'))
         self._bump(run)
         self.append_event(run, 'run_concluded', {
             'outcome': outcome,

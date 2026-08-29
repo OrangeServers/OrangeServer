@@ -44,7 +44,7 @@ class FakePlatform:
         return ToolData("audit_logs", [], [], {"total": 0})
 
     def validate_asset_ids(self, asset_ids):
-        return sorted(asset_ids) == sorted(self.allowed_ids)
+        return set(asset_ids).issubset(self.allowed_ids)
 
     def authorized_system_user_aliases(self):
         return set(self.sys_users)
@@ -99,8 +99,9 @@ def test_admin_knowledge_tool_returns_bounded_references(monkeypatch):
         def __init__(self, _session):
             pass
 
-        def search(self, query, *, limit):
+        def search(self, query, *, limit, scopes):
             assert (query, limit) == ("disk full", 8)
+            assert scopes == ("global",)
             return [{"citation_id": "K1", "title": "Disk runbook"}]
 
     monkeypatch.setattr(knowledge, "KnowledgeService", FakeKnowledgeService)
@@ -110,6 +111,44 @@ def test_admin_knowledge_tool_returns_bounded_references(monkeypatch):
         "knowledge_references": [{"citation_id": "K1", "title": "Disk runbook"}],
         "count": 1,
     }
+
+
+def test_admin_knowledge_tool_includes_authorized_host_scope(monkeypatch):
+    from app.ai import knowledge
+
+    class FakeKnowledgeService:
+        def __init__(self, _session):
+            pass
+
+        def search(self, query, *, limit, scopes):
+            assert (query, limit, scopes) == (
+                "restart cron", 8, ("global", "host:2"),
+            )
+            return [{"citation_id": "K1", "scope": "host:2"}]
+
+    monkeypatch.setattr(knowledge, "KnowledgeService", FakeKnowledgeService)
+    _, _, registry = _registry(role="admin", allowed_ids=[1, 2])
+
+    result = registry.execute("search_knowledge", {
+        "query": "restart cron", "host_alias": "host-2",
+    })
+
+    assert result["knowledge_references"][0]["scope"] == "host:2"
+
+
+def test_admin_knowledge_tool_rejects_unauthorized_host_scope():
+    from app.ai.tools import ToolValidationError
+
+    _, _, registry = _registry(role="admin", allowed_ids=[1, 2])
+
+    try:
+        registry.execute(
+            "search_knowledge", {"query": "restart cron", "host_id": 3},
+        )
+    except ToolValidationError as exc:
+        assert str(exc) == "host_id is not authorized"
+    else:
+        raise AssertionError("unauthorized host scope must be rejected")
 
 
 def test_asset_query_returns_result_set_reference_instead_of_full_context():

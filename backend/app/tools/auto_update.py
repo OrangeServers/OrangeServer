@@ -52,6 +52,82 @@ def _ensure_all_auth_row():
     return t_auth_host.query.filter_by(name='所有权限').first()
 
 
+def sync_user_permissions(
+    old_name,
+    new_name,
+    was_admin,
+    is_admin,
+    *,
+    ensure_all_auth_row=None,
+    auth_model=t_auth_host,
+    auth_user_model=t_auth_host_user,
+    session=db.session,
+    commit=True,
+):
+    """Keep direct permission bindings valid across account rename/setup.
+
+    Admin is a role, but several asset and automation authorization paths
+    still consume the existing all-access junction row.  Keep that row in
+    sync instead of duplicating administrator bypasses across every consumer.
+    """
+    def all_auth_row(create):
+        if ensure_all_auth_row is not None:
+            return ensure_all_auth_row()
+        row = auth_model.query.filter_by(
+            name='所有权限',
+            is_deleted=False,
+        ).first()
+        if row is None and create:
+            row = auth_model(
+                name='所有权限',
+                remarks=_ALL_AUTH_DEFAULT_REMARKS,
+            )
+            session.add(row)
+            session.flush()
+        return row
+
+    changed = False
+    if old_name and old_name != new_name:
+        for binding in auth_user_model.query.filter_by(
+            user_name=old_name,
+        ).all():
+            duplicate = auth_user_model.query.filter_by(
+                auth_id=binding.auth_id,
+                user_name=new_name,
+            ).first()
+            if duplicate is None:
+                binding.user_name = new_name
+            else:
+                session.delete(binding)
+            changed = True
+    if is_admin:
+        all_auth = all_auth_row(True)
+        if all_auth is None:
+            raise RuntimeError('无法初始化所有权限规则')
+        existing = auth_user_model.query.filter_by(
+            auth_id=all_auth.id,
+            user_name=new_name,
+        ).first()
+        if existing is None:
+            session.add(auth_user_model(
+                auth_id=all_auth.id,
+                user_name=new_name,
+            ))
+            changed = True
+    elif was_admin:
+        all_auth = all_auth_row(False)
+        binding = None if all_auth is None else auth_user_model.query.filter_by(
+            auth_id=all_auth.id,
+            user_name=new_name,
+        ).first()
+        if binding is not None:
+            session.delete(binding)
+            changed = True
+    if changed and commit:
+        session.commit()
+    return changed
+
+
 def _audit_permission_change(operation, count):
     """REV44-H2: 审计权限关联表变更 (host_group / sys_user / user_group).
 

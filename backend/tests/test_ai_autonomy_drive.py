@@ -1631,7 +1631,7 @@ def test_full_loop_concludes_resolved_with_fresh_verification(env):
 
 
 def test_completed_run_without_conclusion_defaults_to_inconclusive(env):
-    """模型没有给出结论：默认 inconclusive，绝不虚构成功。"""
+    """模型没有给出结论：低置信兜底，绝不虚构成功。"""
     run = env["create_queued_run"](mode="ask")
     driver = env["make_driver"]()
 
@@ -1641,6 +1641,10 @@ def test_completed_run_without_conclusion_defaults_to_inconclusive(env):
     row = _run_row(env, run["id"])
     assert row.status == "completed"
     assert row.outcome == "inconclusive"
+    conclusion = json.loads(row.conclusion_json)
+    assert conclusion["final_status"] == "inconclusive"
+    assert conclusion["confidence"] == "low"
+    assert conclusion["evidence_ids"] == []
     assert "run_concluded" not in [
         e.event_type for e in _events(env, run["id"])
     ]

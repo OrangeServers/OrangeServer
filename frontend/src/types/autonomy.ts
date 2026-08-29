@@ -63,6 +63,17 @@ export interface AutonomyCustomProfile {
   action_categories: string[]
 }
 
+export interface AutonomyConclusion {
+  confirmed_facts: string[]
+  impact_scope: string
+  root_cause_hypothesis: string
+  confidence: 'low' | 'medium' | 'high'
+  unknowns: string[]
+  recommended_actions: string[]
+  final_status: AutonomyRunOutcome
+  evidence_ids: string[]
+}
+
 /** Run 主体（repository._run_to_dict） */
 export interface AutonomyRun {
   id: string
@@ -76,6 +87,7 @@ export interface AutonomyRun {
   custom_profile: AutonomyCustomProfile | null
   status: AutonomyRunStatus
   outcome: AutonomyRunOutcome | null
+  conclusion: AutonomyConclusion | null
   trigger_type: 'manual' | 'chat' | 'alertmanager' | string
   trigger_ref: string | null
   trigger_summary: string
@@ -100,6 +112,8 @@ export interface AutonomyStep {
   action_digest: string
   note: string
   created_at: string | null
+  /** 服务端从已签名计划快照生成的逐项审批摘要。 */
+  plan_actions?: string[]
 }
 
 /** Run 权威快照 = Run + 有序步骤 + 服务端允许的操作集合 */

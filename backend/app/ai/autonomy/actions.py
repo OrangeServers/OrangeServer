@@ -444,6 +444,11 @@ def build_file_patch_command(
 
     _check_patch_path(path)
     text = _PATCH_CONTROL_RE.sub('', str(content or ''))
+    from app.ai.diagnostic_adapters import sanitize_evidence
+    if sanitize_evidence(text) != text:
+        raise ActionValidationError(
+            'patch content contains credential-like material'
+        )
     if len(text.encode('utf-8')) > PATCH_CONTENT_MAX_BYTES:
         raise ActionValidationError(
             'patch content exceeds %d bytes' % PATCH_CONTENT_MAX_BYTES
@@ -749,13 +754,14 @@ def build_probe_command(
     return command
 
 
-def redacted_summary(action: StructuredAction) -> str:
+def redacted_summary(action: StructuredAction, max_chars=255) -> str:
     """生成不含凭据的动作摘要（供快照与列表展示）。"""
     params = _normalize_params(action.parameters)
     param_text = ' '.join('%s=%s' % (k, v) for k, v in params.items())
     summary = '%s %s' % (action.kind, param_text)
     # 控制字符清洗，防止 ANSI/换行注入 UI 与日志。
-    return re.sub(r'[\x00-\x1f\x7f]', '', summary).strip()[:255]
+    cleaned = re.sub(r'[\x00-\x1f\x7f]', '', summary).strip()
+    return cleaned if max_chars is None else cleaned[:max_chars]
 
 
 def _digest_key(secret_key: str) -> bytes:

@@ -29,6 +29,7 @@ MAX_INDEX_CHUNKS = 20_000
 MAX_RESULTS = 8
 MAX_CONTEXT_BYTES = 16 * 1024
 NAMESPACE = ('ogs', 'knowledge')
+INDEX_LAYOUT_VERSION = 'scope-namespaces-v1'
 STORE_PREFIX = 'ogs_knowledge'
 VECTOR_PREFIX = 'ogs_knowledge_vectors'
 _HEADING_RE = re.compile(r'(?m)^(#{1,6})\s+(.+?)\s*$')
@@ -58,6 +59,7 @@ def _fingerprint(provider_type: str, base_url: str, model: str, dimension: int) 
         model,
         str(int(dimension)),
         LOCAL_MODEL_ARCHIVE_SHA256 if provider_type == 'local' else '',
+        INDEX_LAYOUT_VERSION,
     ))
     return hashlib.sha256(source.encode('utf-8')).hexdigest()
 
@@ -268,15 +270,21 @@ class KnowledgeService:
                 'created_at': None,
                 'updated_at': None,
             }
+        current_fingerprint = _fingerprint(
+            row.provider_type, row.base_url or '', row.model, row.dimension,
+        )
+        index_state = row.index_state
+        if index_state == 'ready' and row.model_fingerprint != current_fingerprint:
+            index_state = 'stale'
         return {
             'provider_type': row.provider_type,
             'base_url': row.base_url or '',
             'model': row.model,
             'dimension': int(row.dimension),
             'api_key_configured': bool(row.api_key_ciphertext),
-            'model_fingerprint': row.model_fingerprint,
+            'model_fingerprint': current_fingerprint,
             'indexed_fingerprint': row.indexed_fingerprint,
-            'index_state': row.index_state,
+            'index_state': index_state,
             'indexed_chunks': int(row.indexed_chunks or 0),
             'created_at': row.created_at,
             'updated_at': row.updated_at,
@@ -287,7 +295,7 @@ class KnowledgeService:
 
     def index_state(self) -> str:
         row = self._config_row()
-        return str(row.index_state) if row is not None else 'empty'
+        return str(self._config_dict(row)['index_state'])
 
     def save_config(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         from app.ai.provider_config import _valid_base_url
@@ -542,6 +550,16 @@ class KnowledgeService:
         from app.core.db.database import t_ai_embedding_config, t_ai_knowledge_document
 
         config_row = self._config_row(create=True)
+        current_fingerprint = _fingerprint(
+            config_row.provider_type,
+            config_row.base_url or '',
+            config_row.model,
+            config_row.dimension,
+        )
+        if config_row.model_fingerprint != current_fingerprint:
+            config_row.model_fingerprint = current_fingerprint
+            config_row.indexed_fingerprint = None
+            config_row.indexed_chunks = 0
         snapshot_fingerprint = str(config_row.model_fingerprint)
         config_row.index_state = 'rebuilding'
         self.session.commit()
@@ -571,7 +589,7 @@ class KnowledgeService:
                     operations = []
                     for doc, position, chunk in prepared[start:start + 64]:
                         operations.append(PutOp(
-                            NAMESPACE,
+                            NAMESPACE + (doc.scope,),
                             '%s:%d:%d' % (doc.id, int(doc.version), position),
                             {
                                 'text': chunk['text'],
@@ -641,12 +659,20 @@ class KnowledgeService:
         if not allowed_scopes:
             return []
         row = self._config_row()
-        if row is None or row.index_state != 'ready':
+        if (
+            row is None
+            or self._config_dict(row)['index_state'] != 'ready'
+        ):
             return []
         with self.store_factory(row, reset=False) as store:
-            # ponytail: bounded overfetch avoids a second vector index; add a
-            # scoped Redis filter only if cross-scope misses become measurable.
-            hits = store.search(NAMESPACE, query=query, limit=MAX_RESULTS * 8)
+            hits = []
+            for scope in allowed_scopes:
+                hits.extend(store.search(
+                    NAMESPACE + (scope,), query=query, limit=MAX_RESULTS,
+                ))
+        hits.sort(
+            key=lambda hit: float(hit.score or 0.0), reverse=True,
+        )
         document_ids = {
             str((hit.value or {}).get('document_id') or '') for hit in hits
         }

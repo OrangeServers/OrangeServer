@@ -30,6 +30,7 @@ class FakeStoreFactory:
         self.hits = []
         self.reset_calls = 0
         self.on_batch = None
+        self.search_namespaces = []
 
     @contextmanager
     def __call__(self, _row, *, reset=False):
@@ -45,9 +46,14 @@ class FakeStoreFactory:
             callback()
         return [None] * len(operations)
 
-    def search(self, _namespace, *, query, limit):
+    def search(self, namespace, *, query, limit):
         assert query
-        return self.hits[:limit]
+        self.search_namespaces.append(namespace)
+        scope = namespace[-1]
+        return [
+            hit for hit in self.hits
+            if (hit.value or {}).get('scope') == scope
+        ][:limit]
 
 
 @pytest.fixture()
@@ -229,6 +235,30 @@ def test_search_enforces_global_and_current_host_scopes(knowledge_env):
     assert service.search('host issue', scopes=('global', 'host:8')) == []
     result = service.search('host issue', scopes=('global', 'host:7'))
     assert result[0]['document_id'] == document['id']
+    assert ('ogs', 'knowledge', 'global') in store.search_namespaces
+    assert ('ogs', 'knowledge', 'host:7') in store.search_namespaces
+
+
+def test_previous_index_layout_is_stale_until_rebuilt(knowledge_env):
+    session, store, service = knowledge_env
+    service.create_document('admin', {
+        'title': 'Runbook', 'content': 'restart cron safely',
+    })
+    service.reindex()
+    row = session.get(t_ai_embedding_config, 1)
+    row.model_fingerprint = 'legacy-layout'
+    row.indexed_fingerprint = 'legacy-layout'
+    row.index_state = 'ready'
+    session.commit()
+
+    store.search_namespaces.clear()
+    assert service.index_state() == 'stale'
+    assert service.search('restart cron') == []
+    assert store.search_namespaces == []
+
+    rebuilt = service.reindex()
+    assert rebuilt['index_state'] == 'ready'
+    assert rebuilt['model_fingerprint'] != 'legacy-layout'
 
 
 def test_remote_embedding_config_is_validated_and_marks_index_stale(

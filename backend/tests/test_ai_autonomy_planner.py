@@ -93,10 +93,13 @@ class FakeRepo:
             raise self.error
         return {"id": "step-%d" % len(self.calls)}
 
-    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+    def conclude_run(
+        self, owner, role, run_id, outcome, evidence_ids, details=None,
+    ):
         self.calls.append(
             {"owner": owner, "role": role, "run_id": run_id,
-             "outcome": outcome, "evidence_ids": evidence_ids},
+             "outcome": outcome, "evidence_ids": evidence_ids,
+             "details": details},
         )
         if self.error is not None:
             raise self.error
@@ -121,10 +124,13 @@ class OneShotConclusionRepo(FakeRepo):
         super().__init__()
         self._error = error
 
-    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+    def conclude_run(
+        self, owner, role, run_id, outcome, evidence_ids, details=None,
+    ):
         self.calls.append({
             "owner": owner, "role": role, "run_id": run_id,
             "outcome": outcome, "evidence_ids": evidence_ids,
+            "details": details,
         })
         if self._error is not None:
             error, self._error = self._error, None
@@ -140,10 +146,13 @@ class RepairFailsThenFallbackRepo(FakeRepo):
         self._remaining_errors = 2
         self._error = error
 
-    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+    def conclude_run(
+        self, owner, role, run_id, outcome, evidence_ids, details=None,
+    ):
         self.calls.append({
             "owner": owner, "role": role, "run_id": run_id,
             "outcome": outcome, "evidence_ids": evidence_ids,
+            "details": details,
         })
         if self._remaining_errors:
             self._remaining_errors -= 1
@@ -208,13 +217,18 @@ def test_single_probe_proposal_goes_through_the_fenced_repo():
     assert "shell" not in kind_enum
 
 
-def test_finish_tool_ends_the_loop_without_a_proposal():
+def test_finish_without_a_conclusion_fails_closed():
     repo = FakeRepo()
     adapter = FakeAdapter(
-        results=[FakeChatResult([FakeToolCall(FINISH_TOOL_NAME, {})])],
+        results=[
+            FakeChatResult([FakeToolCall(FINISH_TOOL_NAME, {})]),
+            FakeChatResult([FakeToolCall(FINISH_TOOL_NAME, {})]),
+        ],
     )
 
-    assert make_planner(adapter)(make_context(repo)) == []
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+    assert excinfo.value.reason == "malformed_proposal"
     assert repo.calls == []
 
 
@@ -513,9 +527,21 @@ def verification_call(probe_id="system.load", params=None):
     )
 
 
+def conclusion_details():
+    return {
+        "confirmed_facts": ["verification passed"],
+        "impact_scope": "target host only",
+        "root_cause_hypothesis": "configuration drift",
+        "confidence": "high",
+        "unknowns": [],
+        "recommended_actions": ["monitor the service"],
+    }
+
+
 def finish_conclusion_call(outcome="resolved", evidence_ids=("ev-1",)):
     return FakeToolCall(FINISH_TOOL_NAME, {
         "outcome": outcome, "evidence_ids": list(evidence_ids),
+        **conclusion_details(),
     })
 
 
@@ -620,6 +646,7 @@ def test_finish_with_conclusion_calls_conclude_run():
     assert repo.calls == [{
         "owner": "admin", "role": "admin", "run_id": "run-1",
         "outcome": "resolved", "evidence_ids": ["ev-1", "ev-2"],
+        "details": conclusion_details(),
     }]
 
 

@@ -604,6 +604,8 @@ class t_ai_autonomous_run(db.Model, TimestampMixin):
     custom_profile_json = db.Column(db.Text, nullable=True)
     status = db.Column(db.String(20), nullable=False, index=True)
     outcome = db.Column(db.String(16), nullable=True)
+    # M2: bounded operator-facing conclusion fields and Evidence references.
+    conclusion_json = db.Column(db.Text, nullable=True)
     revision = db.Column(db.INTEGER, nullable=False, default=0)
     budget_json = db.Column(db.Text, nullable=False)
     latest_event_seq = db.Column(db.INTEGER, nullable=False, default=0)

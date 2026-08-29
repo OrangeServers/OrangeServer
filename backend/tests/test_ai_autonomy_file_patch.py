@@ -93,6 +93,17 @@ def test_patch_content_is_bounded_and_cleaned():
     assert "'a[31mb\nc\t'" in command
 
 
+@pytest.mark.parametrize('content', [
+    'password=hunter2\n',
+    'Authorization: Bearer top-secret\n',
+    '-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n',
+])
+def test_patch_content_rejects_credential_like_material(content):
+    backup = patch_backup_path("/etc/app.conf", RUN_ID, STEP_ID)
+    with pytest.raises(ActionValidationError, match='credential-like'):
+        build_file_patch_command("/etc/app.conf", content, backup)
+
+
 def test_patch_content_cannot_break_shell_quoting():
     backup = patch_backup_path("/etc/app.conf", RUN_ID, STEP_ID)
     # 字面安全的引号逃逸内容照常作为文本写入。

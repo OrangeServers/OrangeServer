@@ -1314,6 +1314,9 @@ def test_propose_plan_persists_immutable_snapshot_and_pauses_run(repo_env):
 
     assert step["kind"] == "plan"
     assert step["status"] == "waiting_approval"
+    assert step["plan_actions"] == [
+        "systemd operation=restart unit=nginx",
+    ]
     row = repo_env["session"].get(t_ai_autonomous_step, step["id"])
     snapshot = json.loads(row.action_json)
     assert snapshot["target_id"] == repo_env["host_id"]
@@ -1331,6 +1334,23 @@ def test_propose_plan_persists_immutable_snapshot_and_pauses_run(repo_env):
     assert action["system_user_id"] == 19
     run_row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
     assert run_row.status == "waiting_approval"
+
+
+def test_plan_actions_do_not_hide_long_patch_details(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    content = "setting=true\n" * 40
+
+    step = repo.propose_plan(
+        "admin", "admin", run["id"], "update config",
+        [{"kind": "file_patch", "params": {
+            "path": "/opt/example.conf", "content": content,
+        }}],
+    )
+
+    assert len(step["plan_actions"][0]) > 255
+    assert content.replace("\n", "") in step["plan_actions"][0]
+    assert "path=/opt/example.conf" in step["plan_actions"][0]
 
 
 def test_probe_only_plan_is_approved_without_pausing(repo_env):
@@ -1711,6 +1731,14 @@ def test_conclude_run_resolved_with_verification_observation(repo_env):
     result = repo.conclude_run(
         "admin", "admin", run["id"], "resolved",
         [action_ev["id"], verify_ev["id"]],
+        {
+            "confirmed_facts": ["cron is active"],
+            "impact_scope": "target host",
+            "root_cause_hypothesis": "configuration drift",
+            "confidence": "high",
+            "unknowns": [],
+            "recommended_actions": ["monitor cron"],
+        },
     )
     assert result["outcome"] == "resolved"
     assert result["forced"] == ""
@@ -1722,6 +1750,40 @@ def test_conclude_run_resolved_with_verification_observation(repo_env):
     assert payload["outcome"] == "resolved"
     assert payload["requested"] == "resolved"
     assert payload["forced"] == ""
+    conclusion = repo.snapshot("admin", run["id"])["conclusion"]
+    assert conclusion["confirmed_facts"] == ["cron is active"]
+    assert conclusion["final_status"] == "resolved"
+    assert conclusion["evidence_ids"] == [action_ev["id"], verify_ev["id"]]
+
+
+def test_conclusion_details_redact_common_secret_material(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    evidence = repo.record_evidence(
+        "admin", run["id"],
+        kind="action_observation", summary="observation",
+    )
+
+    repo.conclude_run(
+        "admin", "admin", run["id"], "not_resolved", [evidence["id"]],
+        {
+            "confirmed_facts": ["Authorization: Bearer top-secret"],
+            "impact_scope": "password=hunter2",
+            "root_cause_hypothesis": "token: abc123",
+            "confidence": "low",
+            "unknowns": [],
+            "recommended_actions": [],
+        },
+    )
+
+    serialized = json.dumps(
+        repo.snapshot("admin", run["id"])["conclusion"],
+        ensure_ascii=False,
+    )
+    assert "top-secret" not in serialized
+    assert "hunter2" not in serialized
+    assert "abc123" not in serialized
+    assert "[REDACTED]" in serialized
 
 
 def test_conclude_run_uncertain_write_forces_inconclusive(repo_env):

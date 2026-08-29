@@ -35,6 +35,13 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Worker health checks no longer leak long-lived Celery inspect processes;
   the bounded probe now verifies checkpoint storage and Worker registration
   in one directly managed process.
+- Fresh-setup administrators now receive the existing all-access binding,
+  authorized host-scoped Run knowledge is available to chat, and ask-mode
+  approval plus final Run conclusions expose the complete operator-facing
+  action and evidence-backed conclusion fields.
+- Existing and renamed administrator accounts now retain direct permission
+  bindings used by asset and automation authorization, and the upgrade
+  migration backfills custom admin names into the existing all-access rule.
 
 ## [1.1.1] - 2026-08-19
 

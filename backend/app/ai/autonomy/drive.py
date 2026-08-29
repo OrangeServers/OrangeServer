@@ -61,7 +61,11 @@ from app.ai.autonomy.recovery import (
     MODE_RESUME,
     RecoveryService,
 )
-from app.ai.autonomy.repository import redacted_summary, sanitize_text
+from app.ai.autonomy.repository import (
+    fallback_conclusion_details,
+    redacted_summary,
+    sanitize_text,
+)
 from app.ai.autonomy.state import (
     RunMode,
     RunStatus,
@@ -150,11 +154,13 @@ class _ClaimFencedPlannerRepository:
             self._repo.session.rollback()
             raise
 
-    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+    def conclude_run(
+        self, owner, role, run_id, outcome, evidence_ids, details=None,
+    ):
         try:
             self._lock_claim(run_id)
             return self._repo.conclude_run(
-                owner, role, run_id, outcome, evidence_ids,
+                owner, role, run_id, outcome, evidence_ids, details,
             )
         except Exception:
             self._repo.session.rollback()
@@ -1532,6 +1538,12 @@ class AutonomyDriver:
         if result in (RESULT_COMPLETED, RESULT_FAILED, RESULT_CANCELLED):
             run.completed_at = run.completed_at or _utcnow()
         run.outcome = run.outcome or _default_outcome(result)
+        if run.outcome and not run.conclusion_json:
+            run.conclusion_json = json.dumps({
+                **fallback_conclusion_details(),
+                'final_status': run.outcome,
+                'evidence_ids': [],
+            }, ensure_ascii=False, separators=(',', ':'))
         self.repo._bump(run)
         if event is not None:
             self.repo.append_event(run, event, {
