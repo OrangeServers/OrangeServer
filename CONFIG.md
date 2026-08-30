@@ -137,7 +137,7 @@ mysql -u root -p orange < backend/mysqldir/orange.sql
 | `OGS_REDIS_HOST` | `192.0.2.1`（代码内置 dev 值） | ✅ | Redis 服务器地址，生产必改 |
 | `OGS_REDIS_PORT` | `6379`（模板；无模板时代码回退 6389） | ✅ | Redis 端口，生产按实际改 |
 | `OGS_REDIS_PASSWORD` | 空 | 推荐 (prod) | Redis requirepass（生产环境强烈建议配置，防未授权访问） |
-| `OGS_REDIS_DB` | `0` | ❌ | db 索引（默认 0；不建议用 10，业务库隔离走 key prefix） |
+| `OGS_REDIS_DB` | `2` | ❌ | 业务会话和带 TTL 缓存的 db 索引；标准 bundled 栈固定使用 DB 2 |
 | `OGS_REDIS_MAX_CONNECTIONS` | `10` | ❌ | 连接池上限 |
 | `OGS_REDIS_SOCKET_TIMEOUT` | `5` | ❌ | 单次操作超时秒（防 hang） |
 | `OGS_REDIS_CONNECT_TIMEOUT` | `5` | ❌ | 连接超时秒 |
@@ -158,7 +158,7 @@ mysql -u root -p orange < backend/mysqldir/orange.sql
 > `192.0.2.1` 是文档保留网段，必然连不上。**config.py 不对 Redis 做
 > fail-fast 检查**——生产前必须按上表改。
 
-> **注意**：OGS_REDIS_DB **默认 0**（不是 10）。如需业务库隔离，推荐用 key prefix（如 `mail_verification:`、`captcha_get_min:`）而不是换 db 索引。
+> **注意**：标准 bundled 栈使用 DB 0 保存 checkpoint/向量、DB 1 作为 Celery broker、DB 2 保存业务会话和带 TTL 缓存。外部 Redis 部署仍可显式覆盖。
 
 ---
 
@@ -276,16 +276,25 @@ AI 运维会话默认使用 256K；只有能力标记为 1M 的 Provider 才能�
 | `OGS_AI_DIAGNOSTIC_EVIDENCE_RETENTION_DAYS` | `7` | ❌ | AI 诊断原始脱敏证据保留天数，允许范围 1–3650 |
 | `OGS_AI_DIAGNOSTIC_REPORT_RETENTION_DAYS` | `90` | ❌ | AI 诊断结构化报告与审计引用保留天数，允许范围 1–3650 |
 | `OGS_AI_AUTONOMY_ENABLED` | 空（进程关闭） | ❌ | 进程级关闭开关。bundled Compose 默认写入 `true`。设为 `false` 可强制关闭全部自治 API |
-| `OGS_AI_AUTONOMY_REDIS_HOST` | 空 | 启用自治时 ✅ | 自治专用 Redis 地址，不得指向业务 Redis 7；bundled 栈为 `autonomy-redis` |
-| `OGS_AI_AUTONOMY_REDIS_PORT` | `6379` | ❌ | 自治专用 Redis 端口；DB 0 用于 checkpoint，DB 1 用于 Celery broker |
-| `OGS_AI_AUTONOMY_REDIS_PASSWORD` | 空 | 网络部署时 ✅ | 自治专用 Redis 密码；与业务 Redis 密码分离，URI 保留字符由后端安全编码 |
-| `OGS_AUTONOMY_REDIS_IMAGE` | `redis/redis-stack-server:7.4.0-v3` | ❌ | 自治 Redis 镜像；必须提供 RediSearch 与 RedisJSON |
+| `OGS_AI_AUTONOMY_REDIS_HOST` | 空 | 启用自治时 ✅ | 自治 Redis 地址；bundled 栈与业务缓存共用 `redis` 服务并按 DB 隔离 |
+| `OGS_AI_AUTONOMY_REDIS_PORT` | `6379` | ❌ | 自治 Redis 端口；DB 0 用于 checkpoint/向量，DB 1 用于 Celery broker |
+| `OGS_AI_AUTONOMY_REDIS_PASSWORD` | 空 | 网络部署时 ✅ | 自治 Redis 密码；bundled 栈与 `OGS_REDIS_PASSWORD` 相同，URI 保留字符由后端安全编码 |
+| `OGS_AUTONOMY_WORKER_CONCURRENCY` | `2` | ❌ | Celery prefork 并发槽数，必须为正整数；受限机器可设为 `1` |
+| `OGS_AI_ALERTMANAGER_TOKEN` | 空 | 启用告警入口时 ✅ | Alertmanager Webhook 的独立 Bearer Token；不得与用户登录或 Provider 密钥复用 |
+| `OGS_AI_ALERTMANAGER_OWNER` | 空 | 启用告警入口时 ✅ | 告警 Run 的固定管理员所有者；必须是现存且未删除的 admin 账号 |
+| `OGS_AI_PROMETHEUS_BASE_URL` | 空 | ❌ | 可选 Prometheus 根地址；只执行服务端固定的 15 分钟可用性查询，不接受模型或 Webhook 提供 URL/PromQL |
+| `OGS_AI_PROMETHEUS_BEARER_TOKEN` | 空 | ❌ | 可选 Prometheus Bearer Token；不会进入模型、事件或 Evidence |
+| `OGS_AI_EMBEDDING_MODEL_PATH` | 空 | ❌ | 本地 embedding 模型目录；正式 Docker 镜像固定为 `/opt/orangeserver/models/fast-bge-small-zh-v1.5`，物理机留空时由 FastEmbed 管理模型缓存 |
 | `OGS_AI_AUTONOMY_LEASE_TTL_SECONDS` | `120` | ❌ | Worker 租约有效期，服务端硬下限 10 秒 |
 | `OGS_AI_AUTONOMY_APPROVAL_TTL_SECONDS` | `86400` | ❌ | draft 和待审批步骤有效期，服务端硬下限 60 秒 |
 
-标准 bundled Compose 会启动专用 Redis Stack 与 Worker，自治默认可用。
+标准 bundled Compose 会启动统一 Redis 8 与 Worker，自治默认可用。
 `OGS_AI_AUTONOMY_ENABLED=false` 只作为紧急关闭。见
 [部署手册](DEPLOY.md)与[AI 运维使用指南](docs/ai/USER_GUIDE.md)。
+
+运维知识库默认使用镜像内置的 512 维中文 BGE ONNX 模型。管理员也可在“运维知识库”
+页面配置独立的 OpenAI-compatible embedding 地址、模型、维度和 API Key；密钥使用
+`OGS_FERNET_KEYS` 加密保存在数据库，不配置为环境变量。切换模型或维度必须重建索引。
 
 默认支持 OpenAI、Anthropic、xAI、DeepSeek、MiniMax、Kimi、Qwen、GLM 和硅基流动。一个 Provider
 配置一个模型；管理员可以读取厂商模型列表，也可以直接填写模型 ID。Anthropic 原生 API 非
@@ -326,7 +335,7 @@ OGS_MYSQL_USER=app_user
 OGS_MYSQL_PASSWORD=<强密码>
 OGS_REDIS_HOST=redis
 OGS_REDIS_PASSWORD=<Redis requirepass>            # 生产必填
-OGS_REDIS_DB=0
+OGS_REDIS_DB=2
 OGS_HTTPS=true
 OGS_SSH_HOST_KEY_POLICY=reject
 OGS_CSRF_ALLOWED_ORIGINS=https://your.domain.com

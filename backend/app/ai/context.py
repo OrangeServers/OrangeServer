@@ -126,8 +126,6 @@ class ContextManager:
         return max(len(payload), math.ceil(len(payload.encode("utf-8")) / 4))
 
     def should_compress(self, conversation: Dict[str, Any]) -> bool:
-        if conversation.get("pending_action_ids"):
-            return False
         return self.estimate_tokens(
             conversation.get("messages", []),
             str(conversation.get("summary") or ""),

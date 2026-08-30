@@ -2,13 +2,16 @@
 # OrangeServer docker-compose 覆盖 — host 模式 (模式 B)
 # =============================================================================
 # 本机已有 redis/mysql 时, 用此文件覆盖基础 compose:
-#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.host.yml up -d backend frontend
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.host.yml up -d app worker
 #
 # 仅添加 extra_hosts, 让 backend 容器通过 host.docker.internal 连宿主机 redis/mysql
 # Docker 24+ 默认支持 host-gateway; Docker 19.x 不支持此特性
 # =============================================================================
 
 services:
-  backend:
+  app:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+  worker:
     extra_hosts:
       - "host.docker.internal:host-gateway"

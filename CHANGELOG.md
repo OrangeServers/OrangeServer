@@ -3,6 +3,46 @@
 Notable user-visible changes are recorded here. This project follows the
 principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- The AI Ops landing page now leads with pending alerts, active runs, recent
+  conclusions, Worker capacity, and knowledge-index status. An optional
+  Bearer-authenticated Alertmanager webhook creates idempotent `ask` runs and
+  attaches bounded, server-owned Prometheus observations to their timeline.
+- An administrator-reviewed operations knowledge base indexes Markdown
+  runbooks and independently verified runs with a bundled Chinese BGE ONNX
+  model or a separate OpenAI-compatible embedding endpoint. Chat and the
+  Autonomy Planner return bounded, versioned citations without granting
+  permissions or replacing live evidence.
+
+### Changed
+
+- Chat now handles query, explanation, diagnosis, and Autonomy Run drafts;
+  every remote write is executed through the existing approval-gated Run path.
+- The Autonomy Worker keeps Celery prefork and defaults to two configurable
+  execution slots. DeepSeek reasoning is preserved across tool-call turns.
+- The standard Compose deployment now serves the bundled SPA from the app
+  image and uses four product containers with one Redis 8 service.
+
+### Removed
+
+- The unused in-tree Ansible Runner and its `ansible-core` dependency.
+
+### Fixed
+
+- Worker health checks no longer leak long-lived Celery inspect processes;
+  the bounded probe now verifies checkpoint storage and Worker registration
+  in one directly managed process.
+- Fresh-setup administrators now receive the existing all-access binding,
+  authorized host-scoped Run knowledge is available to chat, and ask-mode
+  approval plus final Run conclusions expose the complete operator-facing
+  action and evidence-backed conclusion fields.
+- Existing and renamed administrator accounts now retain direct permission
+  bindings used by asset and automation authorization, and the upgrade
+  migration backfills custom admin names into the existing all-access rule.
+
 ## [1.1.1] - 2026-08-19
 
 ### Added

@@ -24,6 +24,16 @@ def register_autonomy_routes(app: Any) -> None:
         _secure(views.autonomy_status, "admin", "user"), methods=["GET"],
     )
     app.add_url_rule(
+        "/ai/ops/status", "ai_ops_status",
+        _secure(views.ops_status, "admin"), methods=["GET"],
+    )
+    # Machine-to-machine endpoint: its own constant-time Bearer check replaces
+    # session auth and CSRF; never wrap it with the browser security chain.
+    app.add_url_rule(
+        "/ai/ops/alertmanager/webhook", "ai_ops_alertmanager_webhook",
+        views.alertmanager_webhook, methods=["POST"],
+    )
+    app.add_url_rule(
         "/ai/autonomous-runs", "ai_autonomy_create_run",
         _secure(views.create_run, *admins), methods=["POST"],
     )
@@ -68,6 +78,29 @@ def register_autonomy_routes(app: Any) -> None:
         "/ai/autonomous-runs/<string:run_id>/evidence",
         "ai_autonomy_evidence_list",
         _secure(views.list_evidence, *admins), methods=["GET"],
+    )
+    app.add_url_rule(
+        "/ai/knowledge/config", "ai_knowledge_config",
+        _secure(views.knowledge_config, *admins), methods=["GET", "PATCH"],
+    )
+    app.add_url_rule(
+        "/ai/knowledge/documents", "ai_knowledge_documents",
+        _secure(views.knowledge_documents, *admins), methods=["GET", "POST"],
+    )
+    app.add_url_rule(
+        "/ai/knowledge/documents/<string:document_id>",
+        "ai_knowledge_document",
+        _secure(views.knowledge_document, *admins),
+        methods=["GET", "PATCH", "DELETE"],
+    )
+    app.add_url_rule(
+        "/ai/knowledge/reindex", "ai_knowledge_reindex",
+        _secure(views.knowledge_reindex, *admins), methods=["POST"],
+    )
+    app.add_url_rule(
+        "/ai/autonomous-runs/<string:run_id>/knowledge",
+        "ai_autonomy_knowledge_capture",
+        _secure(views.knowledge_capture_run, *admins), methods=["POST"],
     )
     app.add_url_rule(
         "/ai/autonomous-runs/<string:run_id>/stream",

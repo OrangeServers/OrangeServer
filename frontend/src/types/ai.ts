@@ -71,36 +71,6 @@ export interface AiConversation {
   context_mode?: AiContextMode
   updated_at?: string
   created_at?: string
-  has_pending_action?: boolean
-}
-
-export interface AiApproval {
-  action_id: string
-  conversation_id?: string
-  command: string
-  sys_user: string
-  target_count: number
-  reason?: string
-  risk_level?: string
-  expires_at?: string
-  created_at?: string
-  updated_at?: string
-  status: 'pending' | 'running' | 'completed' | 'approved' | 'cancelled' | 'failed' | 'rejected' | 'expired'
-  outcome?: 'success' | 'partial' | 'failed'
-  result_summary?: {
-    total?: number
-    success?: number
-    failed?: number
-    status?: string
-    outcome?: 'success' | 'partial' | 'failed'
-  }
-}
-
-export interface AiExecutionItem {
-  host: string
-  status: 'running' | 'success' | 'failed'
-  output?: string
-  error?: string
 }
 
 export interface AiResultScope {
@@ -113,20 +83,11 @@ export interface AiResultScope {
   sample?: Array<Record<string, unknown>>
 }
 
-export interface AiActionHistory {
-  action: AiApproval
-  execution_items: AiExecutionItem[]
-}
-
 export interface AiConversationDetail extends AiConversation {
   messages?: AiChatMessage[]
   tool_events?: AiToolEvent[]
   autonomy_drafts?: AiAutonomyDraft[]
-  pending_action?: AiApproval | null
-  latest_action?: AiApproval | null
-  action_history?: AiActionHistory[]
   result_scope?: AiResultScope | null
-  execution_items?: AiExecutionItem[]
   diagnostics?: AiDiagnosticRun[]
   active_diagnostic?: AiDiagnosticRun | null
   latest_diagnostic?: AiDiagnosticRun | null

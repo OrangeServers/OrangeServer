@@ -13,7 +13,7 @@
 - **统一升级流程**：[`docs/operations/UPGRADE.md`](../docs/operations/UPGRADE.md) — 备份、迁移、验证与回滚
 - **配置参考**：[`CONFIG.md`](../CONFIG.md) — OGS_* 全部环境变量
 - **本目录文件**：
-   - `docker-compose.yml` — 生产 bundled 编排（业务四件套 + 自治 Redis/Worker）
+  - `docker-compose.yml` — 生产 bundled 四容器编排（app、worker、MySQL、Redis 8）
   - `docker-compose.dev.yml` — 独立全容器开发模式（新 MySQL/Redis 卷、backend 源码重载、Vite HMR）
   - `docker-compose.dev-autonomy.yml` — M1 自治开发覆盖层（专用 Redis 8 + Celery Worker）
   - `nginx/orange_server.conf` — 物理机 nginx（含 frontend/dist 静态 serve + 6 个 API 前缀反代）
@@ -31,9 +31,9 @@
 
 | 服务 | 镜像 | 端口 (宿主机) | 端口 (容器内) | 用途 |
 |------|------|---------------|---------------|------|
-| backend | 源码部署默认本地构建；Release 安装使用固定版本 GHCR 镜像 | (无) | 28000 | Flask + gunicorn + geventwebsocket |
-| frontend | nginx:1.25-alpine | ${OGS_HTTP_PORT:-8080} | 80 | 反代 backend + serve frontend/dist |
-| redis | redis:7.4-alpine | (无) | 6379 | 会话/CSRF/限流 (配 OGS_REDIS_PASSWORD) |
+| app | 源码部署默认本地构建；Release 安装使用固定版本 GHCR 镜像 | ${OGS_HTTP_PORT:-8080} | 28000 | Flask + Gunicorn + WebSocket + 内置 SPA |
+| worker | 与 app 相同 | (无) | (无) | Celery prefork，默认并发 2 |
+| redis | redis:8.10.0 | (无) | 6379 | DB0 checkpoint/向量、DB1 broker、DB2 会话/缓存 |
 | mysql | mysql:8.0.42 | (无) | 3306 | 业务数据库（自动导入 orange.sql）|
 
 开发环境不叠加生产编排，也不连接宿主机旧数据库：
@@ -46,7 +46,7 @@ make docker-dev-reset
 make docker-dev-up
 ```
 
-标准 bundled 发布路径会启动自治 Worker 与专用 Redis Stack。开发覆盖层仍可用于
+标准 bundled 发布路径使用统一 Redis 8 与自治 Worker。开发覆盖层仍可用于
 源码热重载：将 `.env.dev` 的 `OGS_AI_AUTONOMY_ENABLED` 设为 `true` 后运行：
 
 ```bash
@@ -70,8 +70,8 @@ Celery Worker；backend 与 Worker 使用同一个由当前源码构建的本地
 
 | 模式 | 启动命令 | 启动服务 | 镜像来源 | 场景 |
 |------|---------|----------|----------|------|
-| A. bundled | `make docker-up` | 4 个 | 后端本地构建；其余 3 个拉取 | 全新部署 / 容器化基础设施 |
-| B. 外部服务 | `make docker-up-host` | 2 个 | 后端本地构建；Nginx 拉取 | 本机已有 redis/mysql |
+| A. bundled | `make docker-up` | 4 个 | app/worker 共用本地构建镜像；Redis/MySQL 拉取 | 全新部署 / 容器化基础设施 |
+| B. 外部服务 | `make docker-up-host` | 2 个 | app/worker 共用本地构建镜像 | 已有 Redis/MySQL |
 
 模式 B 需 .env 改 `OGS_MYSQL_HOST` + `OGS_REDIS_HOST` 为外部地址。
 必须使用 `make docker-up-host`，由它叠加 host overlay 并执行预检（详见 DEPLOY.md）。
@@ -91,7 +91,7 @@ chmod 600 .env backend/.env
 # - MYSQL_ROOT_PASSWORD 只填根 .env
 # - 修改 OGS_HTTP_PORT 时，同步 backend/.env 的 OGS_CSRF_ALLOWED_ORIGINS
 
-# 2. Docker Hub 镜像加速（仅帮助 nginx/redis/mysql，不代理 ghcr.io）
+# 2. Docker Hub 镜像加速（仅帮助 redis/mysql，不代理 ghcr.io）
 #    先把 registry-mirrors 等键合并进现有配置，不要覆盖已有 daemon.json。
 sudoedit /etc/docker/daemon.json
 # 参照 daemon.json.example 合并所需键，保存后先验证：

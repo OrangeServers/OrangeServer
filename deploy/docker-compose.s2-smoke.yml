@@ -24,6 +24,7 @@ x-smoke-environment: &smoke-environment
   OGS_AI_AUTONOMY_REDIS_PORT: 6379
   OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_S2_SMOKE_AUTONOMY_REDIS_PASSWORD:?smoke autonomy Redis password required}
   OGS_AI_AUTONOMY_LEASE_TTL_SECONDS: 60
+  OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}
   # The target is private to this disposable internal network. Host keys are
   # generated in its exact smoke image and never trusted outside this stack.
   OGS_SSH_HOST_KEY_POLICY: auto
@@ -170,8 +171,8 @@ services:
 
   autonomy-worker:
     build:
-      context: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/backend
-      dockerfile: Dockerfile
+      context: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}
+      dockerfile: backend/Dockerfile
     image: ${OGS_S2_SMOKE_BACKEND_IMAGE:?exact-checkout smoke image required}
     pull_policy: never
     restart: "no"
@@ -184,7 +185,6 @@ services:
       - app.ai.autonomy.celery_entry:celery_app
       - worker
       - --loglevel=INFO
-      - --concurrency=1
     depends_on:
       mysql-fresh: {condition: service_healthy}
       business-redis: {condition: service_healthy}
@@ -198,10 +198,10 @@ services:
         read_only: true
     healthcheck:
       test:
-        - CMD-SHELL
-        - >-
-          celery -A app.ai.autonomy.celery_entry:celery_app inspect ping
-          --destination "celery@$$HOSTNAME" --timeout 3 | grep -q pong
+        - CMD
+        - python
+        - -c
+        - from app.ai.autonomy.readiness import checkpoint_readiness, worker_readiness; raise SystemExit(0 if checkpoint_readiness() and worker_readiness() else 1)
       interval: 4s
       timeout: 6s
       retries: 45
@@ -209,8 +209,8 @@ services:
 
   smoke-runner:
     build:
-      context: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}/backend
-      dockerfile: Dockerfile
+      context: ${OGS_S2_SMOKE_SOURCE_ROOT:?archived source root required}
+      dockerfile: backend/Dockerfile
     image: ${OGS_S2_SMOKE_BACKEND_IMAGE:?exact-checkout smoke image required}
     pull_policy: never
     restart: "no"

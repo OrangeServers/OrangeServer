@@ -93,10 +93,13 @@ class FakeRepo:
             raise self.error
         return {"id": "step-%d" % len(self.calls)}
 
-    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+    def conclude_run(
+        self, owner, role, run_id, outcome, evidence_ids, details=None,
+    ):
         self.calls.append(
             {"owner": owner, "role": role, "run_id": run_id,
-             "outcome": outcome, "evidence_ids": evidence_ids},
+             "outcome": outcome, "evidence_ids": evidence_ids,
+             "details": details},
         )
         if self.error is not None:
             raise self.error
@@ -121,10 +124,13 @@ class OneShotConclusionRepo(FakeRepo):
         super().__init__()
         self._error = error
 
-    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+    def conclude_run(
+        self, owner, role, run_id, outcome, evidence_ids, details=None,
+    ):
         self.calls.append({
             "owner": owner, "role": role, "run_id": run_id,
             "outcome": outcome, "evidence_ids": evidence_ids,
+            "details": details,
         })
         if self._error is not None:
             error, self._error = self._error, None
@@ -140,10 +146,13 @@ class RepairFailsThenFallbackRepo(FakeRepo):
         self._remaining_errors = 2
         self._error = error
 
-    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+    def conclude_run(
+        self, owner, role, run_id, outcome, evidence_ids, details=None,
+    ):
         self.calls.append({
             "owner": owner, "role": role, "run_id": run_id,
             "outcome": outcome, "evidence_ids": evidence_ids,
+            "details": details,
         })
         if self._remaining_errors:
             self._remaining_errors -= 1
@@ -208,13 +217,18 @@ def test_single_probe_proposal_goes_through_the_fenced_repo():
     assert "shell" not in kind_enum
 
 
-def test_finish_tool_ends_the_loop_without_a_proposal():
+def test_finish_without_a_conclusion_fails_closed():
     repo = FakeRepo()
     adapter = FakeAdapter(
-        results=[FakeChatResult([FakeToolCall(FINISH_TOOL_NAME, {})])],
+        results=[
+            FakeChatResult([FakeToolCall(FINISH_TOOL_NAME, {})]),
+            FakeChatResult([FakeToolCall(FINISH_TOOL_NAME, {})]),
+        ],
     )
 
-    assert make_planner(adapter)(make_context(repo)) == []
+    with pytest.raises(PlannerProposalError) as excinfo:
+        make_planner(adapter)(make_context(repo))
+    assert excinfo.value.reason == "malformed_proposal"
     assert repo.calls == []
 
 
@@ -259,14 +273,35 @@ def test_truncated_provider_output_fails_closed(result):
     (),
     (probe_call(), probe_call()),
 ])
-def test_ambiguous_tool_calls_fail_closed(calls):
+def test_ambiguous_tool_calls_fail_closed_after_one_probe_repair(calls):
     repo = FakeRepo()
-    adapter = FakeAdapter(results=[FakeChatResult(list(calls))])
+    adapter = FakeAdapter(results=[
+        FakeChatResult(list(calls)),
+        FakeChatResult(list(calls)),
+    ])
 
     with pytest.raises(PlannerProposalError) as excinfo:
         make_planner(adapter)(make_context(repo))
     assert excinfo.value.reason == "ambiguous_proposal"
     assert repo.calls == []
+    assert adapter.requests[1]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": PROPOSAL_TOOL_NAME},
+    }
+
+
+def test_deepseek_ambiguous_investigation_is_repaired_to_probe():
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[
+        FakeChatResult([]),
+        FakeChatResult([probe_call()]),
+    ])
+
+    assert make_planner(adapter)(make_context(repo)) == ["step-1"]
+    assert adapter.requests[1]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": PROPOSAL_TOOL_NAME},
+    }
 
 
 def test_unknown_tool_name_is_unsupported():
@@ -513,9 +548,21 @@ def verification_call(probe_id="system.load", params=None):
     )
 
 
+def conclusion_details():
+    return {
+        "confirmed_facts": ["verification passed"],
+        "impact_scope": "target host only",
+        "root_cause_hypothesis": "configuration drift",
+        "confidence": "high",
+        "unknowns": [],
+        "recommended_actions": ["monitor the service"],
+    }
+
+
 def finish_conclusion_call(outcome="resolved", evidence_ids=("ev-1",)):
     return FakeToolCall(FINISH_TOOL_NAME, {
         "outcome": outcome, "evidence_ids": list(evidence_ids),
+        **conclusion_details(),
     })
 
 
@@ -598,6 +645,34 @@ def test_investigation_handoff_forces_plan_after_probe_phase():
     }
 
 
+def test_successful_verification_handoff_forces_finish():
+    """A provider cannot resume investigation after verification succeeds."""
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[
+        FakeChatResult([probe_call()]),
+        FakeChatResult([
+            finish_conclusion_call("resolved", ("verify-1",)),
+        ]),
+    ])
+    context = make_context(repo, remaining_actions=10)
+    context["require_finish"] = True
+    context["evidence"] = [
+        "id=verify-1 | kind=verification_observation | summary=verified",
+    ]
+
+    assert make_planner(adapter)(context) == []
+    assert repo.calls == [{
+        "owner": "admin", "role": "admin", "run_id": "run-1",
+        "outcome": "resolved", "evidence_ids": ["verify-1"],
+        "details": conclusion_details(),
+    }]
+    for request in adapter.requests:
+        assert request["tool_choice"] == {
+            "type": "function",
+            "function": {"name": FINISH_TOOL_NAME},
+        }
+
+
 def test_verification_schema_pins_the_probe_registry_enum():
     from app.ai.autonomy.actions import list_probe_ids
 
@@ -620,6 +695,7 @@ def test_finish_with_conclusion_calls_conclude_run():
     assert repo.calls == [{
         "owner": "admin", "role": "admin", "run_id": "run-1",
         "outcome": "resolved", "evidence_ids": ["ev-1", "ev-2"],
+        "details": conclusion_details(),
     }]
 
 

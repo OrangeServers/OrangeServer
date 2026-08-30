@@ -650,14 +650,19 @@ def test_planner_context_carries_authoritative_budget_and_history(env):
 
 
 def test_planner_context_forces_plan_after_three_distinct_probes(env):
-    """The phase handoff is derived from authoritative successful actions."""
+    """Failure observations also count after their probes finish."""
     run = env["create_queued_run"]()
-    for probe_id in ("system.load", "system.memory", "system.disk_usage"):
+    for index, probe_id in enumerate((
+        "system.load", "system.memory", "system.disk_usage",
+    )):
         step = env["repo"].propose_probe(
             "admin", "admin", run["id"], probe_id,
         )
         row = _step_row(env, step["id"])
-        row.status = StepStatus.SUCCEEDED.value
+        row.status = (
+            StepStatus.SUCCEEDED.value if index == 0
+            else StepStatus.FAILED.value
+        )
     env["session"].commit()
 
     driver = env["make_driver"]()
@@ -1579,6 +1584,7 @@ def test_full_loop_concludes_resolved_with_fresh_verification(env):
                 context["run_id"], "system.load",
             )
             return [step["id"]]
+        assert context["require_finish"] is True
         evidence = env["repo"].list_evidence(
             context["owner"], context["run_id"],
         )
@@ -1631,7 +1637,7 @@ def test_full_loop_concludes_resolved_with_fresh_verification(env):
 
 
 def test_completed_run_without_conclusion_defaults_to_inconclusive(env):
-    """模型没有给出结论：默认 inconclusive，绝不虚构成功。"""
+    """模型没有给出结论：低置信兜底，绝不虚构成功。"""
     run = env["create_queued_run"](mode="ask")
     driver = env["make_driver"]()
 
@@ -1641,6 +1647,9 @@ def test_completed_run_without_conclusion_defaults_to_inconclusive(env):
     row = _run_row(env, run["id"])
     assert row.status == "completed"
     assert row.outcome == "inconclusive"
+    conclusion = json.loads(row.conclusion_json)
+    assert conclusion["final_status"] == "inconclusive"
+    assert conclusion["confidence"] == "low"
     assert "run_concluded" not in [
         e.event_type for e in _events(env, run["id"])
     ]
@@ -1648,6 +1657,7 @@ def test_completed_run_without_conclusion_defaults_to_inconclusive(env):
     evidence = _evidence_rows(env, run["id"])
     assert len(evidence) == 1
     assert evidence[0].kind == "action_observation"
+    assert conclusion["evidence_ids"] == [evidence[0].id]
 
 
 def test_resolved_without_verification_observation_is_downgraded(env):

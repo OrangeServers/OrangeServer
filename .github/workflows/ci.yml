@@ -68,14 +68,12 @@ jobs:
       - name: Run pytest
         working-directory: backend
         run: |
-          # 与本地一致: --ignore=app/tools/ansible_runner (子进程测试不稳定)
           # conftest.py 已 mock 全部 MySQL/Redis/SSH 依赖, 无需真数据库
           # --cov=app: ti2-COV 覆盖率 (达到 60% 为完工标志)
           # --cov-report=xml: codecov upload 需要 coverage.xml
           python -m pytest tests/ \
             -q --tb=line --no-header \
             -p no:cacheprovider \
-            --ignore=app/tools/ansible_runner \
             --timeout=30 --timeout-method=thread \
             --cov=app \
             --cov-branch \
@@ -122,7 +120,7 @@ jobs:
       - name: Run flake8
         working-directory: backend
         run: |
-          # 配置在 backend/.flake8: max-line-length=120 + 排除 tests/_archive/ansible_runner
+          # 配置在 backend/.flake8: max-line-length=120 + 排除 tests/_archive
           flake8 app/ init.py
 
   # ===========================================================================
@@ -184,7 +182,7 @@ jobs:
             -f backend/Dockerfile \
             -t orangeserver-backend:ci-${{ github.sha }} \
             --load \
-            backend/
+            .
 
   # ===========================================================================
   # 5) build-frontend - 前端 npm build + 上传 dist artifact

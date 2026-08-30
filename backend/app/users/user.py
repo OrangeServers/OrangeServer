@@ -13,7 +13,7 @@ from app.core.db.insert import osql_in
 from app.tools.audlog import LoginToolsLog, CzToolsLog
 from app.core.config import _env, LOGIN_FAIL_LIMIT_IP, MAIL_VERIFY_PREFIX, MAIL_VERIFY_TTL
 from app.tools.at import Log, get_current_user, get_current_user_role, request_param
-from app.tools.auto_update import AuthAutoUpdate
+from app.tools.auto_update import AuthAutoUpdate, sync_user_permissions
 
 
 # REV41-H1: 类内 admin 鉴权防御 (防 init.py 路由层误删 roles=[] 装饰器)
@@ -515,9 +515,20 @@ class AccUserAdd(CzToolsLog):
             user_chk = t_acc_user.query.filter_by(name=self.name).first()
             if user_chk is None:
                 password_en = hash_pwd(self.password)
-                osql_in('t_acc_user', alias=self.alias, name=self.name, password=password_en, usrole=self.usrole, mail=self.mail,
-                        group=self.group,
-                        remarks=self.remarks)
+                db.session.add(t_acc_user(
+                    alias=self.alias,
+                    name=self.name,
+                    password=password_en,
+                    usrole=self.usrole,
+                    mail=self.mail,
+                    group=self.group,
+                    remarks=self.remarks,
+                ))
+                sync_user_permissions(
+                    None, self.name, False, self.usrole == 'admin',
+                    commit=False,
+                )
+                db.session.commit()
                 self.host_log(self.cz_name, '用户操作', '新增用户', self.name, '成功', None)
                 self.ords.conn.set(self.name + '_alias', self.alias)
                 self.ords.conn.set(self.name + '_role', self.usrole)
@@ -528,10 +539,12 @@ class AccUserAdd(CzToolsLog):
                 Log.logger.info(log_msg + ' \"fail sel_fail\"')
                 return jsonify({'code': 100, 'msg': '操作权限不足'})
         except IOError:
+            db.session.rollback()
             self.host_log(self.cz_name, '用户操作', '新增用户', self.name, '失败', '连接数据库错误')
             Log.logger.info(log_msg + ' \"fail con_fail\"')
             return jsonify({'code': 100, 'msg': '服务器内部错误'})
         except Exception:
+            db.session.rollback()
             self.host_log(self.cz_name, '用户操作', '新增用户', self.name, '失败', '未知错误')
             Log.logger.info(log_msg + ' \"fail\"')
             return jsonify({'code': 100, 'msg': '操作失败 (code=2)'})
@@ -578,12 +591,24 @@ class AccUserUpdate(AccUserAdd):
                 self.host_log(self.cz_name, '用户操作', '变更用户', self.name, '失败', rename_err)
                 Log.logger.info(log_msg + ' "fail name conflict"')
                 return jsonify({'code': 100, 'msg': rename_err})
+            old_name = up_user.name
+            was_admin = up_user.usrole == 'admin'
             t_acc_user.query.filter_by(id=self.id).update(update_kwargs)
+            sync_user_permissions(
+                old_name,
+                self.name,
+                was_admin,
+                self.usrole == 'admin',
+                commit=False,
+            )
             db.session.commit()
             role_name = self.name + '_role'
             self.ords.conn.set(role_name, self.usrole)
             self.host_log(self.cz_name, '用户操作', '变更用户', self.name, '成功')
             self.ords.conn.set(self.name + '_alias', self.alias)
+            if old_name != self.name:
+                self.ords.conn.delete(old_name + '_role')
+                self.ords.conn.delete(old_name + '_alias')
             if up_user.group == self.group:
                 AuthAutoUpdate.user_grp_count(self.group)
             else:
@@ -591,6 +616,7 @@ class AccUserUpdate(AccUserAdd):
                 AuthAutoUpdate.user_grp_count(self.group)
             return jsonify({'code': 0})
         except Exception:
+            db.session.rollback()
             self.host_log(self.cz_name, '用户操作', '变更用户', self.name, '失败', '连接数据库错误')
             Log.logger.info(log_msg + ' \"fail\"')
             return jsonify({'code': 100, 'msg': '操作失败 (code=2)'})

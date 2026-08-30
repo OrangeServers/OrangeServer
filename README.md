@@ -56,6 +56,7 @@ OrangeServer keeps day-to-day Linux operations inside one permission boundary:
 | Audit | Query login, command, and platform operation trails |
 | AI operations | Query authorized data, run fixed read-only diagnostics, and prepare batch actions that require human approval |
 | M1 controlled autonomy | Investigate, execute bounded changes, verify independently, and produce cited conclusions |
+| M2 alert and knowledge loop | Trigger investigation from alerts, attach bounded metrics, and retrieve reviewed runbooks and verified runs |
 | Bilingual UI | Full Chinese/English interface; switch instantly under Settings → Appearance & Language, persisted server-side |
 
 ## AI operations is not "handing the shell to a model"
@@ -93,9 +94,12 @@ single-host, recoverable Run: investigation, bounded changes, service operations
 independent verification, and a cited conclusion. This is not a model-owned
 shell. The server fixes the target asset, system account, permission profile,
 budget, and action allowlist; write actions still follow `ask`/Guardian/human
-  approval rules, and `auto` is restricted to assets marked `lab`. The standard
-  bundled install starts the dedicated Redis and Worker; autonomous runs are
-  available by default. See the
+approval rules, and `auto` is restricted to assets marked `lab`. The standard
+bundled install starts one Redis 8 service and a Worker; autonomous runs are
+available by default. M2 also adds an Alertmanager entry point, an operations
+posture page, and administrator-reviewed vector knowledge. Knowledge citations
+inform investigation but never grant permissions or replace independent
+verification. See the
   [AI operations guide](docs/ai/USER_GUIDE.md).
 
 ## Quick start

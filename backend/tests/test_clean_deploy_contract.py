@@ -54,7 +54,7 @@ def test_backend_image_publish_is_guarded_while_repository_is_private():
     assert "linux/amd64" in workflow
     assert "release:" not in workflow.split("permissions:", 1)[0]
     assert "workflow_dispatch:" in workflow
-    assert "npm run build" in workflow
+    assert "context: ." in workflow
     assert "ops/build-deploy-bundle.sh" in workflow
     assert "gh release upload" in workflow
     assert "gh release view" in workflow
@@ -103,13 +103,13 @@ def test_compose_bootstrap_is_a_versioned_checksumming_thin_wrapper():
     assert "openssl rand -hex" in bootstrap
     assert "OGS_FLASK_SECRET_KEY \"\"" in bootstrap
     assert "OGS_FERNET_KEYS \"\"" in bootstrap
-    assert 'autonomy_redis_password="$(openssl rand -hex 24)"' in bootstrap
     assert 'set_key .env OGS_AI_AUTONOMY_ENABLED true' in bootstrap
-    assert 'set_key .env OGS_AI_AUTONOMY_REDIS_HOST autonomy-redis' in bootstrap
+    assert 'set_key .env OGS_AI_AUTONOMY_REDIS_HOST redis' in bootstrap
     assert (
         'set_key .env OGS_AI_AUTONOMY_REDIS_PASSWORD '
-        '"$autonomy_redis_password"'
+        '"$redis_password"'
     ) in bootstrap
+    assert 'set_key .env OGS_AUTONOMY_WORKER_CONCURRENCY 2' in bootstrap
     assert "docker volume inspect" in bootstrap
     assert "docker build" not in bootstrap
     assert "down -v" not in bootstrap
@@ -125,23 +125,37 @@ def test_compose_does_not_force_global_container_names():
     assert "container_name:" not in compose
 
 
-def test_standard_compose_starts_autonomy_redis_and_worker():
+def test_standard_compose_is_four_containers_with_one_redis():
     compose = (DEPLOY / "docker-compose.yml").read_text(encoding="utf-8")
+    redis_service = compose.split("  redis:\n", 1)[1].split("\n  mysql:\n", 1)[0]
     env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
     backend_env = (REPO_ROOT / "backend" / ".env.example").read_text(
         encoding="utf-8",
     )
-    assert "  autonomy-redis:" in compose
-    assert "  autonomy-worker:" in compose
-    assert "redis/redis-stack-server:7.4.0-v3" in compose
+    assert all(f"  {service}:" in compose for service in ("app", "worker", "redis", "mysql"))
+    assert "  frontend:" not in compose
+    assert "  autonomy-redis:" not in compose
+    assert "redis:8.10.0" in compose
+    assert "redis:8.10.0-alpine" not in compose
+    assert "docker-entrypoint.sh redis-server --appendonly yes" in redis_service
+    assert "--maxmemory-policy volatile-lru" in redis_service
+    assert '"$$OGS_REDIS_PASSWORD"' in redis_service
+    assert "--requirepass\n      - ${OGS_REDIS_PASSWORD:-}" not in redis_service
     assert "app.ai.autonomy.celery_entry:celery_app" in compose
     assert compose.count(
         "OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-true}",
     ) == 2
-    assert "OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-autonomy-redis}" in compose
+    assert compose.count("OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-redis}") == 2
+    assert compose.count("OGS_REDIS_DB: ${OGS_REDIS_DB:-2}") == 2
+    assert compose.count(
+        "OGS_REDIS_MAX_CONNECTIONS: ${OGS_REDIS_MAX_CONNECTIONS:-256}",
+    ) == 2
+    assert 'OGS_PROXY_LAYERS: "0"' in compose
+    assert "OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}" in compose
     assert "autonomy-redis-data:" in compose
     assert "OGS_AI_AUTONOMY_ENABLED=" in env_example
-    assert "OGS_AI_AUTONOMY_REDIS_PASSWORD=" in env_example
+    assert "OGS_REDIS_MAX_CONNECTIONS=256" in env_example
+    assert "OGS_AI_AUTONOMY_REDIS_PASSWORD=" not in env_example
     assert "OGS_AI_AUTONOMY_ENABLED=" in backend_env
 
 
@@ -153,15 +167,13 @@ def test_release_bundle_contains_all_compose_runtime_inputs():
         "backend/.env.example",
         "backend/mysqldir/orange.sql",
         "deploy/docker-compose.yml",
-        "deploy/nginx/frontend_container.conf",
-        "deploy/nginx/ogs_proxy_common.conf",
-        "frontend/dist/index.html",
         "ops/preflight-compose.sh",
         "ops/bootstrap-compose.sh",
     ):
         assert f'"{path}"' in builder
     assert "sha256sum" in builder
-    assert "references missing file" in builder
+    assert "frontend/dist" not in builder
+    assert "deploy/nginx" not in builder
     assert '"CHANGELOG.md"' in builder
     assert '"docs/operations/UPGRADE.md"' in builder
     assert '"${ROOT}/backend/mysqldir/"*.sql' in builder
@@ -450,8 +462,8 @@ def test_rev54_autonomy_migration_matches_baseline_and_orm():
         assert f"_utf8mb4''{status}''" in rev54
 
 
-def test_rev55_autonomy_migration_matches_baseline_and_orm():
-    """M1/S3: rev55 追加列后，rev53+rev54+rev55、orange.sql 与 ORM 一致。"""
+def test_autonomy_run_migrations_match_baseline_and_orm():
+    """自治 Run 迁移、orange.sql 与 ORM 列集合一致。"""
     from app.core.db.database import db
 
     def migration_columns(path):
@@ -486,12 +498,18 @@ def test_rev55_autonomy_migration_matches_baseline_and_orm():
 
     rev53_columns = create_columns(rev53, "t_ai_autonomous_run")
     rev54_added = migration_columns("rev54_ai_autonomy_lease.sql")
+    rev57_added = migration_columns("rev57_ai_ops_trigger.sql")
+    assert rev57_added == {
+        "trigger_type", "trigger_ref", "trigger_summary",
+    }
+    rev59_added = migration_columns("rev59_ai_autonomy_conclusion.sql")
+    assert rev59_added == {"conclusion_json"}
     baseline_columns = create_columns(schema, "t_ai_autonomous_run")
     orm_columns = set(
         db.metadata.tables["t_ai_autonomous_run"].columns.keys()
     )
     assert (
-        rev53_columns | rev54_added | added
+        rev53_columns | rev54_added | added | rev57_added | rev59_added
         == baseline_columns == orm_columns
     )
 
@@ -502,6 +520,15 @@ def test_rev55_autonomy_migration_matches_baseline_and_orm():
     )
     assert run_ddl, "orange.sql must define t_ai_autonomous_run"
     assert "`custom_profile_json` text DEFAULT NULL" in run_ddl.group(1)
+    assert "`conclusion_json` text DEFAULT NULL" in run_ddl.group(1)
+    assert "UNIQUE KEY `uq_ai_auto_run_trigger`" in run_ddl.group(1)
+
+    rev57 = (
+        BACKEND / "mysqldir" / "rev57_ai_ops_trigger.sql"
+    ).read_text(encoding="utf-8")
+    assert rev57.count("information_schema.COLUMNS") == 3
+    assert rev57.count("information_schema.STATISTICS") == 1
+    assert rev57.count("PREPARE stmt FROM @sql;") == 4
 
 
 def test_rev56_autonomy_evidence_table_matches_baseline_and_orm():
@@ -555,12 +582,75 @@ def test_rev56_autonomy_evidence_table_matches_baseline_and_orm():
     ) < schema.index("DROP TABLE IF EXISTS `t_ai_autonomous_run`;")
 
 
+def test_rev58_knowledge_tables_match_fresh_schema_and_orm():
+    from app.core.db.database import db
+
+    migration = (
+        BACKEND / "mysqldir" / "rev58_ai_knowledge.sql"
+    ).read_text(encoding="utf-8")
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+
+    def columns(source, table):
+        match = re.search(
+            r"CREATE TABLE(?: IF NOT EXISTS)? `" + table
+            + r"` \((.*?)\)\s*ENGINE=",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        assert match, table
+        return set(re.findall(r"^\s*`([^`]+)`\s+", match.group(1), re.MULTILINE))
+
+    for table in ("t_ai_embedding_config", "t_ai_knowledge_document"):
+        assert columns(migration, table) == columns(schema, table)
+        assert columns(schema, table) == set(db.metadata.tables[table].columns.keys())
+    assert migration.count("CREATE TABLE IF NOT EXISTS") == 2
+    assert "INSERT IGNORE INTO `t_ai_embedding_config`" in migration
+    assert "BAAI/bge-small-zh-v1.5" in migration
+    assert "09b6e5dccb3cf9c17b68c4493ceb1cf6eb4c6980e8a429a8c3343d46932e75ec" in migration
+    assert "`content` longtext NOT NULL" in migration
+
+
+def test_rev60_backfills_all_active_admins_into_all_permissions():
+    migration = (
+        BACKEND / "mysqldir" / "rev60_admin_all_permissions.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "SET NAMES utf8mb4;" in migration
+    assert "INSERT IGNORE INTO `t_auth_host_user`" in migration
+    assert "admin_user.`usrole` = 'admin'" in migration
+    assert "admin_user.`is_deleted` = 0" in migration
+    assert "all_auth.`name` = '所有权限'" in migration
+
+
+def test_dockerfile_pins_and_verifies_local_embedding_model():
+    dockerfile = (BACKEND / "Dockerfile").read_text(encoding="utf-8")
+    requirements = (BACKEND / "requirements.txt").read_text(encoding="utf-8")
+    assert "fastembed==0.8.0" in requirements
+    assert "langchain-text-splitters==1.1.2" in requirements
+    assert "fast-bge-small-zh-v1.5.tar.gz" in dockerfile
+    assert "bf023219b6029148fddf764d248808816c0ca1f107f058231bb1ae0fa526f83f" in dockerfile
+    assert "sha256sum -c -" in dockerfile
+    assert "libgomp1" in dockerfile
+    assert "OGS_AI_EMBEDDING_MODEL_PATH=/opt/orangeserver/models/fast-bge-small-zh-v1.5" in dockerfile
+    assert "PIP_EXTRA_INDEX_URL" not in dockerfile
+    compose = (REPO_ROOT / "deploy" / "docker-compose.yml").read_text(
+        encoding="utf-8",
+    )
+    assert compose.count(
+        "OGS_AI_EMBEDDING_MODEL_PATH: "
+        "/opt/orangeserver/models/fast-bge-small-zh-v1.5"
+    ) == 2
+
+
 def test_dockerfile_builds_from_committed_requirements_without_resolving_lock():
     dockerfile = (BACKEND / "Dockerfile").read_text(encoding="utf-8")
     assert "pip-compile" not in dockerfile
-    assert "COPY requirements.txt" in dockerfile
+    assert "COPY backend/requirements.txt" in dockerfile
     assert "pip wheel" in dockerfile
     assert "FROM base AS runtime" in dockerfile
+    assert "FROM node:22.22.1-alpine AS frontend-builder" in dockerfile
+    assert "npm ci --no-audit --no-fund" in dockerfile
+    assert "COPY --from=frontend-builder" in dockerfile
     assert "/app/.gunicorn" in dockerfile
 
 
@@ -613,11 +703,25 @@ def test_autonomy_dev_overlay_uses_dedicated_redis8_and_worker():
         "${OGS_DEV_AUTONOMY_BACKEND_TAG:-local}"
     )
     assert overlay.count("image: " + image) == 2
-    assert overlay.count("context: ../backend") == 2
+    assert overlay.count("context: ..") == 2
+    assert overlay.count("dockerfile: backend/Dockerfile") == 2
     assert overlay.count("pull_policy: never") == 2
     assert "app.ai.autonomy.celery_entry:celery_app" in overlay
-    assert "--concurrency=1" in overlay
-    assert "inspect ping" in overlay
+    assert "--concurrency=1" not in overlay
+    assert "OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}" in overlay
+    health_probe = (
+        "from app.ai.autonomy.readiness import checkpoint_readiness, "
+        "worker_readiness; raise SystemExit(0 if checkpoint_readiness() "
+        "and worker_readiness() else 1)"
+    )
+    assert health_probe in overlay
+    assert "inspect ping" not in overlay
+    assert health_probe in (
+        REPO_ROOT / "deploy" / "docker-compose.yml"
+    ).read_text(encoding="utf-8")
+    assert health_probe in (
+        REPO_ROOT / "deploy" / "docker-compose.s2-smoke.yml"
+    ).read_text(encoding="utf-8")
     assert "../backend:/app" in overlay
     assert overlay.count("condition: service_healthy") == 4
     assert "docker-compose.dev-autonomy.yml" in makefile

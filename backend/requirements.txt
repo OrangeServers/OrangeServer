@@ -59,7 +59,8 @@ celery==5.6.3
 langgraph==1.2.10
 langgraph-checkpoint-redis==0.5.1
 
-# --- Automation (Ansible) -------------------------------------------------
-# 项目自研 ansible_runner/ 走的是 ansible-core API，而非社区 ansible 发行版
-# 历史注释里的 ansible~=4.10.0 是错的（4.x 已 EOL），必须装 ansible-core
-ansible-core==2.18.17
+# --- Bounded knowledge retrieval (M2/S2) ---------------------------------
+# Keep only the standalone splitter; no LangChain agents or tracing stack.
+langchain-text-splitters==1.1.2
+# Local ONNX embeddings; the model is baked into the image separately.
+fastembed==0.8.0

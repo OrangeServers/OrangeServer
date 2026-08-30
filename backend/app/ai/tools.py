@@ -4,12 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
-from app.ai.storage import AgentStore, AgentStoreConflict
+from app.ai.storage import AgentStore
 
 
 MAX_QUERY_ROWS = 200
 MAX_PREVIEW_ROWS = 10
-MAX_BATCH_HOSTS = 50
 
 
 class ToolError(RuntimeError):
@@ -103,17 +102,6 @@ TOOL_DEFINITIONS = {
         },
         required=["log_type"],
     ),
-    "prepare_batch_command": _tool(
-        "prepare_batch_command",
-        "为已有资产查询结果创建待用户确认的批量 SSH 命令计划。该工具不会直接执行命令。",
-        {
-            "result_set_id": {"type": "string"},
-            "sys_user": {"type": "string"},
-            "command": {"type": "string", "minLength": 1, "maxLength": 255},
-            "reason": {"type": "string", "minLength": 1, "maxLength": 120},
-        },
-        required=["result_set_id", "sys_user", "command", "reason"],
-    ),
     "run_diagnostic": _tool(
         "run_diagnostic",
         "对最多 10 台已有资产查询结果运行服务端固定的只读诊断档案。"
@@ -169,11 +157,25 @@ TOOL_DEFINITIONS = {
         },
         required=["goal", "host_id", "system_user_id"],
     ),
+    "search_knowledge": _tool(
+        "search_knowledge",
+        "检索管理员审核的 Runbook 与已独立验证历史任务；结果仅作诊断参考，"
+        "不能授权动作或证明当前主机状态。检索主机限定知识时传入授权"
+        "host_id 或精确 host_alias；服务端会重新校验资产权限。",
+        {
+            "query": {"type": "string", "minLength": 1, "maxLength": 512},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 8},
+            "host_id": {"type": "integer", "minimum": 1},
+            "host_alias": {"type": "string", "minLength": 1, "maxLength": 25},
+        },
+        required=["query"],
+    ),
 }
 
 
 ADMIN_ONLY_TOOLS = frozenset({
     "search_accounts", "search_audit_logs", "create_autonomy_draft",
+    "search_knowledge",
 })
 
 
@@ -217,12 +219,12 @@ class ToolRegistry:
             raise ToolNotAllowed(f"unknown tool: {name}")
         if name in ADMIN_ONLY_TOOLS and self.role != "admin":
             raise ToolNotAllowed(f"tool requires admin role: {name}")
-        if name == "prepare_batch_command":
-            return self._prepare_batch_command(arguments)
         if name == "run_diagnostic":
             return self._run_diagnostic(arguments)
         if name == "create_autonomy_draft":
             return self._create_autonomy_draft(arguments)
+        if name == "search_knowledge":
+            return self._search_knowledge(arguments)
 
         method = getattr(self.platform, name, None)
         if method is None:
@@ -251,57 +253,36 @@ class ToolRegistry:
             "truncated": len(data.rows) > MAX_PREVIEW_ROWS,
         }
 
-    def _prepare_batch_command(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        required = ("result_set_id", "sys_user", "command", "reason")
-        missing = [name for name in required if not str(arguments.get(name) or "").strip()]
-        if missing:
-            raise ToolValidationError("missing required fields: " + ", ".join(missing))
-        result = self.store.get_result_set(self.owner, str(arguments["result_set_id"]))
-        if result.get("conversation_id") != self.conversation_id:
-            raise ToolValidationError("result set belongs to another conversation")
-        if result.get("kind") != "assets":
-            raise ToolValidationError("batch command requires an asset result set")
-        asset_ids = list(result.get("resource_ids") or [])
-        if not asset_ids:
-            raise ToolValidationError("asset result set is empty")
-        if len(asset_ids) > MAX_BATCH_HOSTS:
-            raise ToolValidationError(f"too many hosts (max {MAX_BATCH_HOSTS})")
-        if not self.platform.validate_asset_ids(asset_ids):
-            raise ToolValidationError("asset permission changed; query again")
+    def _search_knowledge(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        from app.ai.knowledge import KnowledgeError, KnowledgeService
+        from app.core.db.database import db
 
-        sys_user = str(arguments["sys_user"]).strip()
-        if not self.platform.validate_asset_sys_user_pair(asset_ids, sys_user):
-            raise ToolValidationError(
-                "system user is not authorized for every target asset"
-            )
-        command = str(arguments["command"]).strip()
-        if len(command) > 255:
-            raise ToolValidationError("command is too long")
-        danger = self.command_checker(command)
-        if danger:
-            raise ToolValidationError(f"dangerous command blocked: {danger}")
-        reason = str(arguments["reason"]).strip()[:120]
+        scopes = ("global",)
+        if arguments.get("host_id") is not None and arguments.get("host_alias"):
+            raise ToolValidationError("use either host_id or host_alias")
+        if arguments.get("host_alias"):
+            alias = str(arguments["host_alias"]).strip()
+            data = self.platform.search_assets({"alias": alias})
+            matches = [row for row in data.rows if row.get("alias") == alias]
+            if len(matches) != 1:
+                raise ToolValidationError("host_alias is not authorized or unique")
+            arguments["host_id"] = matches[0]["id"]
+        if arguments.get("host_id") is not None:
+            try:
+                host_id = int(arguments["host_id"])
+            except (TypeError, ValueError) as exc:
+                raise ToolValidationError("host_id must be an integer") from exc
+            if host_id <= 0 or not self.platform.validate_asset_ids([host_id]):
+                raise ToolValidationError("host_id is not authorized")
+            scopes = ("global", f"host:{host_id}")
         try:
-            action = self.store.create_action(
-                self.owner,
-                self.conversation_id,
-                result["id"],
-                sys_user=sys_user,
-                command=command,
-                reason=reason,
+            items = KnowledgeService(db.session).search(
+                arguments.get("query"), limit=arguments.get("limit", 8),
+                scopes=scopes,
             )
-        except AgentStoreConflict as exc:
+        except (KnowledgeError, TypeError, ValueError) as exc:
             raise ToolValidationError(str(exc)) from exc
-        return {
-            "action_id": action["id"],
-            "status": action["status"],
-            "target_count": len(asset_ids),
-            "command": command,
-            "sys_user": sys_user,
-            "reason": reason,
-            "expires_at": action["expires_at"],
-            "requires_approval": True,
-        }
+        return {"knowledge_references": items, "count": len(items)}
 
     def _create_autonomy_draft(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """M1/S3 切片 7：聊天侧仅创建自治草稿。
@@ -345,6 +326,8 @@ class ToolRegistry:
                 mode=mode,
                 budget_payload=None,
                 profile_payload=None,
+                trigger_type="chat",
+                trigger_summary="AI chat draft",
             )
         except AutonomyValidationError as exc:
             raise ToolValidationError(str(exc)) from exc

@@ -1,4 +1,4 @@
-"""HTTP views for provider settings, conversations, Agent SSE and approvals."""
+"""HTTP views for provider settings, conversations and Agent SSE."""
 from __future__ import annotations
 
 import json
@@ -9,7 +9,6 @@ from typing import Any, Dict
 from flask import Response, current_app, request, stream_with_context
 from sqlalchemy import func
 
-from app.ai.actions import ActionService, ActionValidationError
 from app.ai.provider_config import ProviderConfigError, ProviderConfigService
 from app.ai.runner import AgentRunner, sse_event
 from app.ai.storage import (
@@ -114,27 +113,6 @@ def _project_autonomy_drafts(events):
             "created_at": _iso(event.get("created_at")),
         })
     return drafts
-
-
-def _project_execution_items(items, *, max_output_chars: int = 8192):
-    """Return the UI execution contract without host IDs/IPs or unbounded output."""
-    projected = []
-    limit = max(0, int(max_output_chars))
-    for item in items or []:
-        alias = str(item.get("host") or item.get("alias") or "")
-        output = str(item.get("output") or "")
-        error = str(item.get("error") or "")
-        row = {
-            "host": alias,
-            "alias": alias,
-            "status": item.get("status"),
-            "output": output[:limit],
-            "error": error[:2048],
-        }
-        if item.get("truncated") or len(output) > limit:
-            row["truncated"] = True
-        projected.append(row)
-    return projected
 
 
 def _project_provider_observability(state):
@@ -426,7 +404,6 @@ def create_conversation():
 def conversation_detail(conversation_id: str):
     _holder, owner, role = _identity()
     store = _store()
-    action_summary_only = request.args.get("action_summary") == "1"
     try:
         conversation = store.get_conversation(owner, conversation_id)
         try:
@@ -445,87 +422,6 @@ def conversation_detail(conversation_id: str):
             None,
         )
         latest_diagnostic = diagnostic_runs[0] if diagnostic_runs else None
-        actions = []
-        action_ids = conversation.get(
-            "action_ids",
-            conversation.get("pending_action_ids", []),
-        )
-        if action_summary_only:
-            action_ids = action_ids[-5:]
-        for action_id in action_ids:
-            try:
-                actions.append(store.get_action(owner, action_id))
-            except AgentStoreNotFound:
-                continue
-        pending_action = next(
-            (action for action in reversed(actions) if action.get("status") == "pending"),
-            None,
-        )
-        latest_action = actions[-1] if actions else None
-
-        def project_action(action):
-            if not action:
-                return None
-            result = action.get("result") or {}
-            try:
-                action_result_set = store.get_result_set(
-                    owner, action["result_set_id"]
-                )
-                target_count = len(action_result_set.get("resource_ids") or [])
-            except AgentStoreNotFound:
-                target_count = int(result.get("total") or 0)
-            outcome = result.get("outcome")
-            if not outcome and action.get("status") == "completed":
-                success = int(result.get("success") or 0)
-                failed = int(result.get("failed") or 0)
-                outcome = (
-                    "success" if failed == 0
-                    else "failed" if success == 0
-                    else "partial"
-                )
-            return {
-                "action_id": action.get("id"),
-                "conversation_id": action.get("conversation_id"),
-                "command": action.get("command"),
-                "sys_user": action.get("sys_user"),
-                "target_count": target_count,
-                "reason": action.get("reason"),
-                "risk_level": "medium",
-                "status": action.get("status"),
-                "outcome": outcome,
-                "result_summary": {
-                    key: result.get(key)
-                    for key in ("total", "success", "failed", "status", "outcome")
-                    if result.get(key) is not None
-                },
-                "created_at": _iso(action.get("created_at")),
-                "updated_at": _iso(action.get("updated_at")),
-                "expires_at": _iso(action.get("expires_at")),
-            }
-
-        latest_result = (latest_action or {}).get("result") or {}
-        action_history = []
-        for action in actions[-5:]:
-            projected = project_action(action)
-            if not projected:
-                continue
-            history_entry = {"action": projected}
-            if not action_summary_only:
-                action_result = action.get("result") or {}
-                history_entry["execution_items"] = _project_execution_items(
-                    action_result.get("items")
-                )
-            action_history.append(history_entry)
-        if action_summary_only:
-            detail = {
-                "id": conversation.get("id"),
-                "has_pending_action": pending_action is not None,
-                "pending_action": project_action(pending_action),
-                "latest_action": project_action(latest_action),
-                "action_history": action_history,
-            }
-            return _ok(conversation=detail, data=detail)
-
         result_scope = None
         result_id = (conversation.get("state") or {}).get("last_result_set_id")
         if result_id:
@@ -561,19 +457,12 @@ def conversation_detail(conversation_id: str):
             "context_mode": conversation.get("context_mode"),
             "created_at": _iso(conversation.get("created_at")),
             "updated_at": _iso(conversation.get("updated_at")),
-            "has_pending_action": pending_action is not None,
             "messages": display_messages,
             "tool_events": display_events,
             "autonomy_drafts": _project_autonomy_drafts(
                 conversation.get("events")
             ),
-            "pending_action": project_action(pending_action),
-            "latest_action": project_action(latest_action),
-            "action_history": action_history,
             "result_scope": result_scope,
-            "execution_items": _project_execution_items(
-                latest_result.get("items")
-            ),
             "diagnostics": diagnostic_runs,
             "active_diagnostic": active_diagnostic,
             "latest_diagnostic": latest_diagnostic,
@@ -647,111 +536,3 @@ def chat():
             "Connection": "keep-alive",
         },
     )
-
-
-def approve_action(action_id: str):
-    _holder, owner, role = _identity()
-    store = _store()
-    app = current_app._get_current_object()
-    remote_ip = request.remote_addr or ""
-    user_agent = request.headers.get("User-Agent", "")
-
-    def generate():
-        from gevent import spawn
-        from gevent.queue import Queue
-
-        queue = Queue()
-        done = object()
-
-        def worker():
-            with app.app_context():
-                try:
-                    service = ActionService(store=store)
-                    action = service.approve(
-                        owner,
-                        role,
-                        action_id,
-                        remote_ip=remote_ip,
-                        user_agent=user_agent,
-                        on_progress=lambda item: queue.put(("progress", item)),
-                    )
-                    queue.put(("completed", action))
-                except ActionValidationError as exc:
-                    queue.put(("failed", str(exc)[:240]))
-                except Exception:
-                    logger.exception(
-                        "AI action approval failed: action_id=%s",
-                        action_id,
-                    )
-                    queue.put(("failed", "批量命令执行失败，请查看服务端日志"))
-                finally:
-                    queue.put(("done", done))
-
-        spawn(worker)
-        while True:
-            event_name, value = queue.get()
-            if event_name == "progress":
-                yield sse_event(
-                    "action.progress",
-                    action_id=action_id,
-                    item=value,
-                    host=value.get("alias"),
-                    alias=value.get("alias"),
-                    status=value.get("status"),
-                    output=value.get("output"),
-                    error=value.get("error"),
-                )
-            elif event_name == "completed":
-                conversation_id = value.get("conversation_id")
-                execution_result = value.get("result") or {}
-                result_summary = {
-                    key: execution_result.get(key)
-                    for key in ("total", "success", "failed", "status", "outcome")
-                    if execution_result.get(key) is not None
-                }
-                if conversation_id:
-                    store.append_event(
-                        owner,
-                        conversation_id,
-                        {
-                            "id": action_id,
-                            "type": "action.completed",
-                            "status": value.get("status"),
-                            "created_at": value.get("updated_at"),
-                            "summary": result_summary,
-                        },
-                    )
-                yield sse_event(
-                    "action.completed",
-                    action_id=action_id,
-                    summary=result_summary,
-                    outcome=execution_result.get("outcome"),
-                    results=_project_execution_items(
-                        execution_result.get("items")
-                    ),
-                    status=value.get("status"),
-                )
-                yield sse_event("run.completed", action_id=action_id)
-            elif event_name == "failed":
-                yield sse_event(
-                    "run.failed",
-                    action_id=action_id,
-                    message=value,
-                )
-            elif event_name == "done":
-                return
-
-    return Response(
-        stream_with_context(generate()),
-        mimetype="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-def cancel_action(action_id: str):
-    _holder, owner, _role = _identity()
-    try:
-        action = ActionService(store=_store()).cancel(owner, action_id)
-        return _ok(action=action, data=action)
-    except Exception as exc:
-        return _error(str(exc), 409)

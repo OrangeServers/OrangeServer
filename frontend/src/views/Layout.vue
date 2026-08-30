@@ -76,6 +76,9 @@
           <el-menu-item index="/ai-runs" v-if="isAdmin" @click="$router.push('/ai-runs')">
             <el-icon><Stopwatch /></el-icon><span>{{ $t('menu.aiRuns') }}</span>
           </el-menu-item>
+          <el-menu-item index="/ai-knowledge" v-if="isAdmin" @click="$router.push('/ai-knowledge')">
+            <el-icon><Collection /></el-icon><span>{{ $t('menu.aiKnowledge') }}</span>
+          </el-menu-item>
 
           <!-- 审计 -->
           <div v-show="!collapsed && (isAdmin || isAudit)" class="sidebar-section">{{ $t('menu.group.audit') }}</div>
@@ -188,7 +191,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
   Fold, Expand, ArrowDown, User, SwitchButton,
-  MagicStick, Sunny, Moon, Promotion, Cpu, Stopwatch,
+  MagicStick, Sunny, Moon, Promotion, Cpu, Stopwatch, Collection,
 } from '@element-plus/icons-vue'
 import { store, loadUserInfo, loadUserRole, loadSettings, applyTheme, clearAuthState } from '@/store'
 import { t } from '@/i18n'

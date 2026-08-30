@@ -128,6 +128,8 @@ def test_create_autonomy_draft_creates_draft_only(autonomy_env):
     assert role == "admin"
     assert kwargs["budget_payload"] is None
     assert kwargs["profile_payload"] is None
+    assert kwargs["trigger_type"] == "chat"
+    assert kwargs["trigger_summary"] == "AI chat draft"
 
 
 def test_create_autonomy_draft_disabled_flag_blocks_execution(monkeypatch):

@@ -574,6 +574,10 @@ class t_ai_autonomous_run(db.Model, TimestampMixin):
         db.UniqueConstraint(
             'active_host_id', name='uq_ai_auto_run_active_host',
         ),
+        db.UniqueConstraint(
+            'trigger_type', 'trigger_ref',
+            name='uq_ai_auto_run_trigger',
+        ),
     )
     id = db.Column(db.String(32), primary_key=True)
     owner = db.Column(db.String(24), nullable=False, index=True)
@@ -583,12 +587,25 @@ class t_ai_autonomous_run(db.Model, TimestampMixin):
     system_user_id = db.Column(db.INTEGER, nullable=False)
     system_user_alias = db.Column(db.String(24), nullable=False)
     mode = db.Column(db.String(16), nullable=False)
+    # M2/S1: 触发来源只保存服务端枚举、不可逆幂等引用和脱敏摘要。
+    # 手工/聊天创建没有 trigger_ref；Alertmanager 使用
+    # sha256(groupKey + startsAt)，唯一键封住重复投递竞态。
+    trigger_type = db.Column(
+        db.String(16), nullable=False,
+        default='manual', server_default='manual',
+    )
+    trigger_ref = db.Column(db.String(64), nullable=True)
+    trigger_summary = db.Column(
+        db.String(512), nullable=False, default='', server_default='',
+    )
     # M1/S3: custom 权限档案（仅 mode='custom' 时非空）。服务端固定
     #   动作类别集合 + Run 已绑定的单一主机；不引入策略表达式语言。
     #   同步 DDL: backend/mysqldir/rev55_ai_autonomy_custom_profile.sql
     custom_profile_json = db.Column(db.Text, nullable=True)
     status = db.Column(db.String(20), nullable=False, index=True)
     outcome = db.Column(db.String(16), nullable=True)
+    # M2: bounded operator-facing conclusion fields and Evidence references.
+    conclusion_json = db.Column(db.Text, nullable=True)
     revision = db.Column(db.INTEGER, nullable=False, default=0)
     budget_json = db.Column(db.Text, nullable=False)
     latest_event_seq = db.Column(db.INTEGER, nullable=False, default=0)
@@ -727,6 +744,59 @@ class t_ai_autonomous_evidence(db.Model):
         db.BOOLEAN, nullable=False, default=False, server_default='0',
     )
     created_at = db.Column(db.DateTime, nullable=False, default=_utcnow)
+
+
+class t_ai_embedding_config(db.Model, TimestampMixin):
+    """M2/S2 singleton embedding/index configuration; secrets stay encrypted."""
+
+    __tablename__ = 't_ai_embedding_config'
+    id = db.Column(db.INTEGER, primary_key=True, default=1)
+    provider_type = db.Column(
+        db.String(24), nullable=False, default='local', server_default='local',
+    )
+    base_url = db.Column(db.String(255), nullable=True)
+    model = db.Column(db.String(128), nullable=False)
+    api_key_ciphertext = db.Column(db.String(1024), nullable=True)
+    dimension = db.Column(db.INTEGER, nullable=False, default=512)
+    model_fingerprint = db.Column(db.String(64), nullable=False)
+    indexed_fingerprint = db.Column(db.String(64), nullable=True)
+    index_state = db.Column(
+        db.String(16), nullable=False, default='empty', server_default='empty',
+    )
+    indexed_chunks = db.Column(
+        db.INTEGER, nullable=False, default=0, server_default='0',
+    )
+
+
+class t_ai_knowledge_document(db.Model, TimestampMixin):
+    """M2/S2 approved Markdown truth; Redis chunks are rebuildable derivatives."""
+
+    __tablename__ = 't_ai_knowledge_document'
+    __table_args__ = (
+        db.UniqueConstraint(
+            'source_type', 'source_ref', name='uq_ai_knowledge_source',
+        ),
+    )
+    id = db.Column(db.String(32), primary_key=True)
+    title = db.Column(db.String(128), nullable=False)
+    source_type = db.Column(db.String(16), nullable=False, index=True)
+    source_ref = db.Column(db.String(64), nullable=True)
+    scope = db.Column(
+        db.String(128), nullable=False, default='global', server_default='global',
+    )
+    content = db.Column(
+        db.Text().with_variant(LONGTEXT(), 'mysql'), nullable=False,
+    )
+    content_sha256 = db.Column(db.String(64), nullable=False)
+    version = db.Column(db.INTEGER, nullable=False, default=1, server_default='1')
+    approved = db.Column(
+        db.BOOLEAN, nullable=False, default=True, server_default='1', index=True,
+    )
+    indexed_fingerprint = db.Column(db.String(64), nullable=True)
+    chunk_count = db.Column(
+        db.INTEGER, nullable=False, default=0, server_default='0',
+    )
+    created_by = db.Column(db.String(24), nullable=False, index=True)
 
 
 class t_settings(db.Model):

@@ -12,6 +12,7 @@ export default {
   webTerminal: 'Web terminal',
   aiAgent: 'AI operations',
   aiRuns: 'Autonomous runs',
+  aiKnowledge: 'Ops knowledge',
   authority: 'Authorization',
   cron: 'Scheduled jobs',
   fileTransfer: 'File transfer',

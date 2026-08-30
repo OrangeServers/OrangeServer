@@ -32,7 +32,7 @@ app.secret_key = FLASK_SECRET_KEY
 #   注意: 反代必须配置 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 try:
     from werkzeug.middleware.proxy_fix import ProxyFix
-    _OGS_PROXY_LAYERS = int(_env('OGS_PROXY_LAYERS', '1'))
+    _OGS_PROXY_LAYERS = int(_env('OGS_PROXY_LAYERS', '0'))
     if _OGS_PROXY_LAYERS > 0:
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=_OGS_PROXY_LAYERS, x_proto=_OGS_PROXY_LAYERS, x_host=_OGS_PROXY_LAYERS)
 except ImportError:
@@ -111,9 +111,9 @@ def _validate_listen_addr(host, port):
 """
 
 
-@app.route('/')
-def index():
-    return 'hello from OrangeServer api server', 200
+from setup.spa import register_spa
+
+register_spa(app, missing_text='hello from OrangeServer api server')
 
 
 # =============================================================================

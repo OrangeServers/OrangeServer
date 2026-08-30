@@ -96,36 +96,37 @@ rm -rf -- "${work_dir}"
 ```
 
 
-从 v1.1.1 起，标准 bundled 栈新增专用自治 Redis 与 Worker 服务，Compose 对
-`OGS_AI_AUTONOMY_REDIS_PASSWORD` 做强校验。从更早版本升级时，复制过来的旧
-`.env` 不含这些键，直接启动会报 `Set OGS_AI_AUTONOMY_REDIS_PASSWORD` 并中止。
-启动前必须为新目录补齐（幂等，可重复执行）：
+M2 标准 bundled 栈把业务 Redis 与自治 Redis 合并为 Redis 8，并继续挂载旧
+`autonomy-redis-data` 卷以保留 checkpoint。业务会话和缓存可重建，不迁移旧业务 Redis
+卷。启动前把两份环境配置统一到同一个 Redis 密码（幂等，可重复执行）：
 
 ```bash
-autonomy_redis_password="$(openssl rand -hex 24)"
+redis_password="$(openssl rand -hex 24)"
+set_env_key() {
+    local file="$1" key="$2" value="$3"
+    if grep -q "^${key}=" "$file"; then
+        sed -i "s|^${key}=.*$|${key}=${value}|" "$file"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$file"
+    fi
+}
 for env_file in "${next_dir}/.env" "${next_dir}/backend/.env"; do
-    grep -q '^OGS_AI_AUTONOMY_ENABLED=' "$env_file" \
-        || printf 'OGS_AI_AUTONOMY_ENABLED=true
-' >> "$env_file"
-    grep -q '^OGS_AI_AUTONOMY_REDIS_HOST=' "$env_file" \
-        || printf 'OGS_AI_AUTONOMY_REDIS_HOST=autonomy-redis
-' >> "$env_file"
-    grep -q '^OGS_AI_AUTONOMY_REDIS_PORT=' "$env_file" \
-        || printf 'OGS_AI_AUTONOMY_REDIS_PORT=6379
-' >> "$env_file"
-    grep -q '^OGS_AI_AUTONOMY_REDIS_PASSWORD=' "$env_file" \
-        || printf 'OGS_AI_AUTONOMY_REDIS_PASSWORD=%s
-' "$autonomy_redis_password" >> "$env_file"
+    set_env_key "$env_file" OGS_REDIS_HOST redis
+    set_env_key "$env_file" OGS_REDIS_DB 2
+    set_env_key "$env_file" OGS_REDIS_PASSWORD "$redis_password"
+    set_env_key "$env_file" OGS_AI_AUTONOMY_ENABLED true
+    set_env_key "$env_file" OGS_AI_AUTONOMY_REDIS_HOST redis
+    set_env_key "$env_file" OGS_AI_AUTONOMY_REDIS_PORT 6379
+    set_env_key "$env_file" OGS_AI_AUTONOMY_REDIS_PASSWORD "$redis_password"
+    set_env_key "$env_file" OGS_AUTONOMY_WORKER_CONCURRENCY 2
 done
 chmod 600 "${next_dir}/.env" "${next_dir}/backend/.env"
 ```
 
-自治 Redis 镜像默认为 `redis/redis-stack-server:7.4.0-v3`（Docker Hub 引用，
-由 `daemon.json` 的 `registry-mirrors` 加速直拉）。无加速器且无法访问
-Docker Hub 的网络，先把该镜像转存到内部仓库，再在根 `.env` 设置
-`OGS_AUTONOMY_REDIS_IMAGE` 指向转存地址。
+统一 Redis 镜像默认为 `redis:8.10.0`（包含 checkpoint/RAG 所需的 Search 和 JSON）。无法访问 Docker Hub 的网络先把该镜像
+转存到内部仓库，再在根 `.env` 设置 `OGS_REDIS_IMAGE` 指向转存地址。
 
-目标 bundle 目标 bundle 包含 `CHANGELOG.md`、本文和数据库迁移 SQL。先比较当前
+目标 bundle 包含 `CHANGELOG.md`、本文和数据库迁移 SQL。先比较当前
 `.orangeserver-version` 与目标版本说明，只执行跨越版本所要求的迁移。
 
 不要先删除旧镜像。保留一个已验证的应用镜像作为回滚点；具体标签和环境路径只
@@ -139,7 +140,7 @@ Docker Hub 的网络，先把该镜像转存到内部仓库，再在根 `.env` �
 install_dir=/opt/orangeserver
 cd "${install_dir}"
 docker compose --env-file .env -f deploy/docker-compose.yml \
-  --profile bundled stop frontend backend
+  --profile bundled stop app worker
 ```
 
 对尚未启用 AI Provider 和受控诊断的旧实例，依次执行：
@@ -171,6 +172,18 @@ mysql -h <mysql-host> -u <mysql-user> -p <database> \
 
 mysql -h <mysql-host> -u <mysql-user> -p <database> \
   < backend/mysqldir/rev56_ai_autonomy_evidence.sql
+
+mysql -h <mysql-host> -u <mysql-user> -p <database> \
+  < backend/mysqldir/rev57_ai_ops_trigger.sql
+
+mysql -h <mysql-host> -u <mysql-user> -p <database> \
+  < backend/mysqldir/rev58_ai_knowledge.sql
+
+mysql -h <mysql-host> -u <mysql-user> -p <database> \
+  < backend/mysqldir/rev59_ai_autonomy_conclusion.sql
+
+mysql -h <mysql-host> -u <mysql-user> -p <database> \
+  < backend/mysqldir/rev60_admin_all_permissions.sql
 ```
 
 顺序不可颠倒：rev49 修改 rev48 创建的 `t_ai_provider`，rev50 增加受控诊断的
@@ -179,8 +192,14 @@ zh-CN，存量行为不变），rev52 增加由管理界面维护的 SMTP 配置
 保存 Fernet 密文，rev53 为 AI 自治（M1/S1）增加资产环境列与 Run/Step/事件/
 产物四张表；rev54 为自治 Run 表追加 Worker 租约、一次性 fencing token、心跳与
 图版本列（M1/S2），rev55 为自治 Run 表追加可选的自定义权限档案列，rev56 增加
-  脱敏 Evidence 引用表（M1/S3）。标准 bundled 栈会启动专用 Redis Stack 与
-  Worker，自治能力默认可用。
+脱敏 Evidence 引用表（M1/S3），rev57 为 Run 增加触发类型、幂等引用和脱敏触发
+摘要（M2/S1），rev58 增加 embedding 单例配置和已审核知识文档表（M2/S2），
+rev59 为 Run 增加结构化结论详情（M2），rev60 幂等回填存量管理员到现有
+“所有权限”规则，避免自定义管理员名仍沿用旧 `admin` 权限关系；
+Redis 向量是可重建数据，不需要数据库 chunk 表。标准 bundled 栈会启动统一 Redis 8
+与 Worker，自治能力默认可用。
+embedding 模型、维度或向量索引布局变化时，知识库会自动显示“索引待更新”；管理员
+执行一次知识库重建后才恢复检索，旧布局不会被误报为可用。
 各脚本针对其自身变更设计了重复执行保护，但重复运行前仍应
 确认输出和目标数据库正确。
 
@@ -230,7 +249,10 @@ SHOW COLUMNS FROM t_ai_autonomous_run LIKE 'active_host_id';
 SHOW INDEX FROM t_ai_autonomous_run
 WHERE Key_name = 'uq_ai_auto_run_active_host';
 SHOW COLUMNS FROM t_ai_autonomous_run LIKE 'custom_profile_json';
+SHOW COLUMNS FROM t_ai_autonomous_run LIKE 'conclusion_json';
 SHOW TABLES LIKE 't_ai_autonomous_evidence';
+SHOW TABLES LIKE 't_ai_embedding_config';
+SHOW TABLES LIKE 't_ai_knowledge_document';
 
 SELECT
     provider_code,
@@ -240,6 +262,17 @@ SELECT
     context_window_tokens
 FROM t_ai_provider
 ORDER BY provider_code;
+
+SELECT admin_user.name AS admin_without_all_permissions
+FROM t_acc_user AS admin_user
+LEFT JOIN t_auth_host AS all_auth
+  ON all_auth.name = '所有权限' AND all_auth.is_deleted = 0
+LEFT JOIN t_auth_host_user AS binding
+  ON binding.auth_id = all_auth.id
+ AND binding.user_name = admin_user.name
+WHERE admin_user.usrole = 'admin' AND admin_user.is_deleted = 0
+GROUP BY admin_user.name
+HAVING COUNT(binding.id) = 0;
 ```
 
 预期：
@@ -252,7 +285,11 @@ ORDER BY provider_code;
 - `t_ai_autonomous_run.active_host_id` 是生成列，且存在
   `uq_ai_auto_run_active_host` 唯一索引；
 - `t_ai_autonomous_run.custom_profile_json` 和
+  `t_ai_autonomous_run.conclusion_json` 存在；
   `t_ai_autonomous_evidence` 存在；Evidence 的 `trusted` 默认值为 `0`；
+- `t_ai_embedding_config` 只有默认本地模型配置，且
+  `t_ai_knowledge_document` 已创建；
+- `admin_without_all_permissions` 查询返回空结果；
 - 查询结果中不应出现明文 API Key。
 
 ## 5. 启动和冒烟验证
@@ -278,6 +315,9 @@ make docker-ps
 # make docker-up
 ```
 
+启动命令会带 `--remove-orphans`，因此旧版的 `frontend`、`autonomy-worker` 和
+`autonomy-redis` 容器会在新四容器栈接管后被移除；命名卷不会被删除。
+
 基础检查：
 
 ```bash
@@ -290,11 +330,12 @@ make docker-health
 2. 资产列表、授权、批量命令和审计页面可打开；
 3. WebSSH 能建立和关闭会话；
 4. “系统设置 → AI 模型服务”显示 256K/1M 能力；
-5. 已配置 API Key 显示掩码状态而非明文或空配置；
-6. Provider Tool Calling 测试成功；
-7. 新建 256K 会话，执行一次只读资产查询；
-8. 对测试资产运行一个固定只读诊断，检查进度、证据引用和报告；
-9. 创建批量命令计划，检查预览后取消，不在升级冒烟中执行破坏性命令。
+5. “运维知识库”可新建 Runbook、重建索引并显示 `ready`；
+6. 已配置 API Key 显示掩码状态而非明文或空配置；
+7. Provider Tool Calling 测试成功；
+8. 新建 256K 会话，执行一次只读资产查询；
+9. 对测试资产运行一个固定只读诊断，检查进度、证据引用和报告；
+10. 创建批量命令计划，检查预览后取消，不在升级冒烟中执行破坏性命令。
 
 ## 6. 回滚
 
@@ -302,7 +343,8 @@ make docker-health
 
 - 应用启动失败但 schema 向后兼容时，可先恢复上一镜像。
 - 如果旧应用不能识别新 schema，停止写入后恢复升级前 MySQL 备份。
-- rev48/rev49/rev50/rev53/rev54/rev55/rev56 不提供自动 down migration；不要在生产手工删除列或表。
+- rev48/rev49/rev50/rev53/rev54/rev55/rev56/rev57/rev58/rev59/rev60 不提供自动 down migration；
+  不要在生产手工删除列或表。rev58 的 Redis 向量可从 MySQL 文档重建。
 - 恢复数据库前先保留失败现场的日志和当前数据库快照。
 - Release bundle 安装可停止前后端，将当前安装目录移回
   `<安装目录>-next-<failed-version>`，再把保留的

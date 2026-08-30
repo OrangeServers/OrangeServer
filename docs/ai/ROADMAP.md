@@ -1,7 +1,7 @@
 # AI 运维路线图
 
-> 本文同时记录已实现的 M1 受控自治和后续规划。标准 bundled 栈包含专用 Redis 与
-> Worker，默认可用。当前可用行为以
+> 本文同时记录已实现的 M1 受控自治和正在推进的 M2。标准 bundled 栈包含统一
+> Redis 与 Worker，默认可用。当前可用行为以
 > [AI 运维使用指南](USER_GUIDE.md)、[受控只读诊断](DIAGNOSTICS.md) 和
 > [AI REST/SSE 契约](API.md) 为准。
 
@@ -12,9 +12,9 @@ OrangeServer 的目标不是用 AI 包装少量 Linux 基础命令，而是复�
 
 路线图遵守以下原则：
 
-- 当前聊天 `AgentRunner`、固定只读诊断和短时审批动作继续独立维护。
-- LangGraph 仅用于新的长任务自治工作流，不迁移现有聊天循环。
-- 不整包引入 LangChain；继续使用现有 Provider 和 Tool Calling 实现。
+- 聊天只负责查询、解释、诊断和创建自治草稿；远程写操作统一进入 Autonomy Run。
+- LangGraph 继续负责长任务自治工作流，不重写现有 Provider 和 Tool Calling 循环。
+- 文本分片只引入独立的 `langchain-text-splitters`，不引入第二套 Agent 执行循环。
 - MySQL 始终是业务事实源，模型输出、SSE 和 checkpoint 都不能覆盖权威状态。
 - 模型提出动作，服务端决定自动执行、等待审批或拒绝；模型不能自行提高权限。
 - 先做深一个 Linux 单机闭环，再扩展监控、Docker 和 Kubernetes。
@@ -27,12 +27,11 @@ M0 是已经发布的能力：
 - AI 对话、资产和账号查询、权限过滤的结果集；
 - 服务端固定档案的 Linux/Docker 只读诊断；
 - 确定性 Analyzer、Evidence 引用、诊断报告和 Runbook 建议；
-- 批量命令预览、人工审批、执行结果和审计；
+- 独立批量运维页面的命令预览、人工审批、执行结果和审计；
 - 256K 标准上下文与 Provider 声明支持时可选的 1M 深度诊断档。
 
-当前诊断不能提交自由 Shell，修复也不会由诊断流程自动执行。M1/S3 另提供独立的
-自治任务工作台，但必须显式打开 feature flag，并配置专用 Redis 8 与 Worker；标准
-发布栈保持关闭时，现有聊天、诊断和批量审批行为不变。
+当前诊断不能提交自由 Shell，修复也不会由诊断流程直接执行。M1/S3 提供独立自治
+任务工作台；标准发布栈默认启动统一 Redis 8 与 Worker，管理员仍可关闭自治入口。
 
 ## 长期里程碑
 
@@ -46,16 +45,28 @@ M0 是已经发布的能力：
 | M5 运维知识闭环 | 已验证处置转 Runbook、相似事故、健康节点对比、服务拓扑、影响范围和复盘草稿 | 积累足够经人工审核的真实成功案例 |
 | M6 持续运维与评测 | 定时巡检、容量趋势、证书/EOL、场景回放、模型评测和 Agent 可观测性 | 用真实数据证明收益后再评估 MCP、插件或更重调度平台 |
 
-长期里程碑只在本文维护。前一阶段通过完成门后，才为下一阶段创建一至两个近期
-工作包，不提前创建 M2～M6 的占位 Issue。
+长期里程碑只在本文维护。M2 总工作包由
+[Issue #25](https://github.com/OrangeServers/OrangeServer/issues/25) 跟踪；后续阶段不提前
+创建占位 Issue。
 
 ### M2：监控与事故工作台
+
+M2 分三段交付：S0 先收敛执行链、Worker 并发和四容器部署；S1 接入第一条
+Alertmanager → Prometheus/SSH → Autonomy Run 闭环；S2 增加只索引审核 Runbook 与
+已验证 Run 的可重建向量知识库。M2 不迁移 ASGI/asyncio，不替换 Celery prefork，
+也不新增默认监控或向量数据库容器。
+
+当前 Unreleased 已完成 S0、S1 和 S2 实现：单条 Alertmanager 告警入口、固定
+Prometheus 可用性观察、Run 触发契约、运维态势首页，以及只索引审核 Runbook 与
+独立验证 Run 的本地/远程 embedding 知识库。测试机真实告警、并行 Run、知识复用与
+从零四容器纵向验收仍由 Issue #25 跟踪，未完成前不视为 M2 发布门通过。
 
 - Prometheus 和 Loki 请求必须经过服务端查询代理；模型不能提供任意 URL、Header、
   tenant 或无限制 PromQL/LogQL。
 - 服务端限制时间范围、步长、返回量、并发、超时和可用标签，并在进入模型前聚合、
   脱敏和外置大结果。
-- Alertmanager 首版只触发只读调查；创建 silence 或修改告警配置属于独立写动作。
+- Alertmanager 首版只触发 `ask` 调查 Run；远程修复仍走原有审批与验证，创建 silence
+  或修改告警配置不在本阶段范围内。
 - 事故工作台以症状、假设、Evidence、动作、验证和结论时间线为权威事实，聊天只是入口。
 - 关联 OrangeServer 审计、定时任务、监控拐点以及后续接入的发布和容器事件。
 
@@ -103,14 +114,14 @@ v1 仅管理员可用，一次 Run 固定一个目标资产、一个系统用户
 |---|---|
 | MySQL | Run、Step、审批、Event、Artifact 引用和最终结果的业务事实 |
 | LangGraph | `计划 → 策略 → 按需审批暂停 → 执行 → 观察 → 验证 → 决策` 的流程游标 |
-| 专用 Redis 8 | LangGraph checkpoint 和 Celery broker，不保存业务最终结果 |
+| 统一 Redis 8 | DB0 checkpoint/可重建向量，DB1 Celery broker，DB2 会话/缓存；不保存业务最终结果 |
 | Celery Worker | 按 `run_id` 推进有界步骤，不承担流程状态或结果存储 |
 | 自治执行器 | 复用现有权限、凭据、SSH host-key 校验和审计，作为唯一远程副作用入口 |
 | 独立工作台 | 展示权威快照、进度、审批、证据、恢复状态和验证结果 |
 
-现有 Redis 7 保持不变。专用 Redis 8 使用 AOF、持久卷和 `noeviction`：DB 0 保存
-checkpoint，DB 1 作为 Celery broker。不启用 Celery result backend，不引入 Flower，
-不自研 MySQL Checkpointer。
+统一 Redis 8 使用 AOF 和沿用的 `autonomy-redis-data` 持久卷，限制 512MiB 并采用
+`volatile-lru`；只有 DB2 中带 TTL 的缓存可被淘汰，checkpoint、向量和 broker 数据不
+设置 TTL。不启用 Celery result backend，不引入 Flower，不自研 MySQL Checkpointer。
 
 WP0 优先验证官方 shallow Redis saver 是否满足 interrupt、resume 和重启恢复；若不满足，
 使用官方完整 Redis saver。两种方案都只保存紧凑 Graph State。
@@ -205,6 +216,8 @@ Celery 任务只携带 `run_id`，按至少一次投递设计。Worker 通过数
 - 写动作可能已经生效但结果未落库时，Step 进入 `outcome_unknown`，Run 进入
   `needs_attention`，绝不自动重放；
 - Redis checkpoint 丢失时，只能从 MySQL 已确认的安全边界重建；
+- 只有已终结的只读调查探针时，可从其 MySQL 摘要继续规划且不重放探针；
+  一旦含未决 Step、计划或写动作，仍按原有边界暂停或转人工；
 - 取消是请求，执行器确认停止前不能把 Run 标记为 `cancelled`；
 - LangGraph 的 interrupt 节点不得包含副作用，因为恢复会从节点开头重新执行；
 - 升级时按 Run 保存的 `graph_version` 选择兼容图，不能让暂停中的旧 Run 跳入新版节点。
@@ -222,10 +235,10 @@ M1 不承诺通用自动回滚。结构化文件补丁必须有备份并可恢�
 - 长日志始终外置为 Artifact，通过 Evidence 检索和分层摘要按需进入上下文；
 - 记录模型 usage、finish reason、耗时和截断原因，但不保存完整敏感 Prompt。
 
-### 已实现接口（默认关闭）
+### 已实现接口
 
 以下接口已实现，但只有管理员且在 `OGS_AI_AUTONOMY_ENABLED` 显式打开时才允许创建、
-启动或推进 Run。`GET /ai/autonomy/status` 始终可用于区分 feature flag、专用 Redis
+启动或推进 Run。`GET /ai/autonomy/status` 始终可用于区分 feature flag、Redis
 checkpoint 和 Worker 是否就绪；接口字段以 [AI REST/SSE 契约](API.md) 为准。
 
 | 方法 | 路径 | 行为 |
@@ -249,17 +262,17 @@ decision 请求只提交 `{operation, expected_revision}`，且 operation 必须
 | WP | 内容 | 完成门 |
 |---|---|---|
 | S1 安全与审批 | 领域表、资产环境、结构化动作、服务端只读探针、权限复核、不可变动作快照和 revision/digest 审批 | 全新安装/升级 schema 一致；伪装写入、越权、篡改、旧 revision 和重复审批失败 |
-| S2 执行与恢复 | 专用 Redis、Celery、LangGraph `allow/ask/deny` 路由、数据库租约、checkpoint fail-closed、可取消 SSH、写意图和未知结果 | 真实 MySQL/Redis/Worker 下通过重复投递、强杀、取消和 checkpoint 丢失测试 |
-| S3 规划、证据与产品闭环 | Planner、一次计划授权、可选 Guardian、脱敏 Evidence、独立 Verification、三态 Outcome、REST/SSE、工作台和聊天引用 | 已通过完成门；能力仍默认关闭，发布部署另行审批 |
+| S2 执行与恢复 | Redis、Celery、LangGraph `allow/ask/deny` 路由、数据库租约、checkpoint fail-closed、可取消 SSH、写意图和未知结果 | 真实 MySQL/Redis/Worker 下通过重复投递、强杀、取消和 checkpoint 丢失测试 |
+| S3 规划、证据与产品闭环 | Planner、一次计划授权、可选 Guardian、脱敏 Evidence、独立 Verification、三态 Outcome、REST/SSE、工作台和聊天引用 | 已通过完成门；标准发布栈默认启动依赖，入口仍可由管理员关闭 |
 
-S1、S2、S3 均已完成实现与隔离验收。能力仍默认关闭；标准发布栈不启动专用 Redis 8
-和 Worker。稳定 tag、GitHub Release、GHCR/TCR、Gitee 同名 tag、从零安装和升级/
+S1、S2、S3 均已完成实现与隔离验收。标准发布栈使用统一 Redis 8 和独立 Worker；
+稳定 tag、GitHub Release、GHCR/TCR、Gitee 同名 tag、从零安装和升级/
 回滚属于合入 `main` 之后的独立发布操作，不能由旧的 CI 结果、普通聊天 draft 或
 “容器已启动”替代。
 
 后续约束：
 
-1. 正式发布只能来自公开 `main` 上的稳定 tag；feature flag 始终默认关闭。
+1. 正式发布只能来自公开 `main` 上的稳定 tag；非标准部署仍需显式启用 feature flag。
 2. M2 以后不提前创建占位 Issue，也不建立永久 `develop` 分支。
 3. 后续实现不得自行改变 MySQL/LangGraph/Redis/Celery 的职责、审批规则或恢复语义；
    需要改变时另开设计复核。

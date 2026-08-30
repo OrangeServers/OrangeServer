@@ -101,34 +101,34 @@ make docker-up
 - 向导要求 gunicorn 形态（三种部署方式均满足）；`python init.py` 裸跑 dev 模式
   不支持，请手工配置 `backend/.env`
 
-> 前端 `frontend/dist/` 是 pre-build 产物，部署机不需要 node/npm。正式源码包或
-> Release 必须包含该目录；只有开发者修改前端后才需要运行 `make build-frontend`。
+> 生产镜像在 Node 构建阶段生成 SPA，再只把 `dist` 复制进 Python 运行镜像；部署机
+> 和运行镜像都不需要 Node。`make build-frontend` 仅用于独立前端验收。
 
-> Docker Hub 拉取 Nginx、Redis、MySQL 超时时，可先合并
+> Docker Hub 拉取 Redis、MySQL 超时时，可先合并
 > `deploy/daemon.json.example` 到现有 `/etc/docker/daemon.json`，执行
 > `dockerd --validate --config-file=/etc/docker/daemon.json` 验证后再重启 Docker。
 > 不要直接覆盖已有 daemon 配置。`registry-mirrors` 只代理 Docker Hub，**不会**
 > 加速 `ghcr.io`；GHCR 需要部署机可达、企业镜像代理，或先在联网机器导出并在
 > 部署机 `docker load` 对应后端镜像。
 
-> 源码检出的 `make docker-up` 会拉取 Nginx、Redis、MySQL，并从本地源码构建
-> OrangeServer 后端镜像。首次冷构建通常约需 3–5 分钟，具体取决于网络和磁盘；
+> 源码检出的 `make docker-up` 会拉取 Redis、MySQL，并从本地源码构建包含 SPA 的
+> OrangeServer 镜像。首次冷构建通常约需 3–5 分钟，具体取决于网络和磁盘；
 > 依赖与源码未变化时 Docker 缓存重建会复用缓存。可用
-> `docker compose ... build --progress=plain backend` 查看详细进度。
+> `docker compose ... build --progress=plain app` 查看详细进度。
 > Release 一键安装默认使用已发布的 GHCR 后端镜像。手工部署也可在根 `.env`
 > 设置 `OGS_BACKEND_IMAGE` 与固定的 `OGS_BACKEND_TAG`，再执行
 > `make docker-up-image` 跳过本地构建。
 
 > 中国大陆一键线路会从腾讯云 TCR 拉 OrangeServer 后端镜像，并使用 DaoCloud
-> 匿名公共镜像拉取固定 digest 的 Nginx、Redis、MySQL 官方镜像。DaoCloud 是
+> 匿名公共镜像拉取 Redis、MySQL 官方镜像。DaoCloud 是
 > 社区公共服务，不承诺可用性 SLA；如需使用组织自己的镜像源，可分别设置
-> `OGS_CN_NGINX_IMAGE`、`OGS_CN_REDIS_IMAGE`、`OGS_CN_MYSQL_IMAGE`。使用一行
+> `OGS_CN_REDIS_IMAGE`、`OGS_CN_MYSQL_IMAGE`。使用一行
 > 管道时应把变量传给 `sudo env`，例如：
 >
 > ```bash
 > set -o pipefail
 > curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/vX.Y.Z/ops/bootstrap-compose-cn.sh \
->   | sudo env OGS_CN_NGINX_IMAGE=registry.example.com/nginx:1.25 \
+>   | sudo env OGS_CN_REDIS_IMAGE=registry.example.com/redis:8.10.0 \
 >       bash -s -- --version vX.Y.Z
 > ```
 
@@ -276,10 +276,15 @@ make docker-dev-up
 > 如果宿主机的临时端口范围覆盖 8081/28001，请先将这两个监听端口加入
 > `net.ipv4.ip_local_reserved_ports`，或在 `.env.dev` 中改用已保留端口。
 
-### M1 自治栈
+### M2 AIOps 栈
 
-标准 `make docker-up` / 一键安装会启动业务 Redis 7，以及专用 Redis Stack 与
-Worker。自治任务默认可用。
+标准 `make docker-up` / 一键安装启动 app、Worker、MySQL 与统一 Redis 8 四个容器。
+Redis DB0 用于 checkpoint（以及 M2 可重建向量），DB1 用于 Celery broker，DB2 用于
+业务会话和缓存；自治任务默认可用，Worker 默认并发 2，可通过
+`OGS_AUTONOMY_WORKER_CONCURRENCY=1` 在受限机器降级。
+同一个 app/Worker 镜像层内置约 90 MB 的中文 BGE ONNX embedding 模型；知识向量仍
+写入统一 Redis DB0，不新增向量数据库或模型服务容器。生产运行镜像不包含 Node 和
+编译工具。
 
 开发覆盖层仍可用于源码热重载验收：
 
@@ -399,7 +404,7 @@ Supervisor 守护进程，并用 `supervisorctl reread` / `update` 验证。
 
 ```bash
 # 构建 & 推送镜像
-docker build -t registry.example.com/orangeserver-backend:v1.0.0 backend/
+docker build -f backend/Dockerfile -t registry.example.com/orangeserver-backend:v1.0.0 .
 docker push registry.example.com/orangeserver-backend:v1.0.0
 ```
 

@@ -131,6 +131,9 @@ export default {
     start: 'Start run',
     startFailed: 'Failed to start',
     cancel: 'Request cancel',
+    captureKnowledge: 'Save as knowledge',
+    captureKnowledgeDone: 'Added to reviewed knowledge; rebuild the index to publish it',
+    captureKnowledgeFailed: 'Failed to save run knowledge',
     cancelRequested: 'Cancel requested; waiting for the executor to confirm the remote stop',
     cancelFailed: 'Failed to request cancel',
     cancelConfirm: 'Request cancellation? The run enters cancelled only after the executor confirms the remote stop.',
@@ -190,6 +193,19 @@ export default {
       stepFact: 'steps succeeded',
       verificationFact: 'verifications passed',
       evidenceFact: 'execution evidence',
+      confirmedFacts: 'Confirmed facts',
+      impactScope: 'Impact scope',
+      rootCauseHypothesis: 'Root-cause hypothesis',
+      confidence: 'Confidence',
+      unknowns: 'Unknowns',
+      recommendedActions: 'Recommended actions',
+      finalStatus: 'Final status',
+      evidenceRefs: 'Evidence references',
+      confidenceValue: {
+        low: 'Low',
+        medium: 'Medium',
+        high: 'High',
+      },
     },
     execution: {
       action: 'Action',
@@ -222,6 +238,8 @@ export default {
     evidenceKind: {
       action: 'Action result',
       verification: 'Verification result',
+      alert: 'Alert observation',
+      prometheus: 'Metrics observation',
       generic: 'Execution evidence',
     },
     artifactKind: {

@@ -139,6 +139,9 @@ def test_create_run_defaults_and_event_trail(repo_env):
     assert run["revision"] == 0
     assert run["host_alias"] == "web-01"
     assert run["system_user_alias"] == "readonly"
+    assert run["trigger_type"] == "manual"
+    assert run["trigger_ref"] is None
+    assert run["trigger_summary"] == ""
     assert run["budget"]["max_actions"] == 30
     assert run["graph_version"] == "v2"
 
@@ -150,6 +153,52 @@ def test_create_run_defaults_and_event_trail(repo_env):
     assert payload["system_user_id"] == 19
     assert "password" not in payload
     assert "credential" not in json.dumps(payload)
+
+
+def test_alert_trigger_roundtrip_and_unique_idempotency(repo_env):
+    repo = repo_env["repo"]
+    run = repo.create_run(
+        "admin", "admin",
+        goal="service alert",
+        host_id=repo_env["host_id"],
+        system_user_id=19,
+        mode="ask",
+        trigger_type="alertmanager",
+        trigger_ref="a" * 64,
+        trigger_summary="firing: nginx on asset #1",
+    )
+    assert repo.find_run_by_trigger(
+        "admin", "alertmanager", "a" * 64,
+    )["id"] == run["id"]
+
+    row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    row.status = "completed"
+    repo_env["session"].commit()
+    with pytest.raises(AutonomyConflict, match="trigger"):
+        repo.create_run(
+            "admin", "admin",
+            goal="duplicate service alert",
+            host_id=repo_env["host_id"],
+            system_user_id=19,
+            mode="ask",
+            trigger_type="alertmanager",
+            trigger_ref="a" * 64,
+        )
+
+
+def test_external_evidence_appends_timeline_event(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    evidence = repo.record_evidence(
+        "admin", run["id"],
+        kind="alert_observation",
+        summary="Alertmanager firing: nginx",
+        event_type="alert_firing",
+    )
+    event = repo_env["session"].query(t_ai_autonomous_event).filter_by(
+        run_id=run["id"], event_type="alert_firing",
+    ).one()
+    assert json.loads(event.payload_json)["evidence_id"] == evidence["id"]
 
 
 @pytest.mark.parametrize("mode", ["ask", "ai_review", "auto", "custom"])
@@ -711,6 +760,22 @@ def test_cancel_running_run_stays_request_only(repo_env):
     assert row.lease_expires_at is not None
 
 
+def test_cancel_needs_attention_releases_the_asset(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    row.status = "needs_attention"
+    repo_env["session"].commit()
+
+    cancelled = repo.request_cancel("admin", "admin", run["id"])
+
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["cancel_requested"] is True
+    repo_env["session"].expire_all()
+    row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    assert row.active_host_id is None
+
+
 def test_run_is_owner_scoped(repo_env):
     run = repo_env["create_started_run"]()
     with pytest.raises(AutonomyNotFound):
@@ -1265,6 +1330,9 @@ def test_propose_plan_persists_immutable_snapshot_and_pauses_run(repo_env):
 
     assert step["kind"] == "plan"
     assert step["status"] == "waiting_approval"
+    assert step["plan_actions"] == [
+        "systemd operation=restart unit=nginx",
+    ]
     row = repo_env["session"].get(t_ai_autonomous_step, step["id"])
     snapshot = json.loads(row.action_json)
     assert snapshot["target_id"] == repo_env["host_id"]
@@ -1282,6 +1350,23 @@ def test_propose_plan_persists_immutable_snapshot_and_pauses_run(repo_env):
     assert action["system_user_id"] == 19
     run_row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
     assert run_row.status == "waiting_approval"
+
+
+def test_plan_actions_do_not_hide_long_patch_details(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    content = "setting=true\n" * 40
+
+    step = repo.propose_plan(
+        "admin", "admin", run["id"], "update config",
+        [{"kind": "file_patch", "params": {
+            "path": "/opt/example.conf", "content": content,
+        }}],
+    )
+
+    assert len(step["plan_actions"][0]) > 255
+    assert content.replace("\n", "") in step["plan_actions"][0]
+    assert "path=/opt/example.conf" in step["plan_actions"][0]
 
 
 def test_probe_only_plan_is_approved_without_pausing(repo_env):
@@ -1662,6 +1747,14 @@ def test_conclude_run_resolved_with_verification_observation(repo_env):
     result = repo.conclude_run(
         "admin", "admin", run["id"], "resolved",
         [action_ev["id"], verify_ev["id"]],
+        {
+            "confirmed_facts": ["cron is active"],
+            "impact_scope": "target host",
+            "root_cause_hypothesis": "configuration drift",
+            "confidence": "high",
+            "unknowns": [],
+            "recommended_actions": ["monitor cron"],
+        },
     )
     assert result["outcome"] == "resolved"
     assert result["forced"] == ""
@@ -1673,6 +1766,40 @@ def test_conclude_run_resolved_with_verification_observation(repo_env):
     assert payload["outcome"] == "resolved"
     assert payload["requested"] == "resolved"
     assert payload["forced"] == ""
+    conclusion = repo.snapshot("admin", run["id"])["conclusion"]
+    assert conclusion["confirmed_facts"] == ["cron is active"]
+    assert conclusion["final_status"] == "resolved"
+    assert conclusion["evidence_ids"] == [action_ev["id"], verify_ev["id"]]
+
+
+def test_conclusion_details_redact_common_secret_material(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    evidence = repo.record_evidence(
+        "admin", run["id"],
+        kind="action_observation", summary="observation",
+    )
+
+    repo.conclude_run(
+        "admin", "admin", run["id"], "not_resolved", [evidence["id"]],
+        {
+            "confirmed_facts": ["Authorization: Bearer top-secret"],
+            "impact_scope": "password=hunter2",
+            "root_cause_hypothesis": "token: abc123",
+            "confidence": "low",
+            "unknowns": [],
+            "recommended_actions": [],
+        },
+    )
+
+    serialized = json.dumps(
+        repo.snapshot("admin", run["id"])["conclusion"],
+        ensure_ascii=False,
+    )
+    assert "top-secret" not in serialized
+    assert "hunter2" not in serialized
+    assert "abc123" not in serialized
+    assert "[REDACTED]" in serialized
 
 
 def test_conclude_run_uncertain_write_forces_inconclusive(repo_env):

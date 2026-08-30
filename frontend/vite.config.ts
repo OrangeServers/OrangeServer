@@ -5,28 +5,20 @@ import { defineConfig, loadEnv } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
 
-// 后端地址，开发环境从 .env.development 读取
+// 开发服务器的后端地址从当前 mode 的 .env 读取。
 // REVIEW-14 P1-5: 默认值清空（防硬编码内网 IP 泄露后端拓扑）
 //   缺失或不合法时直接报错，强制开发者配置 .env.development
-// 注意：vite.config.ts 在 esbuild 阶段加载，process.env 不会自动包含 .env 文件内容，
-//       必须用 Vite 自带的 loadEnv() 显式读取。
-const env = loadEnv('development', process.cwd(), '')
-const API_SERVER: string = env.VITE_API_TARGET || ''
-if (!API_SERVER) {
-  throw new Error(
-    '[vite.config.ts] VITE_API_TARGET 未配置！\n' +
-    '  请在 pycharm_ogsfront/.env.development 中设置：\n' +
-    '    VITE_API_TARGET=http://your-backend-host:port\n' +
-    '  示例：VITE_API_TARGET=http://127.0.0.1:28000'
-  )
-}
-if (!/^https?:\/\//i.test(API_SERVER)) {
-  throw new Error(
-    '[vite.config.ts] VITE_API_TARGET 格式不正确，必须以 http:// 或 https:// 开头：' + API_SERVER
-  )
-}
-
-export default defineConfig({
+// 生产构建只生成同源静态资源，不需要代理目标。
+export default defineConfig(({ command, mode }) => {
+  const env = loadEnv(mode, process.cwd(), '')
+  const API_SERVER: string = env.VITE_API_TARGET || ''
+  if (command === 'serve' && !API_SERVER) {
+    throw new Error('[vite.config.ts] VITE_API_TARGET 未配置')
+  }
+  if (command === 'serve' && !/^https?:\/\//i.test(API_SERVER)) {
+    throw new Error('[vite.config.ts] VITE_API_TARGET 必须是 HTTP(S) URL')
+  }
+  return {
   plugins: [vue()],
   resolve: {
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) }
@@ -76,5 +68,6 @@ export default defineConfig({
         changeOrigin: false
       },
     }
+  }
   }
 })

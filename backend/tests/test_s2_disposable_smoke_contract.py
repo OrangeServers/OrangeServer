@@ -16,6 +16,7 @@ def test_s2_smoke_compose_is_isolated_and_builds_current_backend():
     )[1].split('\n  ssh-target:\n', 1)[0]
 
     assert compose.count('context: ${OGS_S2_SMOKE_SOURCE_ROOT') == 3
+    assert compose.count('dockerfile: backend/Dockerfile') == 2
     assert compose.count('source: ${OGS_S2_SMOKE_SOURCE_ROOT') == 6
     assert compose.count('pull_policy: never') == 4
     assert 'ports:' not in compose
@@ -36,7 +37,8 @@ def test_s2_smoke_compose_is_isolated_and_builds_current_backend():
         '      - ${OGS_S2_SMOKE_AUTONOMY_REDIS_PASSWORD:'
         '?smoke autonomy Redis password required}'
     ) in autonomy_redis
-    assert '--concurrency=1' in compose
+    assert '--concurrency=1' not in compose
+    assert 'OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}' in compose
     assert 'OGS_AI_AUTONOMY_LEASE_TTL_SECONDS: 60' in compose
     assert 'OGS_AI_AUTONOMY_REDIS_HOST: autonomy-redis' in compose
     assert 'OGS_S2_SMOKE_UPGRADE_MYSQL_HOST: mysql-upgrade' in compose

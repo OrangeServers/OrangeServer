@@ -83,6 +83,7 @@ class ChatResult:
     finish_reason: Optional[str] = None
     latency_ms: int = 0
     truncated: bool = False
+    reasoning_content: str = ""
 
 
 class ProviderResponseError(RuntimeError):
@@ -250,6 +251,7 @@ class OpenAICompatibleAdapter:
         on_delta: Optional[Callable[[str], None]] = None,
     ) -> ChatResult:
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_parts: dict[int, dict[str, str]] = {}
         saw_choice = False
         finish_reason = None
@@ -274,6 +276,14 @@ class OpenAICompatibleAdapter:
                 self._stream_emitted = True
                 if on_delta:
                     on_delta(content)
+
+            reasoning_content = _value(delta, "reasoning_content")
+            if isinstance(reasoning_content, str) and reasoning_content:
+                reasoning_parts.append(reasoning_content)
+                # A streamed reasoning token means the provider has started
+                # producing this response. Retrying the request as non-stream
+                # could duplicate a billed/tool-producing model turn.
+                self._stream_emitted = True
 
             for position, tool_chunk in enumerate(
                 _value(delta, "tool_calls", ()) or ()
@@ -320,6 +330,7 @@ class OpenAICompatibleAdapter:
             used_stream=True,
             usage=usage,
             finish_reason=finish_reason,
+            reasoning_content="".join(reasoning_parts),
         )
 
     def _consume_non_stream(self, response: Any) -> ChatResult:
@@ -334,6 +345,9 @@ class OpenAICompatibleAdapter:
         content = _value(message, "content") or ""
         if not isinstance(content, str):
             content = str(content)
+        reasoning_content = _value(message, "reasoning_content") or ""
+        if not isinstance(reasoning_content, str):
+            reasoning_content = str(reasoning_content)
         tool_calls: list[ProviderToolCall] = []
         for position, tool_call in enumerate(
             _value(message, "tool_calls", ()) or ()
@@ -360,4 +374,5 @@ class OpenAICompatibleAdapter:
             used_stream=False,
             usage=self._usage(_value(response, "usage")),
             finish_reason=_value(choice, "finish_reason"),
+            reasoning_content=reasoning_content,
         )

@@ -1,46 +1,26 @@
-# =============================================================================
-# OrangeServer docker-compose — 生产编排
-# =============================================================================
-# 服务（bundled 6 个）:
-#   - backend          Flask + gunicorn（gevent worker）
-#   - frontend         nginx serve dist/
-#   - redis            业务 Redis 7（会话/CSRF）     [profile: bundled]
-#   - mysql            业务数据库                      [profile: bundled]
-#   - autonomy-redis   自治 Redis Stack（checkpoint） [profile: bundled]
-#   - autonomy-worker  同一后端镜像的 Celery Worker   [profile: bundled]
+# OrangeServer production Compose.
+# Bundled mode starts exactly four product containers:
+# app (Gunicorn + SPA), worker (Celery prefork), MySQL, and Redis 8.
 #
-# 用法（两种部署模式）:
-#
-# 模式 A: bundled 模式（容器化自包含, 6 服务全起）
+# Bundled:
 #   docker compose --env-file .env -f deploy/docker-compose.yml --profile bundled up -d --build
-#
-# 模式 B: 外部 MySQL/Redis（只起 backend + frontend）
-#   docker compose --env-file .env -f deploy/docker-compose.yml up -d --build backend frontend
-#   需先在顶层 .env 中设 OGS_MYSQL_HOST / OGS_REDIS_HOST 为外部地址
-#
-# 镜像来源可通过根 .env 的 OGS_NGINX_IMAGE / OGS_REDIS_IMAGE /
-# OGS_MYSQL_IMAGE 覆盖；国内一键入口会传入已验证的匿名公共镜像地址。
-# =============================================================================
+# External MySQL/Redis:
+#   docker compose --env-file .env -f deploy/docker-compose.yml up -d --build app worker
 
 services:
-  # ---------- 后端 Flask ----------
-  backend:
+  app:
     build:
-      context: ../backend
-      dockerfile: Dockerfile
-    # 默认仍从本地源码构建。首个公开 GHCR 镜像发布后，可在根 .env 设置
-    # OGS_BACKEND_IMAGE=ghcr.io/orangeservers/orangeserver-backend 并固定版本。
+      context: ..
+      dockerfile: backend/Dockerfile
     image: ${OGS_BACKEND_IMAGE:-orangeserver-backend}:${OGS_BACKEND_TAG:-latest}
     restart: unless-stopped
-    networks:
-      - ogs-internal
+    networks: [ogs-internal]
     env_file:
       - ../backend/.env
     environment:
       OGS_ENV: prod
       OGS_BIND_HOST: 0.0.0.0
       OGS_PORT: 28000
-      # REV48 (P0-8): 变量化让 host.docker.internal (模式 B) 可覆盖 compose 硬编码
       OGS_MYSQL_HOST: ${OGS_MYSQL_HOST:-mysql}
       OGS_MYSQL_PORT: ${OGS_MYSQL_PORT:-3306}
       OGS_MYSQL_DBNAME: ${OGS_MYSQL_DBNAME:-orange}
@@ -48,107 +28,117 @@ services:
       OGS_MYSQL_PASSWORD: ${OGS_MYSQL_PASSWORD}
       OGS_REDIS_HOST: ${OGS_REDIS_HOST:-redis}
       OGS_REDIS_PORT: ${OGS_REDIS_PORT:-6379}
+      OGS_REDIS_DB: ${OGS_REDIS_DB:-2}
+      OGS_REDIS_MAX_CONNECTIONS: ${OGS_REDIS_MAX_CONNECTIONS:-256}
       OGS_REDIS_PASSWORD: ${OGS_REDIS_PASSWORD:-}
       OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-true}
-      OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-autonomy-redis}
+      OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-redis}
       OGS_AI_AUTONOMY_REDIS_PORT: ${OGS_AI_AUTONOMY_REDIS_PORT:-6379}
-      OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_AI_AUTONOMY_REDIS_PASSWORD:-}
-      # REV48 (P1-12): 试运行改 false, Secure cookie 不被写入 HTTP; 正式生产用 LB/nginx 终止 TLS 后改回 true
+      OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_REDIS_PASSWORD:-}
+      OGS_AI_ALERTMANAGER_TOKEN: ${OGS_AI_ALERTMANAGER_TOKEN:-}
+      OGS_AI_ALERTMANAGER_OWNER: ${OGS_AI_ALERTMANAGER_OWNER:-}
+      OGS_AI_PROMETHEUS_BASE_URL: ${OGS_AI_PROMETHEUS_BASE_URL:-}
+      OGS_AI_PROMETHEUS_BEARER_TOKEN: ${OGS_AI_PROMETHEUS_BEARER_TOKEN:-}
+      OGS_AI_EMBEDDING_MODEL_PATH: /opt/orangeserver/models/fast-bge-small-zh-v1.5
+      OGS_PROXY_LAYERS: "0"
       OGS_HTTPS: "${OGS_HTTPS:-false}"
     depends_on:
-      # bundled 模式: 等 redis/mysql healthy 后再起 backend (test_03 要求)
-      # host 模式: required: false, --profile host 不启 redis/mysql 也不阻塞
-      redis:
-        condition: service_healthy
-        required: false
       mysql:
         condition: service_healthy
         required: false
-      autonomy-redis:
+      redis:
         condition: service_healthy
         required: false
+    ports:
+      - "${OGS_HTTP_PORT:-8080}:28000"
+    volumes:
+      - backend-data:/app/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:28000/local/health', timeout=2); exit(0 if r.status==200 else 1)"]
       interval: 30s
       timeout: 3s
       retries: 3
       start_period: 15s
-    expose:
-      - "28000"
-    # REV49: extra_hosts 仅在 host 模式需要, bundled 模式删除
-    # 模式 B (host.docker.internal) 请用 deploy/docker-compose.host.yml 覆盖
 
-    # REV48 (P1-6): data 卷持久化, 防 docker compose up 重建丢 SSH 私钥/头像/上传文件/日志
+  worker:
+    image: ${OGS_BACKEND_IMAGE:-orangeserver-backend}:${OGS_BACKEND_TAG:-latest}
+    restart: unless-stopped
+    working_dir: /app
+    networks: [ogs-internal]
+    env_file:
+      - ../backend/.env
+    environment:
+      OGS_ENV: prod
+      OGS_MYSQL_HOST: ${OGS_MYSQL_HOST:-mysql}
+      OGS_MYSQL_PORT: ${OGS_MYSQL_PORT:-3306}
+      OGS_MYSQL_DBNAME: ${OGS_MYSQL_DBNAME:-orange}
+      OGS_MYSQL_USER: ${OGS_MYSQL_USER:-app_user}
+      OGS_MYSQL_PASSWORD: ${OGS_MYSQL_PASSWORD}
+      OGS_REDIS_HOST: ${OGS_REDIS_HOST:-redis}
+      OGS_REDIS_PORT: ${OGS_REDIS_PORT:-6379}
+      OGS_REDIS_DB: ${OGS_REDIS_DB:-2}
+      OGS_REDIS_MAX_CONNECTIONS: ${OGS_REDIS_MAX_CONNECTIONS:-256}
+      OGS_REDIS_PASSWORD: ${OGS_REDIS_PASSWORD:-}
+      OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-true}
+      OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-redis}
+      OGS_AI_AUTONOMY_REDIS_PORT: ${OGS_AI_AUTONOMY_REDIS_PORT:-6379}
+      OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_REDIS_PASSWORD:-}
+      OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}
+      OGS_AI_EMBEDDING_MODEL_PATH: /opt/orangeserver/models/fast-bge-small-zh-v1.5
+    command:
+      - celery
+      - -A
+      - app.ai.autonomy.celery_entry:celery_app
+      - worker
+      - --loglevel=INFO
     volumes:
       - backend-data:/app/data
-
-  # ---------- 前端 nginx ----------
-  frontend:
-    # ⓘ 全球默认锁版本；中国大陆入口使用固定 SHA digest
-    # REV49: 去掉 -alpine3.20 具体版本后缀, 用 -alpine 自动匹配官方 Alpine 版本
-    image: ${OGS_NGINX_IMAGE:-nginx:1.25-alpine}
-    # ⓘ 前端是 pre-build 产物: 部署前需在开发者机器 / CI 跑 `make build-frontend`
-    #   输出 frontend/dist/ (2-3 MB 静态文件), 这里用 nginx:alpine 直接 serve
-    #   部署机不需要装 node/npm
-    #   失败模式: dist/ 不存在时挂载空目录, nginx 容器起不来
-    restart: unless-stopped
-    networks:
-      - ogs-internal
-    ports:
-      # REV49: 端口变量化, 默认 8080 (避免与 Harbor/其他服务抢占 80/443)
-      - "${OGS_HTTP_PORT:-8080}:80"
-    volumes:
-      # REV48 (P0-9.1): 用容器版 nginx 配置 (frontend_container.conf), upstream=backend:28000 (不是 127.0.0.1)
-      #          覆盖默认 server (default.conf), 防 listen 80 抢占
-      - ../frontend/dist:/usr/share/nginx/html:ro
-      - ./nginx/frontend_container.conf:/etc/nginx/conf.d/default.conf:ro
-      # REV48 (P0-4): 公共反代参数 include (proxy_http_version 等)
-      - ./nginx/ogs_proxy_common.conf:/etc/nginx/ogs_proxy_common.conf:ro
     depends_on:
-      - backend
+      mysql:
+        condition: service_healthy
+        required: false
+      redis:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - from app.ai.autonomy.readiness import checkpoint_readiness, worker_readiness; raise SystemExit(0 if checkpoint_readiness() and worker_readiness() else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
 
-  # ---------- Redis ----------
-  # ⓘ profiles: ['bundled'] 标记: 默认 --profile bundled 才启
-  #   本机有 redis 时, 用 `docker compose up -d backend frontend` (不起 redis/mysql) +
-  #   backend OGS_REDIS_HOST=host.docker.internal 连本机
   redis:
-    # ⓘ 全球默认锁版本；中国大陆入口使用固定 SHA digest
-    # REV49: 去掉 -alpine3.21 具体版本后缀
-    image: ${OGS_REDIS_IMAGE:-redis:7.4-alpine}
-    profiles: ["bundled"]
-    # REV48 (P0-10): 注入 OGS_REDIS_PASSWORD 到容器, 让 backend 配的密码真生效
+    image: ${OGS_REDIS_IMAGE:-redis:8.10.0}
+    profiles: [bundled]
+    restart: unless-stopped
+    networks: [ogs-internal]
     environment:
       OGS_REDIS_PASSWORD: ${OGS_REDIS_PASSWORD:-}
-    restart: unless-stopped
-    networks:
-      - ogs-internal
-    # ⓘ 修复: 启用 requirepass (与 OGS_REDIS_PASSWORD 一致) - REV46-H12 防未授权访问
-    #   命令行密码含特殊字符会破, 用 --requirepass "$PASSWORD" 仍要小心
-    #   安全: 走 docker secrets 或 OGS_REDIS_PASSWORD 文件 (参见生产部署文档)
-    command: >
-      sh -c "if [ -n \"$$OGS_REDIS_PASSWORD\" ]; then
-                redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass \"$$OGS_REDIS_PASSWORD\";
-              else
-                echo '[WARN] OGS_REDIS_PASSWORD 未设, Redis 启无密码模式 (仅限 dev)';
-                redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru;
-              fi"
+    command:
+      - sh
+      - -c
+      - >-
+        exec docker-entrypoint.sh redis-server --appendonly yes --appendfsync everysec
+        --maxmemory 512mb --maxmemory-policy volatile-lru --requirepass
+        "$$OGS_REDIS_PASSWORD"
+    volumes:
+      # Keep the M1 volume name so existing LangGraph checkpoints survive.
+      - autonomy-redis-data:/data
     healthcheck:
-      test: ["CMD", "sh", "-c", "if [ -n \"$$OGS_REDIS_PASSWORD\" ]; then redis-cli -a \"$$OGS_REDIS_PASSWORD\" ping | grep PONG; else redis-cli ping | grep PONG; fi"]
+      test: ["CMD", "sh", "-c", "if [ -n \"$$OGS_REDIS_PASSWORD\" ]; then redis-cli -a \"$$OGS_REDIS_PASSWORD\" ping | grep -q PONG; else redis-cli ping | grep -q PONG; fi"]
       interval: 10s
       timeout: 3s
-      retries: 5
+      retries: 10
 
-  # ---------- MySQL ----------
-  # ⓘ profiles: ['bundled'] 标记: 默认 --profile bundled 才启
-  #   本机有 mysql 时, 用 `docker compose up -d backend frontend` (不起 redis/mysql) +
-  #   backend OGS_MYSQL_HOST=host.docker.internal 连本机
   mysql:
-    # ⓘ 锁镜像版本
     image: ${OGS_MYSQL_IMAGE:-mysql:8.0.42}
-    profiles: ["bundled"]
+    profiles: [bundled]
     restart: unless-stopped
-    networks:
-      - ogs-internal
+    networks: [ogs-internal]
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       MYSQL_DATABASE: ${OGS_MYSQL_DBNAME:-orange}
@@ -161,89 +151,11 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
       - ../backend/mysqldir/orange.sql:/docker-entrypoint-initdb.d/orange.sql:ro
-    # ⓘ 修复: healthcheck 用 MYSQL_PWD 环境变量传密码, 避免 -p${...} 拼命令行被特殊字符（! & ;）破
     healthcheck:
       test: ["CMD", "sh", "-c", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysqladmin ping -h 127.0.0.1 -u root"]
       interval: 10s
       timeout: 5s
       retries: 10
-
-  autonomy-redis:
-    image: ${OGS_AUTONOMY_REDIS_IMAGE:-redis/redis-stack-server:7.4.0-v3}
-    profiles: ["bundled"]
-    restart: unless-stopped
-    networks:
-      - ogs-internal
-    environment:
-      OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_AI_AUTONOMY_REDIS_PASSWORD:?Set OGS_AI_AUTONOMY_REDIS_PASSWORD}
-      REDIS_ARGS: >-
-        --requirepass ${OGS_AI_AUTONOMY_REDIS_PASSWORD:?Set OGS_AI_AUTONOMY_REDIS_PASSWORD}
-        --appendonly yes
-        --appendfsync everysec
-        --maxmemory-policy noeviction
-    volumes:
-      - autonomy-redis-data:/data
-    healthcheck:
-      test:
-        - CMD
-        - sh
-        - -c
-        - redis-cli -a "$$OGS_AI_AUTONOMY_REDIS_PASSWORD" ping | grep -q PONG
-      interval: 10s
-      timeout: 3s
-      retries: 10
-
-  autonomy-worker:
-    image: ${OGS_BACKEND_IMAGE:-orangeserver-backend}:${OGS_BACKEND_TAG:-latest}
-    profiles: ["bundled"]
-    restart: unless-stopped
-    working_dir: /app
-    networks:
-      - ogs-internal
-    env_file:
-      - ../backend/.env
-    environment:
-      OGS_ENV: prod
-      OGS_MYSQL_HOST: ${OGS_MYSQL_HOST:-mysql}
-      OGS_MYSQL_PORT: ${OGS_MYSQL_PORT:-3306}
-      OGS_MYSQL_DBNAME: ${OGS_MYSQL_DBNAME:-orange}
-      OGS_MYSQL_USER: ${OGS_MYSQL_USER:-app_user}
-      OGS_MYSQL_PASSWORD: ${OGS_MYSQL_PASSWORD}
-      OGS_REDIS_HOST: ${OGS_REDIS_HOST:-redis}
-      OGS_REDIS_PORT: ${OGS_REDIS_PORT:-6379}
-      OGS_REDIS_PASSWORD: ${OGS_REDIS_PASSWORD:-}
-      OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-true}
-      OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-autonomy-redis}
-      OGS_AI_AUTONOMY_REDIS_PORT: ${OGS_AI_AUTONOMY_REDIS_PORT:-6379}
-      OGS_AI_AUTONOMY_REDIS_PASSWORD: ${OGS_AI_AUTONOMY_REDIS_PASSWORD:-}
-    command:
-      - celery
-      - -A
-      - app.ai.autonomy.celery_entry:celery_app
-      - worker
-      - --loglevel=INFO
-      - --concurrency=1
-    volumes:
-      - backend-data:/app/data
-    depends_on:
-      mysql:
-        condition: service_healthy
-        required: false
-      redis:
-        condition: service_healthy
-        required: false
-      autonomy-redis:
-        condition: service_healthy
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - >-
-          celery -A app.ai.autonomy.celery_entry:celery_app inspect ping
-          --destination "celery@$$HOSTNAME" --timeout 2 | grep -q pong
-      interval: 10s
-      timeout: 5s
-      retries: 20
-      start_period: 20s
 
 networks:
   ogs-internal:
@@ -251,9 +163,5 @@ networks:
 
 volumes:
   mysql-data:
-    driver: local
-  # REV48 (P1-6): backend 运行时数据 (SSH 私钥 / 头像 / 上传 / 日志) 持久化
   backend-data:
-    driver: local
   autonomy-redis-data:
-    driver: local

@@ -52,6 +52,7 @@ for _k, _v in {
     'OGS_FLASK_SECRET_KEY': 'test_secret_key_with_enough_entropy_xyz_12345',
     'OGS_ENV': 'dev',
     'OGS_REDIS_HOST': '127.0.0.1',
+    'OGS_PROXY_LAYERS': '1',
 }.items():
     os.environ.setdefault(_k, _v)
 
@@ -135,6 +136,7 @@ def _ensure_valid_config_env(monkeypatch):
         'OGS_MAIL_SMTP': 'smtp.gmail.com',  # REV48: 真实邮件服务器域名, 不触发 OGS_MAIL_SMTP=smtp.example.com 占位符 fail-fast
         'OGS_FLASK_SECRET_KEY': 'test_secret_key_with_enough_entropy_xyz_12345',
         'OGS_ENV': 'dev',
+        'OGS_PROXY_LAYERS': '1',
     }
     for k, v in defaults.items():
         if k not in os.environ:

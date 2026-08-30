@@ -129,6 +129,9 @@ export default {
     start: '启动任务',
     startFailed: '启动失败',
     cancel: '请求取消',
+    captureKnowledge: '沉淀为知识',
+    captureKnowledgeDone: '已加入审核知识，重建索引后可检索',
+    captureKnowledgeFailed: '任务知识沉淀失败',
     cancelRequested: '已请求取消，等待执行器确认远端停止',
     cancelFailed: '取消请求失败',
     cancelConfirm: '确定请求取消该任务？执行器确认远端停止后才会进入已取消。',
@@ -188,6 +191,19 @@ export default {
       stepFact: '步骤成功',
       verificationFact: '项验证通过',
       evidenceFact: '条执行证据',
+      confirmedFacts: '已确认事实',
+      impactScope: '影响范围',
+      rootCauseHypothesis: '根因假设',
+      confidence: '置信度',
+      unknowns: '未知项',
+      recommendedActions: '推荐动作',
+      finalStatus: '最终状态',
+      evidenceRefs: 'Evidence 引用',
+      confidenceValue: {
+        low: '低',
+        medium: '中',
+        high: '高',
+      },
     },
     execution: {
       action: '执行动作',
@@ -220,6 +236,8 @@ export default {
     evidenceKind: {
       action: '动作结果',
       verification: '验证结果',
+      alert: '告警观察',
+      prometheus: '指标观察',
       generic: '执行证据',
     },
     artifactKind: {
