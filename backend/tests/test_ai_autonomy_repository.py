@@ -760,6 +760,22 @@ def test_cancel_running_run_stays_request_only(repo_env):
     assert row.lease_expires_at is not None
 
 
+def test_cancel_needs_attention_releases_the_asset(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    row.status = "needs_attention"
+    repo_env["session"].commit()
+
+    cancelled = repo.request_cancel("admin", "admin", run["id"])
+
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["cancel_requested"] is True
+    repo_env["session"].expire_all()
+    row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    assert row.active_host_id is None
+
+
 def test_run_is_owner_scoped(repo_env):
     run = repo_env["create_started_run"]()
     with pytest.raises(AutonomyNotFound):

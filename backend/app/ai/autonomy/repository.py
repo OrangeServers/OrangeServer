@@ -681,6 +681,7 @@ class AutonomyRepository:
             RunStatus.DRAFT.value,
             RunStatus.QUEUED.value,
             RunStatus.WAITING_APPROVAL.value,
+            RunStatus.NEEDS_ATTENTION.value,
         }
         # 租约已过期 = Worker 已死/失联，取消可直接落终态，不再等确认。
         lease_expired = (
