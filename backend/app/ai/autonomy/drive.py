@@ -1408,8 +1408,8 @@ class AutonomyDriver:
                         return RESULT_PAUSED
                     entry = Command(resume=decision)
                 else:
-                    # as_node=plan 的下一节点是 policy；沿刚重建的
-                    # checkpoint 继续，绝不再次调用 planner。
+                    # as_node=plan 的下一节点是 policy；as_node=decide
+                    # 只用于已终结的只读调查，下一节点安全回到 planner。
                     entry = None
             elif outcome.mode == MODE_RESUME:
                 # 健康 checkpoint 的原生续跑输入是 None。重新传初始

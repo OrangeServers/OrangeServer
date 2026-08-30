@@ -216,6 +216,8 @@ Celery 任务只携带 `run_id`，按至少一次投递设计。Worker 通过数
 - 写动作可能已经生效但结果未落库时，Step 进入 `outcome_unknown`，Run 进入
   `needs_attention`，绝不自动重放；
 - Redis checkpoint 丢失时，只能从 MySQL 已确认的安全边界重建；
+- 只有已终结的只读调查探针时，可从其 MySQL 摘要继续规划且不重放探针；
+  一旦含未决 Step、计划或写动作，仍按原有边界暂停或转人工；
 - 取消是请求，执行器确认停止前不能把 Run 标记为 `cancelled`；
 - LangGraph 的 interrupt 节点不得包含副作用，因为恢复会从节点开头重新执行；
 - 升级时按 Run 保存的 `graph_version` 选择兼容图，不能让暂停中的旧 Run 跳入新版节点。

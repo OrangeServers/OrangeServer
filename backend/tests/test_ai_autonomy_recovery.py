@@ -478,6 +478,40 @@ def test_checkpoint_loss_resumes_durable_proposal_at_policy(env):
     assert "recovery_boundary_rebuild" in _event_types(env, run["id"])
 
 
+def test_checkpoint_loss_resumes_after_terminal_investigation_probes(env):
+    run = env["create_queued_run"]()
+    step_ids = [
+        env["repo"].propose_probe(
+            "admin", "admin", run["id"], probe_id,
+        )["id"]
+        for probe_id in ("system.load", "system.memory", "system.disk_usage")
+    ]
+    for index, step_id in enumerate(step_ids):
+        _step_row(env, step_id).status = (
+            "succeeded" if index == 0 else "failed"
+        )
+    env["session"].commit()
+    env["simulate_kill"](run["id"])
+    planner_contexts = []
+
+    def finish_planning(context):
+        planner_contexts.append(context)
+        return []
+
+    result = env["make_driver"](
+        saver=MemorySaver(), planner=finish_planning,
+    ).drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(planner_contexts) == 1
+    assert planner_contexts[0]["loops"] == 3
+    assert env["runner"].calls == []
+    assert [_step_row(env, step_id).status for step_id in step_ids] == [
+        "succeeded", "failed", "failed",
+    ]
+    assert "recovery_boundary_rebuild" in _event_types(env, run["id"])
+
+
 def test_multiple_durable_proposals_fail_closed_without_partial_recovery(env):
     run = env["create_queued_run"]()
     step_ids = [
