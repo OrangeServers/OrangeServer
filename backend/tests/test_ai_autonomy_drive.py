@@ -1584,6 +1584,7 @@ def test_full_loop_concludes_resolved_with_fresh_verification(env):
                 context["run_id"], "system.load",
             )
             return [step["id"]]
+        assert context["require_finish"] is True
         evidence = env["repo"].list_evidence(
             context["owner"], context["run_id"],
         )

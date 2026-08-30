@@ -497,12 +497,18 @@ def _user_message(context):
     evidence_block = '\n'.join(evidence) if evidence else '（暂无证据）'
     knowledge = prompt_citations(context.get('knowledge') or [])
     knowledge_block = '\n'.join(knowledge) if knowledge else '（暂无匹配知识）'
-    phase = (
-        '服务端已完成最低只读调查门槛；本轮必须调用 propose_plan，'
-        '不要继续调用只读探针。'
-        if context.get('require_plan') else
-        '服务端尚未要求切换阶段；请按已有观察选择下一步。'
-    )
+    if context.get('require_finish'):
+        phase = (
+            '服务端已确认写动作及其独立验证成功；本轮必须调用 finish，'
+            '不得继续调查或提议动作。'
+        )
+    elif context.get('require_plan'):
+        phase = (
+            '服务端已完成最低只读调查门槛；本轮必须调用 propose_plan，'
+            '不要继续调用只读探针。'
+        )
+    else:
+        phase = '服务端尚未要求切换阶段；请按已有观察选择下一步。'
     return (
         '调查目标：%s\n'
         '当前第 %s 轮；剩余动作额度 %s。\n'
@@ -555,6 +561,11 @@ class ToolCallingPlanner:
         ]
         tools = proposal_tool_schemas(context)
         tool_choice = (
+            {
+                'type': 'function',
+                'function': {'name': FINISH_TOOL_NAME},
+            }
+            if context.get('require_finish') else
             {
                 'type': 'function',
                 'function': {'name': PLAN_TOOL_NAME},
@@ -627,10 +638,18 @@ class ToolCallingPlanner:
         if len(calls) != 1:
             raise PlannerProposalError(
                 REASON_AMBIGUOUS_PROPOSAL,
-                repair_tool=PLAN_TOOL_NAME if context.get('require_plan')
-                else PROPOSAL_TOOL_NAME,
+                repair_tool=(
+                    FINISH_TOOL_NAME if context.get('require_finish') else
+                    PLAN_TOOL_NAME if context.get('require_plan') else
+                    PROPOSAL_TOOL_NAME
+                ),
             )
         call = calls[0]
+        if context.get('require_finish') and call.name != FINISH_TOOL_NAME:
+            raise PlannerProposalError(
+                REASON_UNSUPPORTED_PROPOSAL,
+                repair_tool=FINISH_TOOL_NAME,
+            )
         if context.get('require_plan') and call.name != PLAN_TOOL_NAME:
             raise PlannerProposalError(
                 REASON_UNSUPPORTED_PROPOSAL,

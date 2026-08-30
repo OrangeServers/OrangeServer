@@ -479,6 +479,31 @@ class AutonomyDriver:
                     probe_ids.add(probe_id)
         return len(probe_ids) >= MIN_DISTINCT_PROBES_BEFORE_PLAN
 
+    def _planner_requires_finish(self, run_id):
+        """Require conclusion once the latest successful write is verified."""
+        from app.core.db.database import t_ai_autonomous_step
+
+        latest_write = 0
+        latest_verification = 0
+        rows = self.session.query(t_ai_autonomous_step).filter(
+            t_ai_autonomous_step.run_id == run_id,
+            t_ai_autonomous_step.status == StepStatus.SUCCEEDED.value,
+            t_ai_autonomous_step.kind.in_([
+                StepKind.ACTION.value, StepKind.VERIFICATION.value,
+            ]),
+        ).order_by(t_ai_autonomous_step.seq.asc()).all()
+        for row in rows:
+            if row.kind == StepKind.VERIFICATION.value:
+                latest_verification = int(row.seq)
+                continue
+            try:
+                action = action_from_dict(json.loads(row.action_json or ''))
+            except (ActionValidationError, TypeError, ValueError):
+                continue
+            if action.kind in WRITE_KINDS:
+                latest_write = int(row.seq)
+        return bool(latest_write and latest_verification > latest_write)
+
     def _build_handlers(self, run_id):
         planner_repo = _ClaimFencedPlannerRepository(
             self.repo, self._lock_current_claim,
@@ -536,6 +561,7 @@ class AutonomyDriver:
                 'evidence': summarize_evidence(self.session, run_id),
                 'knowledge': knowledge,
                 'require_plan': self._planner_requires_plan(run_id),
+                'require_finish': self._planner_requires_finish(run_id),
             }
             proposed = list(self.planner(context) or [])
             return {

@@ -645,6 +645,34 @@ def test_investigation_handoff_forces_plan_after_probe_phase():
     }
 
 
+def test_successful_verification_handoff_forces_finish():
+    """A provider cannot resume investigation after verification succeeds."""
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[
+        FakeChatResult([probe_call()]),
+        FakeChatResult([
+            finish_conclusion_call("resolved", ("verify-1",)),
+        ]),
+    ])
+    context = make_context(repo, remaining_actions=10)
+    context["require_finish"] = True
+    context["evidence"] = [
+        "id=verify-1 | kind=verification_observation | summary=verified",
+    ]
+
+    assert make_planner(adapter)(context) == []
+    assert repo.calls == [{
+        "owner": "admin", "role": "admin", "run_id": "run-1",
+        "outcome": "resolved", "evidence_ids": ["verify-1"],
+        "details": conclusion_details(),
+    }]
+    for request in adapter.requests:
+        assert request["tool_choice"] == {
+            "type": "function",
+            "function": {"name": FINISH_TOOL_NAME},
+        }
+
+
 def test_verification_schema_pins_the_probe_registry_enum():
     from app.ai.autonomy.actions import list_probe_ids
 
