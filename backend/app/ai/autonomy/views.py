@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""M1/S1: 自治任务最小 API 视图（默认禁用，仅管理员）。
+"""M1/S1: 自治任务最小 API 视图（默认禁用，按 owner 隔离）。
 
 本工作包不实现任何远程副作用：创建/启动只落库与状态转换，
 探针提议只做服务端分类与审批排队，执行器属于 S2。
@@ -17,6 +17,7 @@ from app.ai.autonomy.repository import (
     AutonomyPermissionError,
     AutonomyRepository,
     AutonomyValidationError,
+    resolve_current_autonomy_role,
 )
 from app.ai.autonomy.readiness import autonomy_readiness
 from app.ai.autonomy.state import AutonomyStateError, TERMINAL_RUN_STATUSES
@@ -25,7 +26,7 @@ from app.core import config
 from app.core.config import FLASK_SECRET_KEY
 from app.core.db.database import db
 from app.tools.apierr import ApiCode, api_error, api_response
-from app.tools.at import get_current_user, get_current_user_role
+from app.tools.at import get_current_user
 
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,11 @@ def _jsonable(value):
 
 def _identity():
     redis_holder, owner = get_current_user()
-    return redis_holder, owner, str(get_current_user_role() or '')
+    role = (
+        resolve_current_autonomy_role(db.session, owner)
+        if owner else None
+    )
+    return redis_holder, owner, str(role or '')
 
 
 def _payload():
@@ -76,7 +81,7 @@ def _disabled():
 
 
 def _not_admin():
-    return api_error(ApiCode.FORBIDDEN, '自治任务 v1 仅管理员可用', 403)
+    return api_error(ApiCode.FORBIDDEN, '此自治操作仅管理员可用', 403)
 
 
 def _handle(exc):
@@ -134,8 +139,6 @@ def _ops_capacity(owner, readiness=None):
 def ops_status():
     """GET /ai/ops/status: the AIOps landing-page aggregate."""
     _holder, owner, role = _identity()
-    if role != 'admin':
-        return _not_admin()
     from app.ai.ops import alertmanager_configured, prometheus_configured
 
     readiness = autonomy_readiness(enabled=is_autonomy_enabled())
@@ -307,11 +310,13 @@ def alertmanager_webhook():
         return _handle(exc)
 
 
-def _guarded(role):
-    """flag + v1 管理员限制的统一前置检查；通过返回 None。"""
+def _guarded(role, *, admin_only=False):
+    """feature flag and role checks shared by Run lifecycle endpoints."""
     if not is_autonomy_enabled():
         return _disabled()
-    if role != 'admin':
+    if str(role or '') not in {'admin', 'user'}:
+        return _not_admin()
+    if admin_only and role != 'admin':
         return _not_admin()
     return None
 
@@ -414,7 +419,7 @@ def run_detail(run_id):
 def propose_step(run_id):
     """提议一个服务端自有探针动作（结构化参数白名单校验）。"""
     _holder, owner, role = _identity()
-    blocked = _guarded(role)
+    blocked = _guarded(role, admin_only=True)
     if blocked:
         return blocked
     payload = _payload()
@@ -455,7 +460,7 @@ def decide_step(run_id, step_id):
 def set_host_environment(host_id):
     """POST：管理员维护 t_host.ai_environment。"""
     _holder, owner, role = _identity()
-    blocked = _guarded(role)
+    blocked = _guarded(role, admin_only=True)
     if blocked:
         return blocked
     payload = _payload()
@@ -525,6 +530,37 @@ def _knowledge_service():
     return KnowledgeService(db.session)
 
 
+def _knowledge_scopes(owner, role):
+    """Derive searchable scopes from current server-side asset grants."""
+    from app.ai.tools import PlatformQueryService
+
+    return PlatformQueryService(owner, role, session=db.session).authorized_knowledge_scopes()
+
+
+def _knowledge_search_limit(value):
+    if isinstance(value, bool):
+        raise ValueError('limit must be an integer')
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('limit must be an integer') from exc
+    if limit < 1:
+        raise ValueError('limit must be at least 1')
+    return min(limit, 8)
+
+
+def _knowledge_search_query(value):
+    from app.ai.knowledge import _bounded_text
+
+    return _bounded_text(value, 'query', 512)
+
+
+def _admin_only(role):
+    if str(role or '') != 'admin':
+        return _not_admin()
+    return None
+
+
 def _handle_knowledge(exc):
     from app.ai.knowledge import (
         KnowledgeConflict,
@@ -545,6 +581,10 @@ def _handle_knowledge(exc):
 
 def knowledge_config():
     """GET/PATCH embedding config; API keys are write-only."""
+    _holder, _owner, role = _identity()
+    blocked = _admin_only(role)
+    if blocked:
+        return blocked
     try:
         service = _knowledge_service()
         data = (
@@ -559,7 +599,11 @@ def knowledge_config():
 
 def knowledge_documents():
     """GET approved documents or POST an administrator-reviewed runbook."""
-    _holder, owner, _role = _identity()
+    _holder, owner, role = _identity()
+    if request.method == 'POST':
+        blocked = _admin_only(role)
+        if blocked:
+            return blocked
     try:
         service = _knowledge_service()
         if request.method == 'POST':
@@ -567,8 +611,21 @@ def knowledge_documents():
                 data=_jsonable(service.create_document(owner, _payload())),
                 status=201,
             )
+        if role == 'admin':
+            documents = service.list_documents()
+        else:
+            documents = service.list_documents(
+                scopes=_knowledge_scopes(owner, role),
+            )
+            documents = [
+                {
+                    key: value for key, value in document.items()
+                    if key not in {'content_sha256', 'created_by'}
+                }
+                for document in documents
+            ]
         return api_response(data={
-            'documents': _jsonable(service.list_documents()),
+            'documents': _jsonable(documents),
         })
     except Exception as exc:
         db.session.rollback()
@@ -577,6 +634,10 @@ def knowledge_documents():
 
 def knowledge_document(document_id):
     """GET/PATCH/DELETE one reviewed knowledge document."""
+    _holder, _owner, role = _identity()
+    blocked = _admin_only(role)
+    if blocked:
+        return blocked
     try:
         service = _knowledge_service()
         if request.method == 'DELETE':
@@ -594,6 +655,10 @@ def knowledge_document(document_id):
 
 def knowledge_reindex():
     """Queue a bounded Redis index rebuild on the existing prefork Worker."""
+    _holder, _owner, role = _identity()
+    blocked = _admin_only(role)
+    if blocked:
+        return blocked
     try:
         from app.ai.autonomy.worker import dispatch_knowledge_reindex
 
@@ -617,10 +682,36 @@ def knowledge_reindex():
 
 def knowledge_capture_run(run_id):
     """Promote one owned, resolved and independently verified Run."""
-    _holder, owner, _role = _identity()
+    _holder, owner, role = _identity()
+    blocked = _admin_only(role)
+    if blocked:
+        return blocked
     try:
         data = _knowledge_service().capture_run(owner, run_id)
         return api_response(data=_jsonable(data), status=201)
+    except Exception as exc:
+        db.session.rollback()
+        return _handle_knowledge(exc)
+
+
+def knowledge_search():
+    """Search bounded, server-authorized knowledge references."""
+    _holder, owner, role = _identity()
+    payload = _payload()
+    try:
+        query = _knowledge_search_query(payload.get('query'))
+        limit = _knowledge_search_limit(payload.get('limit', 8))
+        items = _knowledge_service().search(
+            query,
+            limit=limit,
+            scopes=_knowledge_scopes(owner, role),
+        )
+        return api_response(data={
+            'results': _jsonable(items),
+            'count': len(items),
+        })
+    except (TypeError, ValueError) as exc:
+        return api_error(ApiCode.TYPE_ERROR, str(exc), 400)
     except Exception as exc:
         db.session.rollback()
         return _handle_knowledge(exc)

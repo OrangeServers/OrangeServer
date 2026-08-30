@@ -174,8 +174,7 @@ TOOL_DEFINITIONS = {
 
 
 ADMIN_ONLY_TOOLS = frozenset({
-    "search_accounts", "search_audit_logs", "create_autonomy_draft",
-    "search_knowledge",
+    "search_accounts", "search_audit_logs",
 })
 
 
@@ -383,9 +382,26 @@ class ToolRegistry:
 class PlatformQueryService:
     """Thin, request-independent queries over existing OrangeServer models."""
 
-    def __init__(self, owner: str, role: str):
+    def __init__(self, owner: str, role: str, session=None):
         self.owner = owner
         self.role = role
+        self.session = session
+
+    def _query(self, model):
+        return self.session.query(model) if self.session is not None else model.query
+
+    def _active_auth_ids(self, auth_ids: Iterable[int]) -> Set[int]:
+        from app.core.db.database import t_auth_host
+
+        if not auth_ids:
+            return set()
+        return {
+            int(row.id)
+            for row in self._query(t_auth_host).filter(
+                t_auth_host.id.in_(auth_ids),
+                t_auth_host.is_deleted.is_(False),
+            ).all()
+        }
 
     def _allowed_groups(self) -> Set[str]:
         from app.core.db.database import (
@@ -399,23 +415,32 @@ class PlatformQueryService:
         if self.role == "admin":
             return {
                 row.name
-                for row in t_group.query.filter_by(is_deleted=False).all()
+                for row in self._query(t_group).filter_by(
+                    is_deleted=False,
+                ).all()
             }
         auth_ids = {
             row.auth_id
-            for row in t_auth_host_user.query.filter_by(user_name=self.owner).all()
+            for row in self._query(t_auth_host_user).filter_by(
+                user_name=self.owner,
+            ).all()
         }
-        user = t_acc_user.query.filter_by(name=self.owner, is_deleted=False).first()
+        user = self._query(t_acc_user).filter_by(
+            name=self.owner, is_deleted=False,
+        ).first()
         if user and user.group:
             auth_ids.update(
                 row.auth_id
-                for row in t_auth_host_user_group.query.filter_by(group_name=user.group).all()
+                for row in self._query(t_auth_host_user_group).filter_by(
+                    group_name=user.group,
+                ).all()
             )
+        auth_ids = self._active_auth_ids(auth_ids)
         if not auth_ids:
             return set()
         return {
             row.group_name
-            for row in t_auth_host_host_group.query.filter(
+            for row in self._query(t_auth_host_host_group).filter(
                 t_auth_host_host_group.auth_id.in_(auth_ids)
             ).all()
         }
@@ -429,17 +454,21 @@ class PlatformQueryService:
 
         auth_ids = {
             int(row.auth_id)
-            for row in t_auth_host_user.query.filter_by(user_name=self.owner).all()
+            for row in self._query(t_auth_host_user).filter_by(
+                user_name=self.owner,
+            ).all()
         }
-        user = t_acc_user.query.filter_by(name=self.owner, is_deleted=False).first()
+        user = self._query(t_acc_user).filter_by(
+            name=self.owner, is_deleted=False,
+        ).first()
         if user and user.group:
             auth_ids.update(
                 int(row.auth_id)
-                for row in t_auth_host_user_group.query.filter_by(
+                for row in self._query(t_auth_host_user_group).filter_by(
                     group_name=user.group
                 ).all()
             )
-        return auth_ids
+        return self._active_auth_ids(auth_ids)
 
     def authorized_system_user_aliases(self) -> Set[str]:
         from app.core.db.database import (
@@ -453,23 +482,32 @@ class PlatformQueryService:
         if self.role == "admin":
             return {
                 row.alias
-                for row in t_sys_user.query.filter_by(is_deleted=False).all()
+                for row in self._query(t_sys_user).filter_by(
+                    is_deleted=False,
+                ).all()
             }
         auth_ids = {
             row.auth_id
-            for row in t_auth_host_user.query.filter_by(user_name=self.owner).all()
+            for row in self._query(t_auth_host_user).filter_by(
+                user_name=self.owner,
+            ).all()
         }
-        user = t_acc_user.query.filter_by(name=self.owner, is_deleted=False).first()
+        user = self._query(t_acc_user).filter_by(
+            name=self.owner, is_deleted=False,
+        ).first()
         if user and user.group:
             auth_ids.update(
                 row.auth_id
-                for row in t_auth_host_user_group.query.filter_by(group_name=user.group).all()
+                for row in self._query(t_auth_host_user_group).filter_by(
+                    group_name=user.group,
+                ).all()
             )
+        auth_ids = self._active_auth_ids(auth_ids)
         if not auth_ids:
             return set()
         return {
             row.sys_user_alias
-            for row in t_auth_host_sys_user.query.filter(
+            for row in self._query(t_auth_host_sys_user).filter(
                 t_auth_host_sys_user.auth_id.in_(auth_ids)
             ).all()
         }
@@ -481,7 +519,7 @@ class PlatformQueryService:
             credential_id = int(sys_user_id)
         except (TypeError, ValueError):
             return None
-        row = t_sys_user.query.filter_by(
+        row = self._query(t_sys_user).filter_by(
             id=credential_id,
             is_deleted=False,
         ).first()
@@ -509,6 +547,7 @@ class PlatformQueryService:
                 username=self.owner,
                 role=self.role,
                 host_ids=asset_ids,
+                session=self.session,
             )
             return True
         except BatchOperationValidationError:
@@ -530,6 +569,7 @@ class PlatformQueryService:
                 role=self.role,
                 host_ids=asset_ids,
                 sys_user=sys_user,
+                session=self.session,
             )
             return True
         except BatchOperationValidationError:
@@ -547,6 +587,21 @@ class PlatformQueryService:
                 asset_ids,
                 str(credential["alias"]),
             )
+        )
+
+    def authorized_knowledge_scopes(self) -> tuple[str, ...]:
+        """Return server-derived global and currently visible host scopes."""
+        from app.core.db.database import t_host
+
+        query = self._query(t_host).filter(t_host.is_deleted.is_(False))
+        if self.role != "admin":
+            allowed_groups = self._allowed_groups()
+            if not allowed_groups:
+                return ("global",)
+            query = query.filter(t_host.group.in_(allowed_groups))
+        host_ids = sorted(int(row.id) for row in query.all())
+        return ("global",) + tuple(
+            f"host:{host_id}" for host_id in host_ids
         )
 
     def get_platform_overview(self, _arguments: Dict[str, Any]) -> ToolData:

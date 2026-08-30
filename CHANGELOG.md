@@ -19,6 +19,11 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- AI operations now uses a Codex-style workbench with grouped task and alert
+  views, an on-demand evidence inspector, legacy-route redirects, and a
+  separate first-level knowledge destination. Authorized users can manage
+  their own Runs and search scoped knowledge; knowledge mutations remain
+  administrator-only.
 - Chat now handles query, explanation, diagnosis, and Autonomy Run drafts;
   every remote write is executed through the existing approval-gated Run path.
 - The Autonomy Worker keeps Celery prefork and defaults to two configurable

@@ -4,6 +4,12 @@ export default {
   title: '自治任务',
   eyebrow: 'AUTONOMY',
   subtitle: '以服务端权威状态监督 AI 在资产上的每次自治运行',
+  alerts: {
+    eyebrow: 'ALERTS',
+    title: '告警任务',
+    subtitle: '只显示由 Alertmanager 触发的自治运行，按当前状态处理告警',
+    empty: '还没有 Alertmanager 触发的自治任务。',
+  },
   create: '新建任务草稿',
   featureDisabled: '自治任务当前不可用。标准安装默认启用；请确认专用 Redis 与 Worker 已启动。',
   notReady: '基础设施未就绪（{reason}），任务启动后不会被执行；草稿仍可创建。',
@@ -21,6 +27,48 @@ export default {
     search: '搜索自治任务',
     searchPlaceholder: '搜索目标、资产、凭据或任务 ID',
     count: '显示 {visible} / 共 {total} 项',
+  },
+  trigger: {
+    manual: '手工创建',
+    chat: '对话创建',
+    alertmanager: 'Alertmanager',
+    unknown: '其他触发源',
+  },
+  group: {
+    waiting: {
+      title: '待处理',
+      hint: '草稿与等待审批的任务',
+    },
+    running: {
+      title: '执行中',
+      hint: '排队、执行或恢复中的任务',
+    },
+    attention: {
+      title: '需要关注',
+      hint: '失败或需要人工判断的任务',
+    },
+    recent: {
+      title: '最近完成',
+      hint: '已完成、取消或过期的任务',
+    },
+  },
+  row: {
+    trigger: '来源',
+    asset: '资产',
+    credential: '凭据',
+    next: '下一步',
+  },
+  nextStep: {
+    draft: '打开任务并审阅计划',
+    queued: '等待 Worker 开始执行',
+    running: '等待动作完成并独立验证',
+    waiting_approval: '审阅动作并作出审批决定',
+    recovering: '等待检查点恢复',
+    needs_attention: '查看异常并决定下一步',
+    completed: '查看结论和证据',
+    failed: '查看失败证据并决定下一步',
+    cancelled: '查看取消结果',
+    expired: '查看预算或保留期信息',
   },
   status: {
     draft: '草稿',
@@ -61,6 +109,7 @@ export default {
     open: '查看详情',
   },
   empty: '还没有自治任务。新建一个任务草稿，审核后再启动。',
+  emptyFiltered: '没有符合当前搜索或筛选条件的任务。',
   loadFailed: '任务列表加载失败',
   dialog: {
     title: '新建自治任务草稿',

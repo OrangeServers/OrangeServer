@@ -10,12 +10,12 @@
       <div class="page-title">
         <div>
           <div class="run-detail-back">
-            <el-button text size="small" :icon="ArrowLeft" @click="router.push('/ai-runs')">
+            <el-button text size="small" :icon="ArrowLeft" @click="router.push('/ai-ops/tasks')">
               {{ t('common.action.back') }}
             </el-button>
             <span class="run-detail-id">{{ runId }}</span>
           </div>
-          <span class="page-eyebrow">{{ t('aiRuns.eyebrow') }}</span>
+          <span class="page-eyebrow">{{ triggerLabel }}</span>
           <h2 class="run-detail-goal" :title="snapshot?.goal || undefined">
             {{ snapshot ? goalSummary : '—' }}
           </h2>
@@ -43,8 +43,11 @@
         </div>
       </div>
       <div class="page-actions">
+        <el-button v-if="snapshot" plain :icon="Document" @click="inspectorVisible = true">
+          {{ t('aiRuns.detail.evidenceTitle') }} · {{ evidence.length + artifacts.length }}
+        </el-button>
         <el-button
-          v-if="snapshot?.status === 'completed' && snapshot.outcome === 'resolved' && stepCounts.verificationSucceeded > 0"
+          v-if="isAdmin && snapshot?.status === 'completed' && snapshot.outcome === 'resolved' && stepCounts.verificationSucceeded > 0"
           plain :loading="capturingKnowledge" @click="captureKnowledge"
         >
           {{ t('aiRuns.detail.captureKnowledge') }}
@@ -73,6 +76,12 @@
     <div v-else-if="!snapshot" v-loading="true" class="panel run-detail-loading" />
 
     <template v-else>
+      <section class="run-next-action" aria-live="polite">
+        <span>{{ t('ai.ops.next.label') }}</span>
+        <strong>{{ nextActionText }}</strong>
+        <small>{{ snapshot.host_alias }} · {{ t(`aiRuns.status.${snapshot.status}`) }}</small>
+      </section>
+
       <!-- 状态横幅：需要关注 / 恢复中 / 过期，文案只转述服务端状态 -->
       <el-alert
         v-if="snapshot.status === 'needs_attention'"
@@ -299,6 +308,12 @@
         </div>
 
         <!-- 右列：证据索引 + 产物 -->
+        <el-drawer
+          v-model="inspectorVisible"
+          append-to-body
+          size="min(560px, 100vw)"
+          :title="t('ai.ops.inspector.title')"
+        >
         <aside class="run-detail-side">
           <details class="panel run-collapsible-panel" :open="evidence.length === 0">
             <summary class="panel-head run-collapsible-head">
@@ -372,6 +387,7 @@
             </ul>
           </details>
         </aside>
+        </el-drawer>
       </div>
     </template>
 
@@ -392,8 +408,9 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowLeft, InfoFilled } from '@element-plus/icons-vue'
+import { ArrowLeft, Document, InfoFilled } from '@element-plus/icons-vue'
 import { t } from '@/i18n'
+import { store } from '@/store'
 import {
   cancelAutonomyRun, captureRunKnowledge, decideAutonomyStep, getAutonomyArtifact, getAutonomySnapshot,
   listAutonomyArtifacts, listAutonomyEvidence, startAutonomyRun, streamAutonomyRun,
@@ -422,10 +439,28 @@ const snapshotError = ref('')
 const acting = ref(false)
 const deciding = ref(false)
 const capturingKnowledge = ref(false)
+const inspectorVisible = ref(false)
+const isAdmin = computed(() => store.user.role === 'admin')
 
 const terminal = computed<boolean>(() => (
   snapshot.value ? isTerminalRunStatus(snapshot.value.status) : false
 ))
+const triggerLabel = computed(() => {
+  const trigger = snapshot.value?.trigger_type || 'manual'
+  return ['manual', 'chat', 'alertmanager'].includes(trigger)
+    ? t(`ai.ops.trigger.${trigger}`)
+    : trigger.toUpperCase()
+})
+const nextActionText = computed(() => {
+  const current = snapshot.value
+  if (!current) return '—'
+  if (current.status === 'draft') return t('ai.ops.next.start')
+  if (current.status === 'waiting_approval') return t('ai.ops.next.approve')
+  if (current.status === 'needs_attention') return t('ai.ops.next.inspect')
+  if (current.status === 'recovering') return t('ai.ops.next.recovering')
+  if (['queued', 'running'].includes(current.status)) return t('ai.ops.next.monitor')
+  return t('ai.ops.next.review')
+})
 const allowedOps = computed<string[]>(() => snapshot.value?.allowed_operations || [])
 const waitingStep = computed<AutonomyStep | null>(() => (
   snapshot.value?.steps.find((step) => step.status === 'waiting_approval') || null
@@ -863,7 +898,7 @@ interface Phase { key: string; state: 'done' | 'active' | 'pending' }
 
 const phases = computed<Phase[]>(() => {
   const all: Phase[] = [
-    'drafted', 'executing', 'approving', 'verifying', 'concluding', 'terminal',
+    'drafted', 'approving', 'executing', 'verifying', 'concluding', 'terminal',
   ].map((key) => ({ key, state: 'pending' as const }))
   const current = snapshot.value
   if (!current) return all
@@ -885,12 +920,12 @@ const phases = computed<Phase[]>(() => {
 
   // 提议：有步骤或已离开草稿即完成；草稿态为当前阶段
   all[0].state = (current.status !== 'draft' || steps.length > 0) ? 'done' : 'active'
-  // 执行：有已终局步骤即完成；排队/运行/恢复中为当前阶段
-  if (executedSteps.length > 0) all[1].state = 'done'
-  else if (['queued', 'running', 'recovering'].includes(current.status)) all[1].state = 'active'
   // 审批：等待审批为当前阶段；任何步骤越过审批即完成过审批
-  if (current.status === 'waiting_approval') all[2].state = 'active'
-  else if (pastApproval) all[2].state = 'done'
+  if (current.status === 'waiting_approval') all[1].state = 'active'
+  else if (pastApproval) all[1].state = 'done'
+  // 执行：有已终局步骤即完成；排队/运行/恢复中为当前阶段
+  if (executedSteps.length > 0) all[2].state = 'done'
+  else if (['queued', 'running', 'recovering'].includes(current.status)) all[2].state = 'active'
   // 验证：有验证步骤终局即完成；进行中的验证步骤为当前阶段
   if (verificationDone) all[3].state = 'done'
   else if (verificationActive && !isTerminal) all[3].state = 'active'
@@ -953,6 +988,10 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  width: min(100%, 980px);
+  margin: 0 auto;
+  padding: 24px clamp(16px, 3vw, 34px) 48px;
+  box-sizing: border-box;
 }
 .run-mono { font-family: var(--ogs-mono); }
 
@@ -1005,6 +1044,18 @@ onBeforeUnmount(() => {
 }
 .run-detail-loading { min-height: 240px; }
 .run-detail-error { padding: 12px; }
+.run-next-action {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px 16px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--ogs-primary) 42%, var(--ogs-border));
+  background: var(--ogs-primary-soft);
+}
+.run-next-action span { color: var(--ogs-primary); font: 700 10px/1 var(--ogs-mono); letter-spacing: .08em; text-transform: uppercase; }
+.run-next-action strong { font-size: 13px; }
+.run-next-action small { color: var(--ogs-text-muted); font-size: 11px; }
 
 /* ---- 横幅 ---- */
 .run-banner { border-radius: 4px; }
@@ -1222,7 +1273,7 @@ onBeforeUnmount(() => {
 /* ---- 双列布局 ---- */
 .run-detail-columns {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 340px;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
   align-items: start;
 }
@@ -1256,18 +1307,37 @@ onBeforeUnmount(() => {
 /* ---- 计划步骤 ---- */
 .run-steps { list-style: none; margin: 0; padding: 8px 0; }
 .run-step {
+  position: relative;
   display: flex;
   gap: 12px;
-  padding: 10px 18px;
+  padding: 14px 18px 18px 54px;
 }
-.run-step + .run-step { border-top: 1px solid var(--ogs-border-subtle); }
+.run-step::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 27px;
+  width: 1px;
+  content: '';
+  background: var(--ogs-border);
+}
+.run-step:first-child::before { top: 22px; }
+.run-step:last-child::before { bottom: calc(100% - 22px); }
 .run-step-seq {
-  flex-shrink: 0;
-  width: 26px;
-  font-size: 12px;
+  position: absolute;
+  top: 15px;
+  left: 18px;
+  z-index: 1;
+  width: 19px;
+  height: 19px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--ogs-border);
+  border-radius: 50%;
+  background: var(--ogs-surface);
+  font-size: 9px;
   font-weight: 700;
   color: var(--ogs-text-tertiary);
-  padding-top: 2px;
 }
 .run-step-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .run-step-line { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
@@ -1463,11 +1533,15 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 640px) {
+  .run-detail { padding: 16px 12px 38px; }
+  .run-next-action { grid-template-columns: 1fr; gap: 5px; }
   .run-conclusion { padding: 14px; }
   .run-conclusion-details { grid-template-columns: 1fr; }
   .run-conclusion-head { flex-direction: column; gap: 8px; }
   .run-conclusion-title { font-size: 16px; }
-  .run-step { padding: 10px 12px; gap: 8px; }
+  .run-step { padding: 12px 10px 16px 43px; gap: 8px; }
+  .run-step::before { left: 21px; }
+  .run-step-seq { left: 12px; }
   .run-step-command,
   .run-step-result { grid-template-columns: 1fr; gap: 2px; }
   .run-artifact-open { align-items: flex-start; flex-direction: column; }

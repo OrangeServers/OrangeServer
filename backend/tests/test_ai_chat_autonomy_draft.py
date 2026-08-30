@@ -38,26 +38,14 @@ def test_admin_definitions_include_create_autonomy_draft():
     assert "create_autonomy_draft" in names
 
 
-def test_normal_user_does_not_receive_create_autonomy_draft():
+def test_normal_user_receives_create_autonomy_draft():
     from app.ai.tools import ADMIN_ONLY_TOOLS
 
     _, _, registry = _registry(role="user")
     names = {item["function"]["name"] for item in registry.definitions()}
 
-    assert "create_autonomy_draft" not in names
-    assert "create_autonomy_draft" in ADMIN_ONLY_TOOLS
-
-
-def test_normal_user_cannot_execute_create_autonomy_draft():
-    from app.ai.tools import ToolNotAllowed
-
-    _, _, registry = _registry(role="user")
-
-    with pytest.raises(ToolNotAllowed):
-        registry.execute(
-            "create_autonomy_draft",
-            {"goal": "巡检", "host_id": 1, "system_user_id": 1},
-        )
+    assert "create_autonomy_draft" in names
+    assert "create_autonomy_draft" not in ADMIN_ONLY_TOOLS
 
 
 # =============================================================================
@@ -130,6 +118,27 @@ def test_create_autonomy_draft_creates_draft_only(autonomy_env):
     assert kwargs["profile_payload"] is None
     assert kwargs["trigger_type"] == "chat"
     assert kwargs["trigger_summary"] == "AI chat draft"
+
+
+def test_user_create_autonomy_draft_still_uses_existing_run_path(autonomy_env):
+    _, _, registry = _registry(role="user")
+
+    response = registry.execute(
+        "create_autonomy_draft",
+        {
+            "goal": "检查授权主机",
+            "host_id": 1,
+            "system_user_id": 2,
+            "mode": "ask",
+        },
+    )
+
+    assert response["autonomy_draft"]["status"] == "draft"
+    (repo,) = autonomy_env
+    (owner, role, kwargs), = repo.create_run_calls
+    assert owner == "alice"
+    assert role == "user"
+    assert kwargs["trigger_type"] == "chat"
 
 
 def test_create_autonomy_draft_disabled_flag_blocks_execution(monkeypatch):

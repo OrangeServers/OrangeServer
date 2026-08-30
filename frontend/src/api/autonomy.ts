@@ -22,6 +22,7 @@ import type {
   KnowledgeDocument,
   KnowledgeDocumentPayload,
   KnowledgeEmbeddingConfig,
+  KnowledgeSearchResult,
 } from '@/types/autonomy'
 
 const BASE = '/ai/autonomous-runs'
@@ -37,7 +38,7 @@ export function getAutonomyStatus(): Promise<AutonomyReadiness> {
   return envelopeData(aiJsonRequest<AutonomyEnvelope<AutonomyReadiness>>('/ai/autonomy/status'))
 }
 
-/** 管理员 AIOps 首页聚合。 */
+/** 当前运维用户可见的 AIOps 聚合状态。 */
 export function getAIOpsStatus(): Promise<AIOpsStatus> {
   return envelopeData(aiJsonRequest<AutonomyEnvelope<AIOpsStatus>>('/ai/ops/status'))
 }
@@ -96,6 +97,13 @@ export function reindexKnowledge(): Promise<KnowledgeEmbeddingConfig> {
   return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeEmbeddingConfig>>(
     `${KNOWLEDGE_BASE}/reindex`, { method: 'POST', body: {} },
   ))
+}
+
+export async function searchKnowledge(query: string, limit = 8): Promise<KnowledgeSearchResult[]> {
+  const data = await envelopeData(aiJsonRequest<AutonomyEnvelope<{ results: KnowledgeSearchResult[] }>>(
+    `${KNOWLEDGE_BASE}/search`, { method: 'POST', body: { query, limit } },
+  ))
+  return data.results || []
 }
 
 export function captureRunKnowledge(runId: string): Promise<KnowledgeDocument> {

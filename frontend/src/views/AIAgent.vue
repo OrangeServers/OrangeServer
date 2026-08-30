@@ -1,29 +1,5 @@
 <template>
   <div class="ai-agent-page">
-    <header class="page-header agent-header">
-      <div>
-        <span class="page-eyebrow">AI OPS · {{ $t('ai.header.eyebrow') }}</span>
-        <h2>{{ $t('ai.header.title') }}</h2>
-        <p class="agent-subtitle">{{ $t('ai.header.subtitle') }}</p>
-      </div>
-      <div class="page-actions agent-actions">
-        <el-button v-if="isAdmin" plain @click="openModelSettings">
-          <el-icon><Setting /></el-icon>
-          {{ $t('ai.header.modelSettings') }}
-        </el-button>
-        <el-button plain @click="conversationDrawer = true">
-          <el-icon><Clock /></el-icon>
-          {{ $t('ai.header.recent') }}
-        </el-button>
-        <el-button type="primary" @click="startNewConversation">
-          <el-icon><Plus /></el-icon>
-          {{ $t('ai.header.new') }}
-        </el-button>
-      </div>
-    </header>
-
-    <AIOpsOverview v-if="isAdmin" />
-
     <div class="agent-workspace">
       <section class="conversation-panel" :aria-label="$t('ai.conversation.aria')">
         <div class="conversation-head">
@@ -34,10 +10,20 @@
               <strong :title="currentTitle">{{ currentTitle }}</strong>
             </div>
           </div>
-          <el-button class="mobile-context-button" text @click="contextDrawer = true">
-            <el-icon><View /></el-icon>
-            {{ $t('ai.conversation.contextButton') }}
-          </el-button>
+          <div class="conversation-head-actions">
+            <el-button v-if="isAdmin" text @click="openModelSettings">
+              <el-icon><Setting /></el-icon><span class="head-action-label">{{ $t('ai.header.modelSettings') }}</span>
+            </el-button>
+            <el-button text @click="conversationDrawer = true">
+              <el-icon><Clock /></el-icon><span class="head-action-label">{{ $t('ai.header.recent') }}</span>
+            </el-button>
+            <el-button text @click="startNewConversation">
+              <el-icon><Plus /></el-icon><span class="head-action-label">{{ $t('ai.header.new') }}</span>
+            </el-button>
+            <el-button class="mobile-context-button" text @click="contextDrawer = true">
+              <el-icon><View /></el-icon><span class="head-action-label">{{ $t('ai.conversation.contextButton') }}</span>
+            </el-button>
+          </div>
         </div>
 
         <div
@@ -419,7 +405,6 @@ import { currentLocale, t } from '@/i18n'
 import { providerBrandColor, providerIcon } from '@/assets/provider-logos'
 import DiagnosticRunCard from '@/components/ai/DiagnosticRunCard.vue'
 import AutonomyDraftCard from '@/components/ai/AutonomyDraftCard.vue'
-import AIOpsOverview from '@/components/ai/AIOpsOverview.vue'
 import OrangeMark from '@/components/OrangeMark.vue'
 import {
   cancelDiagnostic,
@@ -1816,14 +1801,6 @@ onBeforeUnmount(() => {
   flex-direction: column;
 }
 
-.agent-header { flex: 0 0 auto; align-items: center; }
-.agent-subtitle {
-  margin-top: 5px;
-  color: var(--ogs-text-secondary);
-  font-size: 13px;
-  line-height: 1.6;
-}
-.agent-actions { flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 /* —— composer 工具栏：模型与上下文选择贴着输入位，安静版控件 —— */
 .provider-select { width: 230px; }
 .provider-select :deep(.el-select__wrapper) {
@@ -1912,8 +1889,6 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 326px;
   overflow: hidden;
-  border: 1px solid var(--ogs-border);
-  border-radius: 4px;
   background: var(--ogs-surface);
 }
 .conversation-panel {
@@ -1981,6 +1956,7 @@ onBeforeUnmount(() => {
   color: var(--ogs-text);
   font-size: 14px;
 }
+.conversation-head-actions { display: flex; align-items: center; gap: 2px; }
 .mobile-context-button { display: none; }
 
 .message-stream {
@@ -2716,12 +2692,10 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 760px) {
-  .agent-header { align-items: flex-start; }
-  .agent-actions { width: 100%; justify-content: flex-start; }
   .provider-select { width: 150px; }
-  .agent-workspace { border-radius: var(--ogs-radius); }
   .conversation-head { padding-inline: 14px; }
   .conversation-identity { flex: 1; }
+  .conversation-head-actions .head-action-label { display: none; }
   .empty-terminal { width: 100%; box-sizing: border-box; }
   .empty-terminal code { overflow: hidden; text-overflow: ellipsis; }
   .message-stream { padding: 20px 14px; }

@@ -30,6 +30,7 @@ from app.core.db.database import (
     t_ai_autonomous_evidence,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
+    t_acc_user,
     t_group,
     t_host,
 )
@@ -184,6 +185,9 @@ class FakePlatform:
     def validate_asset_ids(self, asset_ids):
         return True
 
+    def validate_asset_sys_user_id_pair(self, asset_ids, sys_user_id):
+        return True
+
     def resolve_system_user(self, sys_user_id):
         return {"id": int(sys_user_id), "alias": "readonly"}
 
@@ -244,12 +248,22 @@ def env(monkeypatch, tmp_path):
     db.metadata.create_all(
         engine,
         tables=[t_group.__table__, t_host.__table__,
+                t_acc_user.__table__,
                 t_ai_autonomous_run.__table__,
                 t_ai_autonomous_step.__table__,
                 t_ai_autonomous_event.__table__,
                 t_ai_autonomous_artifact.__table__,
                 t_ai_autonomous_evidence.__table__],
     )
+    session.add(t_acc_user(
+        alias="Administrator", name="admin", password="fake-hash",
+        usrole="admin", mail="admin@example.com", group="admins",
+    ))
+    session.add(t_acc_user(
+        alias="Alice", name="alice", password="fake-hash",
+        usrole="user", mail="alice@example.com", group="operators",
+    ))
+    session.commit()
 
     platform_state = {"asset_ok": True}
     repo = AutonomyRepository(
@@ -261,6 +275,8 @@ def env(monkeypatch, tmp_path):
     host_seq = {"n": 0}
 
     def create_queued_run(**kwargs):
+        owner = kwargs.pop("owner", "admin")
+        role = kwargs.pop("role", "admin")
         graph_version = kwargs.pop("graph_version", None)
         legacy_mode = kwargs.get("mode") if kwargs.get("mode") in {
             "read_only", "assisted", "lab_autonomous",
@@ -282,7 +298,7 @@ def env(monkeypatch, tmp_path):
             mode="ask",
         )
         payload.update(kwargs)
-        run = repo.create_run("admin", "admin", **payload)
+        run = repo.create_run(owner, role, **payload)
         if graph_version is not None or legacy_mode is not None:
             row = session.get(t_ai_autonomous_run, run["id"])
             if graph_version is not None:
@@ -290,7 +306,7 @@ def env(monkeypatch, tmp_path):
             if legacy_mode is not None:
                 row.mode = legacy_mode
             session.commit()
-        return repo.start_run("admin", "admin", run["id"])
+        return repo.start_run(owner, role, run["id"])
 
     planner_calls = {"n": 0}
 
@@ -1095,6 +1111,35 @@ def test_lease_loss_during_remote_execution_aborts_graph(env):
     assert call_kwargs["lease_owner"] == "driver-test-worker"
     assert callable(call_kwargs["control_probe"])
     assert _run_row(env, run["id"]).status == "running"
+
+
+def test_driver_resolves_user_role_before_passing_it_to_executor(env):
+    run = env["create_queued_run"](
+        owner="alice", role="user", mode="assisted", graph_version="v1",
+    )
+    driver = env["make_driver"]()
+    assert driver.drive(run["id"], env["claim"](run["id"])) == (
+        drive_mod.RESULT_PAUSED
+    )
+
+    row = _run_row(env, run["id"])
+    step = _pending_step(env, run["id"])
+    env["repo"].decide(
+        "alice", "user", run["id"], step.id,
+        operation="approve", expected_revision=int(row.revision),
+    )
+    fake_executor = FakeExecutor({
+        "step_status": "running",
+        "run_status": "running",
+        "revision": int(_run_row(env, run["id"]).revision),
+        "termination": "lease_lost",
+    })
+    driver.executor = fake_executor
+
+    assert driver.drive(run["id"], env["claim"](run["id"])) == (
+        drive_mod.RESULT_LEASE_LOST
+    )
+    assert fake_executor.calls[0][0:2] == ("alice", "user")
 
 
 def test_heartbeat_started_and_stopped(env):

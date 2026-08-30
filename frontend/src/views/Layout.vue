@@ -1,7 +1,12 @@
 <template>
   <el-container style="height:100vh">
     <!-- 侧边栏 -->
-    <el-aside :width="collapsed ? '68px' : '232px'" class="layout-sidebar" style="transition:width 0.25s cubic-bezier(0.4,0,0.2,1);overflow:hidden">
+    <el-aside
+      :width="sidebarWidth"
+      class="layout-sidebar"
+      :class="{ 'is-ai-mobile': narrow && isAiWorkspace, 'is-ai-mobile-open': mobileSidebarOpen }"
+      style="transition:width 0.25s cubic-bezier(0.4,0,0.2,1);overflow:hidden"
+    >
       <!-- Logo -->
       <div class="sidebar-logo">
         <img src="/juzi11.png" alt="logo" />
@@ -14,7 +19,7 @@
       <!-- 菜单 -->
       <div class="sidebar-scroll">
         <el-menu
-          :default-active="$route.path"
+          :default-active="menuActive"
           :collapse="collapsed"
           :collapse-transition="false"
           background-color="transparent"
@@ -69,14 +74,10 @@
 
           <!-- AI 运维 -->
           <div v-show="!collapsed && (isAdmin || isUser)" class="sidebar-section">{{ $t('menu.group.intelligence') }}</div>
-          <el-menu-item index="/ai-agent" v-if="isAdmin || isUser" @click="$router.push('/ai-agent')">
+          <el-menu-item index="/ai-ops" v-if="isAdmin || isUser" @click="$router.push('/ai-ops')">
             <el-icon><Cpu /></el-icon><span>{{ $t('menu.aiAgent') }}</span>
           </el-menu-item>
-          <!-- 自治任务：v1 后端 admin-only，菜单同样只对管理员可见 -->
-          <el-menu-item index="/ai-runs" v-if="isAdmin" @click="$router.push('/ai-runs')">
-            <el-icon><Stopwatch /></el-icon><span>{{ $t('menu.aiRuns') }}</span>
-          </el-menu-item>
-          <el-menu-item index="/ai-knowledge" v-if="isAdmin" @click="$router.push('/ai-knowledge')">
+          <el-menu-item index="/ai-knowledge" v-if="isAdmin || isUser" @click="$router.push('/ai-knowledge')">
             <el-icon><Collection /></el-icon><span>{{ $t('menu.aiKnowledge') }}</span>
           </el-menu-item>
 
@@ -119,13 +120,20 @@
         </div>
       </div>
     </el-aside>
+    <button
+      v-if="narrow && isAiWorkspace && mobileSidebarOpen"
+      class="layout-sidebar-backdrop"
+      type="button"
+      :aria-label="$t('layout.collapseSidebar')"
+      @click="mobileSidebarOpen = false"
+    />
 
     <el-container>
       <!-- 顶栏（毛玻璃） -->
       <el-header class="layout-header" height="64px">
         <div class="header-left">
           <el-tooltip :content="collapsed ? $t('layout.expandSidebar') : $t('layout.collapseSidebar')" placement="bottom">
-            <span class="collapse-btn" @click="collapsed=!collapsed">
+            <span class="collapse-btn" @click="toggleSidebar">
               <el-icon :size="18"><Fold v-if="!collapsed" /><Expand v-else /></el-icon>
             </span>
           </el-tooltip>
@@ -169,7 +177,7 @@
 
       <!-- 内容区 -->
       <el-main
-        :class="{ 'agent-main': $route.path === '/ai-agent' }"
+        :class="{ 'agent-main': isAiWorkspace }"
         style="background:var(--ogs-bg);padding:0;overflow-y:auto"
       >
         <!-- WHITESCREEN-FIX: 不能用 <transition mode="out-in"> 包 router-view——
@@ -177,7 +185,7 @@
              router-view 永久只剩 <!---- > 占位, 整个内容区白屏且无任何报错,
              只能刷新自救。改为纯 CSS 挂载动画 (styles/index.css 的 ogs-page-enter),
              视觉等效且不经过 Vue 过渡状态机。 -->
-        <div class="page-container" :class="{ 'agent-page-container': $route.path === '/ai-agent' }">
+        <div class="page-container" :class="{ 'agent-page-container': isAiWorkspace }">
           <router-view />
         </div>
       </el-main>
@@ -186,12 +194,12 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
   Fold, Expand, ArrowDown, User, SwitchButton,
-  MagicStick, Sunny, Moon, Promotion, Cpu, Stopwatch, Collection,
+  MagicStick, Sunny, Moon, Promotion, Cpu, Collection,
 } from '@element-plus/icons-vue'
 import { store, loadUserInfo, loadUserRole, loadSettings, applyTheme, clearAuthState } from '@/store'
 import { t } from '@/i18n'
@@ -201,16 +209,44 @@ import { logout, getHealth } from '@/api'
 const THEME_ORDER: readonly string[] = ['blue', 'orange', 'black']
 
 const router = useRouter()
+const route = useRoute()
 const collapsed = ref<boolean>(window.innerWidth <= 1366)
+const narrow = ref<boolean>(window.innerWidth <= 720)
+const mobileSidebarOpen = ref(false)
+const isAiWorkspace = computed<boolean>(() => (
+  route.path.startsWith('/ai-ops') || route.path === '/ai-knowledge'
+))
+const sidebarWidth = computed<string>(() => (
+  narrow.value && isAiWorkspace.value && !mobileSidebarOpen.value
+    ? '0px'
+    : collapsed.value ? '68px' : '232px'
+))
+const menuActive = computed<string>(() => {
+  if (route.path.startsWith('/ai-ops') || route.path === '/ai-agent' || route.path.startsWith('/ai-runs')) return '/ai-ops'
+  return route.path
+})
 
 // P3: 响应式自动折叠侧边栏
 function _onResize(): void {
   collapsed.value = window.innerWidth <= 1366
+  narrow.value = window.innerWidth <= 720
+  if (!narrow.value) mobileSidebarOpen.value = false
 }
 window.addEventListener('resize', _onResize)
 const isAdmin = computed<boolean>(() => store.user.role === 'admin')
 const isAudit = computed<boolean>(() => store.user.role === 'audit')
 const isUser = computed<boolean>(() => store.user.role === 'user')
+
+function toggleSidebar(): void {
+  if (narrow.value && isAiWorkspace.value) {
+    collapsed.value = false
+    mobileSidebarOpen.value = !mobileSidebarOpen.value
+    return
+  }
+  collapsed.value = !collapsed.value
+}
+
+watch(() => route.fullPath, () => { mobileSidebarOpen.value = false })
 
 async function doLogout(): Promise<void> {
   // REVIEW-14 P1-4: 先清本地状态（关 ws + 清 store），再调后端 logout
@@ -281,5 +317,24 @@ onBeforeUnmount(() => {
   overflow: hidden;
   /* AI 工作台吃满宽度：对话列自身限宽保证可读性，右栏贴边随时可瞥 */
   max-width: none;
+}
+.layout-sidebar-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1090;
+  border: 0;
+  background: rgb(0 0 0 / 48%);
+}
+@media (max-width: 720px) {
+  .agent-page-container { padding: 0; }
+  .layout-sidebar.is-ai-mobile {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 1100;
+    width: 232px !important;
+    transform: translateX(-100%);
+    transition: transform .18s ease !important;
+  }
+  .layout-sidebar.is-ai-mobile.is-ai-mobile-open { transform: translateX(0); }
 }
 </style>

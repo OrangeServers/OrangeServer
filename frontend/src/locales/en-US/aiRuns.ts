@@ -6,6 +6,12 @@ export default {
   title: 'Autonomous Runs',
   eyebrow: 'AUTONOMY',
   subtitle: 'Supervise every autonomous AI run on your assets, driven by server-authoritative state',
+  alerts: {
+    eyebrow: 'ALERTS',
+    title: 'Alert-triggered runs',
+    subtitle: 'Only Alertmanager-triggered autonomous runs, grouped by the action they need',
+    empty: 'No Alertmanager-triggered autonomous runs yet.',
+  },
   create: 'New task draft',
   featureDisabled: 'Autonomous runs are unavailable. The standard install enables them; confirm dedicated Redis and the Worker are running.',
   notReady: 'Infrastructure not ready ({reason}); started runs will not execute. Drafts can still be created.',
@@ -23,6 +29,48 @@ export default {
     search: 'Search autonomous runs',
     searchPlaceholder: 'Search goal, host, credential, or run ID',
     count: 'Showing {visible} / {total}',
+  },
+  trigger: {
+    manual: 'Manual',
+    chat: 'Chat',
+    alertmanager: 'Alertmanager',
+    unknown: 'Other trigger',
+  },
+  group: {
+    waiting: {
+      title: 'Waiting',
+      hint: 'Drafts and runs awaiting approval',
+    },
+    running: {
+      title: 'Running',
+      hint: 'Queued, executing, or recovering',
+    },
+    attention: {
+      title: 'Needs attention',
+      hint: 'Failed runs or runs needing a decision',
+    },
+    recent: {
+      title: 'Recent',
+      hint: 'Completed, cancelled, or expired runs',
+    },
+  },
+  row: {
+    trigger: 'Source',
+    asset: 'Asset',
+    credential: 'Credential',
+    next: 'Next',
+  },
+  nextStep: {
+    draft: 'Open the run and review its plan',
+    queued: 'Wait for the Worker to start',
+    running: 'Wait for actions and independent verification',
+    waiting_approval: 'Review the action and decide',
+    recovering: 'Wait for checkpoint recovery',
+    needs_attention: 'Review the issue and decide what to do',
+    completed: 'Review the conclusion and evidence',
+    failed: 'Review failure evidence and decide what to do',
+    cancelled: 'Review the cancellation result',
+    expired: 'Review the budget or retention details',
   },
   status: {
     draft: 'Draft',
@@ -63,6 +111,7 @@ export default {
     open: 'View details',
   },
   empty: 'No autonomous runs yet. Create a task draft, review it, then start it.',
+  emptyFiltered: 'No runs match the current search or filters.',
   loadFailed: 'Failed to load the run list',
   dialog: {
     title: 'New autonomous task draft',

@@ -122,7 +122,7 @@ Run 的权威状态为 `queued`、`running`、`completed`、`partial`、`failed`
 
 | 方法 | 路径 | 调用方 | 说明 |
 |---|---|---|---|
-| GET | `/ai/ops/status` | admin | 返回待处理告警、活动/排队 Run、最近结论、Worker 容量和知识索引状态 |
+| GET | `/ai/ops/status` | admin/user | 返回当前用户可见的待处理告警、活动/排队 Run、最近结论、Worker 容量和知识索引状态 |
 | POST | `/ai/ops/alertmanager/webhook` | Alertmanager | 使用独立 Bearer Token；单条 `firing` 幂等创建并启动 `ask` Run，`resolved` 只追加 Evidence |
 
 Webhook 最大 256 KiB，首版每次只接受一条 Alertmanager alert。标签必须包含
@@ -137,16 +137,19 @@ PromQL。返回的 Evidence/Artifact 不包含 Prometheus 地址、认证信息�
 
 ## M2 运维知识 API
 
-以下接口仅对管理员开放。MySQL 保存文档正文和版本，Redis DB0 中的 chunk/vector 是
-可删除并重建的派生索引；配置接口永不返回 API Key 明文。
+MySQL 保存文档正文和版本，Redis DB0 中的 chunk/vector 是可删除并重建的派生索引；
+配置接口永不返回 API Key 明文。普通用户只能读取获授权范围的来源元数据、索引健康
+和检索结果；配置、正文、增删改、重建和 Run 知识沉淀仍仅管理员可用。
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET/PATCH | `/ai/knowledge/config` | 读取或更新本地/远程 embedding 配置；模型或维度变化将索引标记为 `stale` |
-| GET/POST | `/ai/knowledge/documents` | 列出文档元数据或新增管理员审核的 Markdown Runbook |
-| GET/PATCH/DELETE | `/ai/knowledge/documents/{id}` | 读取正文、更新版本或删除文档 |
-| POST | `/ai/knowledge/reindex` | 向现有 Celery Worker 提交重建任务，返回 `202`；最多生成 20,000 个 Redis 向量分片 |
-| POST | `/ai/autonomous-runs/{run_id}/knowledge` | 将当前管理员拥有、已解决且独立验证通过的 Run 沉淀为审核知识 |
+| 方法 | 路径 | 角色 | 说明 |
+|---|---|---|---|
+| GET/PATCH | `/ai/knowledge/config` | admin | 读取或更新本地/远程 embedding 配置；模型或维度变化将索引标记为 `stale` |
+| GET | `/ai/knowledge/documents` | admin/user | 列出获授权范围的来源元数据，不返回正文 |
+| POST | `/ai/knowledge/documents` | admin | 新增管理员审核的 Markdown Runbook |
+| GET/PATCH/DELETE | `/ai/knowledge/documents/{id}` | admin | 读取正文、更新版本或删除文档 |
+| POST | `/ai/knowledge/search` | admin/user | 在服务端验证的 `global` 与获授权 `host:*` 范围检索；查询最多 512 字符，最多返回 8 条 |
+| POST | `/ai/knowledge/reindex` | admin | 向现有 Celery Worker 提交重建任务，返回 `202`；最多生成 20,000 个 Redis 向量分片 |
+| POST | `/ai/autonomous-runs/{run_id}/knowledge` | admin | 将当前管理员拥有、已解决且独立验证通过的 Run 沉淀为审核知识 |
 
 固定边界为：单文档 1 MiB、分片 400 字符并重叠 60、检索最多 8 条、注入模型上下文
 最多 16 KiB。只允许 `runbook` 和 `verified_run` 来源。列表接口不返回正文；读取或编辑
@@ -155,35 +158,36 @@ PromQL。返回的 Evidence/Artifact 不包含 Prometheus 地址、认证信息�
 自动显示为 `stale`，重建完成前不会查询旧布局。
 
 文档范围只接受 `global` 或 `host:<资产 ID>`。聊天检索默认使用 `global`；工具参数提供
-当前管理员有权访问的 `host_id` 或精确 `host_alias` 时，也使用对应资产范围。Autonomy
+当前用户有权访问的 `host_id` 或精确 `host_alias` 时，也使用对应资产范围。Autonomy
 Planner 仅使用 `global` 和当前 Run 的目标资产范围。
 
-聊天提供管理员工具 `search_knowledge`。Autonomy Planner 会用 Run 目标检索最多 4 条
+聊天提供 `search_knowledge` 工具。Autonomy Planner 会用 Run 目标检索最多 4 条
 引用；系统提示固定说明这些引用只供假设，不能授权远程动作，也不能替代本次 Run 的
 实时 Evidence 和独立验证。
 
 ## M1 自治任务 API
 
-自治接口只对管理员开放。标准 bundled 栈启动统一 Redis 8 与 Worker，默认可用。
+管理员和普通用户都可以在各自已授权的资产与系统凭据范围内管理自己创建的 Run；
+跨 owner 访问保持拒绝。标准 bundled 栈启动统一 Redis 8 与 Worker，默认可用。
 未同时满足进程启用、checkpoint 和 Worker 就绪条件时，Run 不能启动。聊天只拥有
-创建草稿引用卡的能力，不能启动、审批或取消 Run。
+创建草稿引用卡的能力，启动、审批和取消仍通过工作台调用既有 Run 接口。
 
 ### 就绪状态与生命周期
 
 | 方法 | 路径 | 角色 | 说明 |
 |---|---|---|---|
 | GET | `/ai/autonomy/status` | admin/user | 返回 `enabled`、Redis checkpoint、Worker pool/并发和 `ready` 布尔值，以及固定 `reason` 码 |
-| POST | `/ai/autonomous-runs` | admin | 校验目标资产、系统用户、模式和预算，创建 `draft` |
-| GET | `/ai/autonomous-runs` | admin | 当前管理员的 Run 列表 |
-| GET | `/ai/autonomous-runs/{run_id}` | admin | 当前管理员的权威快照、步骤和 `allowed_operations` |
-| POST | `/ai/autonomous-runs/{run_id}/start` | admin | 重新校验边界后将 `draft` 排入执行 |
-| POST | `/ai/autonomous-runs/{run_id}/cancel` | admin | 请求取消；远端停止被确认前不会虚报 `cancelled` |
+| POST | `/ai/autonomous-runs` | admin/user | 校验目标资产、系统用户组合授权、模式和预算，创建 `draft` |
+| GET | `/ai/autonomous-runs` | admin/user | 当前用户拥有的 Run 列表 |
+| GET | `/ai/autonomous-runs/{run_id}` | admin/user | 当前用户拥有 Run 的权威快照、步骤和 `allowed_operations` |
+| POST | `/ai/autonomous-runs/{run_id}/start` | admin/user | 重新校验资产与系统凭据组合授权后将 `draft` 排入执行 |
+| POST | `/ai/autonomous-runs/{run_id}/cancel` | admin/user | 请求取消；跨 owner 拒绝，远端停止被确认前不会虚报 `cancelled` |
 | POST | `/ai/autonomous-runs/{run_id}/steps` | admin | 提议服务端固定探针，不接受任意 Shell 作为探针参数 |
-| POST | `/ai/autonomous-runs/{run_id}/steps/{step_id}/decision` | admin | 对服务端返回的待审批 Step 作 `approve` 或 `reject` 决策 |
-| GET | `/ai/autonomous-runs/{run_id}/artifacts` | admin | 获取本 Run 的脱敏 Artifact 元数据 |
-| GET | `/ai/autonomous-runs/{run_id}/artifacts/{artifact_id}` | admin | 读取单条未过期 Artifact 的解密正文 |
-| GET | `/ai/autonomous-runs/{run_id}/evidence` | admin | 获取本 Run 的不可信 Evidence 引用 |
-| GET | `/ai/autonomous-runs/{run_id}/stream` | admin | 按事件序号续传 SSE；支持 `after_seq` 或 `Last-Event-ID` |
+| POST | `/ai/autonomous-runs/{run_id}/steps/{step_id}/decision` | admin/user | 对自己 Run 的待审批 Step 作 `approve` 或 `reject` 决策，副作用前再次验证授权 |
+| GET | `/ai/autonomous-runs/{run_id}/artifacts` | admin/user | 获取自己 Run 的脱敏 Artifact 元数据 |
+| GET | `/ai/autonomous-runs/{run_id}/artifacts/{artifact_id}` | admin/user | 读取自己 Run 的单条未过期 Artifact 解密正文 |
+| GET | `/ai/autonomous-runs/{run_id}/evidence` | admin/user | 获取自己 Run 的不可信 Evidence 引用 |
+| GET | `/ai/autonomous-runs/{run_id}/stream` | admin/user | 按事件序号续传 SSE；支持 `after_seq` 或 `Last-Event-ID` |
 | POST | `/ai/autonomy/hosts/{host_id}/environment` | admin | 设置资产的 `production`、`staging` 或 `lab` 环境 |
 
 创建草稿：

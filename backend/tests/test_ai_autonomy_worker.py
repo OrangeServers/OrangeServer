@@ -35,6 +35,9 @@ class FakePlatform:
     def validate_asset_ids(self, asset_ids):
         return True
 
+    def validate_asset_sys_user_id_pair(self, asset_ids, sys_user_id):
+        return True
+
     def resolve_system_user(self, sys_user_id):
         return {"id": int(sys_user_id), "alias": "readonly"}
 
@@ -731,4 +734,5 @@ def test_build_default_executor_wires_the_tool_calling_planner(monkeypatch):
 
     assert result == drive_mod.RESULT_COMPLETED
     assert isinstance(captured["planner"], ToolCallingPlanner)
+    assert captured.get("role") is None
     assert captured["drive"] == ("run-x", {"lease_token": "token-x"})

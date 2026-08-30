@@ -1,4 +1,4 @@
-"""M1/S1 autonomy routes: REST verbs, admin-only, disabled by default."""
+"""M1/S1 autonomy routes with owner-scoped admin/user access."""
 from typing import Any, Callable, cast
 
 from app.ai.autonomy import views
@@ -15,17 +15,19 @@ def _secure(view: Callable[..., Any], *roles: str) -> Callable[..., Any]:
 def register_autonomy_routes(app: Any) -> None:
     """注册自治任务最小 API。
 
-    v1 除状态探测外全部仅管理员；功能本身还受
-    OGS_AI_AUTONOMY_ENABLED（默认关闭）二次门控。
+    Run 生命周期与只读数据按当前 owner 对 admin/user 开放；服务端
+    自有探针提议、主机环境和知识库管理仍仅管理员。自治功能本身还
+    受 OGS_AI_AUTONOMY_ENABLED（默认关闭）二次门控。
     """
     admins = ("admin",)
+    run_users = ("admin", "user")
     app.add_url_rule(
         "/ai/autonomy/status", "ai_autonomy_status",
         _secure(views.autonomy_status, "admin", "user"), methods=["GET"],
     )
     app.add_url_rule(
         "/ai/ops/status", "ai_ops_status",
-        _secure(views.ops_status, "admin"), methods=["GET"],
+        _secure(views.ops_status, *run_users), methods=["GET"],
     )
     # Machine-to-machine endpoint: its own constant-time Bearer check replaces
     # session auth and CSRF; never wrap it with the browser security chain.
@@ -35,24 +37,24 @@ def register_autonomy_routes(app: Any) -> None:
     )
     app.add_url_rule(
         "/ai/autonomous-runs", "ai_autonomy_create_run",
-        _secure(views.create_run, *admins), methods=["POST"],
+        _secure(views.create_run, *run_users), methods=["POST"],
     )
     app.add_url_rule(
         "/ai/autonomous-runs", "ai_autonomy_list_runs",
-        _secure(views.list_runs, *admins), methods=["GET"],
+        _secure(views.list_runs, *run_users), methods=["GET"],
     )
     app.add_url_rule(
         "/ai/autonomous-runs/<string:run_id>", "ai_autonomy_run_detail",
-        _secure(views.run_detail, *admins), methods=["GET"],
+        _secure(views.run_detail, *run_users), methods=["GET"],
     )
     app.add_url_rule(
         "/ai/autonomous-runs/<string:run_id>/start", "ai_autonomy_run_start",
-        _secure(views.start_run, *admins), methods=["POST"],
+        _secure(views.start_run, *run_users), methods=["POST"],
     )
     app.add_url_rule(
         "/ai/autonomous-runs/<string:run_id>/cancel",
         "ai_autonomy_run_cancel",
-        _secure(views.cancel_run, *admins), methods=["POST"],
+        _secure(views.cancel_run, *run_users), methods=["POST"],
     )
     app.add_url_rule(
         "/ai/autonomous-runs/<string:run_id>/steps", "ai_autonomy_propose_step",
@@ -61,23 +63,23 @@ def register_autonomy_routes(app: Any) -> None:
     app.add_url_rule(
         "/ai/autonomous-runs/<string:run_id>/steps/<string:step_id>/decision",
         "ai_autonomy_step_decision",
-        _secure(views.decide_step, *admins), methods=["POST"],
+        _secure(views.decide_step, *run_users), methods=["POST"],
     )
     app.add_url_rule(
         "/ai/autonomous-runs/<string:run_id>/artifacts",
         "ai_autonomy_artifact_list",
-        _secure(views.list_artifacts, *admins), methods=["GET"],
+        _secure(views.list_artifacts, *run_users), methods=["GET"],
     )
     app.add_url_rule(
         "/ai/autonomous-runs/<string:run_id>/artifacts/"
         "<string:artifact_id>",
         "ai_autonomy_artifact_detail",
-        _secure(views.artifact_content, *admins), methods=["GET"],
+        _secure(views.artifact_content, *run_users), methods=["GET"],
     )
     app.add_url_rule(
         "/ai/autonomous-runs/<string:run_id>/evidence",
         "ai_autonomy_evidence_list",
-        _secure(views.list_evidence, *admins), methods=["GET"],
+        _secure(views.list_evidence, *run_users), methods=["GET"],
     )
     app.add_url_rule(
         "/ai/knowledge/config", "ai_knowledge_config",
@@ -85,7 +87,15 @@ def register_autonomy_routes(app: Any) -> None:
     )
     app.add_url_rule(
         "/ai/knowledge/documents", "ai_knowledge_documents",
-        _secure(views.knowledge_documents, *admins), methods=["GET", "POST"],
+        _secure(views.knowledge_documents, *run_users), methods=["GET"],
+    )
+    app.add_url_rule(
+        "/ai/knowledge/documents", "ai_knowledge_documents_create",
+        _secure(views.knowledge_documents, *admins), methods=["POST"],
+    )
+    app.add_url_rule(
+        "/ai/knowledge/search", "ai_knowledge_search",
+        _secure(views.knowledge_search, *run_users), methods=["POST"],
     )
     app.add_url_rule(
         "/ai/knowledge/documents/<string:document_id>",
@@ -105,7 +115,7 @@ def register_autonomy_routes(app: Any) -> None:
     app.add_url_rule(
         "/ai/autonomous-runs/<string:run_id>/stream",
         "ai_autonomy_run_stream",
-        _secure(views.stream_run, *admins), methods=["GET"],
+        _secure(views.stream_run, *run_users), methods=["GET"],
     )
     app.add_url_rule(
         "/ai/autonomy/hosts/<int:host_id>/environment",

@@ -72,8 +72,13 @@ def _normalize_host_ids(host_ids: Iterable[int]) -> List[int]:
     return normalized_ids
 
 
-def _active_authorization_ids(username: str) -> set[int]:
-    user = t_acc_user.query.filter_by(
+def _query(model, session=None):
+    """Use an injected control session when authorization is rechecked."""
+    return session.query(model) if session is not None else model.query
+
+
+def _active_authorization_ids(username: str, session=None) -> set[int]:
+    user = _query(t_acc_user, session).filter_by(
         name=username,
         is_deleted=False,
     ).first()
@@ -81,12 +86,14 @@ def _active_authorization_ids(username: str) -> set[int]:
         return set()
     auth_ids = {
         int(row.auth_id)
-        for row in t_auth_host_user.query.filter_by(user_name=username).all()
+        for row in _query(t_auth_host_user, session).filter_by(
+            user_name=username,
+        ).all()
     }
     if user.group:
         auth_ids.update(
             int(row.auth_id)
-            for row in t_auth_host_user_group.query.filter_by(
+            for row in _query(t_auth_host_user_group, session).filter_by(
                 group_name=user.group
             ).all()
         )
@@ -94,7 +101,7 @@ def _active_authorization_ids(username: str) -> set[int]:
         return set()
     return {
         int(row.id)
-        for row in t_auth_host.query.filter(
+        for row in _query(t_auth_host, session).filter(
             t_auth_host.id.in_(auth_ids),
             t_auth_host.is_deleted.is_(False),
         ).all()
@@ -106,6 +113,7 @@ def validate_authorized_hosts(
     username: str,
     role: str,
     host_ids: Iterable[int],
+    session=None,
 ) -> List[Any]:
     """Resolve active hosts and enforce the caller's current asset grants."""
     if str(role or "") not in {"admin", "user"}:
@@ -113,7 +121,7 @@ def validate_authorized_hosts(
             "batch operation permission denied"
         )
     normalized_ids = _normalize_host_ids(host_ids)
-    hosts = t_host.query.filter(
+    hosts = _query(t_host, session).filter(
         t_host.id.in_(normalized_ids),
         t_host.is_deleted.is_(False),
     ).all()
@@ -126,14 +134,14 @@ def validate_authorized_hosts(
     if str(role or "") == "admin":
         return ordered_hosts
 
-    active_auth_ids = _active_authorization_ids(username)
+    active_auth_ids = _active_authorization_ids(username, session)
     if not active_auth_ids:
         raise BatchOperationValidationError(
             "asset and system user permission denied"
         )
     covered_groups = {
         row.group_name
-        for row in t_auth_host_host_group.query.filter(
+        for row in _query(t_auth_host_host_group, session).filter(
             t_auth_host_host_group.auth_id.in_(active_auth_ids)
         ).all()
         if int(row.auth_id) in active_auth_ids
@@ -151,6 +159,7 @@ def validate_batch_targets(
     role: str,
     host_ids: Iterable[int],
     sys_user: str,
+    session=None,
 ) -> List[Any]:
     """Resolve active targets and revalidate their credential authorization."""
     if not sys_user:
@@ -159,8 +168,9 @@ def validate_batch_targets(
         username=username,
         role=role,
         host_ids=host_ids,
+        session=session,
     )
-    credential = t_sys_user.query.filter_by(
+    credential = _query(t_sys_user, session).filter_by(
         alias=sys_user,
         is_deleted=False,
     ).first()
@@ -169,10 +179,10 @@ def validate_batch_targets(
     if str(role or "") == "admin":
         return ordered_hosts
 
-    active_auth_ids = _active_authorization_ids(username)
+    active_auth_ids = _active_authorization_ids(username, session)
     credential_auth_ids = {
         int(row.auth_id)
-        for row in t_auth_host_sys_user.query.filter(
+        for row in _query(t_auth_host_sys_user, session).filter(
             t_auth_host_sys_user.auth_id.in_(active_auth_ids),
             t_auth_host_sys_user.sys_user_alias == sys_user,
         ).all()
@@ -181,7 +191,7 @@ def validate_batch_targets(
     }
     covered_groups = {
         row.group_name
-        for row in t_auth_host_host_group.query.filter(
+        for row in _query(t_auth_host_host_group, session).filter(
             t_auth_host_host_group.auth_id.in_(credential_auth_ids)
         ).all()
         if int(row.auth_id) in credential_auth_ids

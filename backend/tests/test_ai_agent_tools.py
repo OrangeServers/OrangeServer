@@ -80,6 +80,7 @@ def test_normal_user_does_not_receive_admin_only_tools():
     assert "search_accounts" not in names
     assert "search_audit_logs" not in names
     assert "search_assets" in names
+    assert "search_knowledge" in names
     assert "prepare_batch_command" not in names
 
 
@@ -92,7 +93,7 @@ def test_admin_receives_account_and_audit_tools():
     assert "search_knowledge" in names
 
 
-def test_admin_knowledge_tool_returns_bounded_references(monkeypatch):
+def test_user_knowledge_tool_returns_bounded_references(monkeypatch):
     from app.ai import knowledge
 
     class FakeKnowledgeService:
@@ -105,7 +106,7 @@ def test_admin_knowledge_tool_returns_bounded_references(monkeypatch):
             return [{"citation_id": "K1", "title": "Disk runbook"}]
 
     monkeypatch.setattr(knowledge, "KnowledgeService", FakeKnowledgeService)
-    _, _, registry = _registry(role="admin")
+    _, _, registry = _registry(role="user")
     result = registry.execute("search_knowledge", {"query": "disk full"})
     assert result == {
         "knowledge_references": [{"citation_id": "K1", "title": "Disk runbook"}],
@@ -113,7 +114,7 @@ def test_admin_knowledge_tool_returns_bounded_references(monkeypatch):
     }
 
 
-def test_admin_knowledge_tool_includes_authorized_host_scope(monkeypatch):
+def test_user_knowledge_tool_includes_authorized_host_scope(monkeypatch):
     from app.ai import knowledge
 
     class FakeKnowledgeService:
@@ -127,7 +128,7 @@ def test_admin_knowledge_tool_includes_authorized_host_scope(monkeypatch):
             return [{"citation_id": "K1", "scope": "host:2"}]
 
     monkeypatch.setattr(knowledge, "KnowledgeService", FakeKnowledgeService)
-    _, _, registry = _registry(role="admin", allowed_ids=[1, 2])
+    _, _, registry = _registry(role="user", allowed_ids=[1, 2])
 
     result = registry.execute("search_knowledge", {
         "query": "restart cron", "host_alias": "host-2",
@@ -136,10 +137,10 @@ def test_admin_knowledge_tool_includes_authorized_host_scope(monkeypatch):
     assert result["knowledge_references"][0]["scope"] == "host:2"
 
 
-def test_admin_knowledge_tool_rejects_unauthorized_host_scope():
+def test_user_knowledge_tool_rejects_unauthorized_host_scope():
     from app.ai.tools import ToolValidationError
 
-    _, _, registry = _registry(role="admin", allowed_ids=[1, 2])
+    _, _, registry = _registry(role="user", allowed_ids=[1, 2])
 
     try:
         registry.execute(

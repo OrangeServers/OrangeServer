@@ -15,8 +15,9 @@
 - 租约丢失即中止：心跳续租失败后，驱动循环在下一个节点边界立刻
   中止，不再产生任何副作用，也不释放（已不属于自己）的租约。
 - v1 兼容图仍让所有动作经过 approval_pause；v2 使用服务端
-  allow/ask/deny 决策，仅 ask 暂停。role 固定 'admin'（自治入口在
-  路由层强制管理员），多角色支持需先把 role 持久化到 Run 行。
+  allow/ask/deny 决策，仅 ask 暂停。驱动每次接管 Run 都从当前
+  t_acc_user 解析 owner role，不把角色持久化到 Run，也不信任旧投递
+  中携带的角色。
 """
 import datetime
 import json
@@ -65,6 +66,7 @@ from app.ai.autonomy.repository import (
     MAX_EVIDENCE_CITATIONS,
     fallback_conclusion_details,
     redacted_summary,
+    resolve_current_autonomy_role,
     sanitize_text,
 )
 from app.ai.autonomy.state import (
@@ -259,7 +261,7 @@ class AutonomyDriver:
         heartbeat_session_factory=None,
         worker_id=None,
         lease_ttl=None,
-        role='admin',
+        role=None,
     ):
         self.session = session
         self.role = role
@@ -1332,6 +1334,17 @@ class AutonomyDriver:
         # 取消是请求：开跑前无进行中副作用，可直接确认。
         if bool(run.cancel_requested):
             return self._confirm_cancel(run)
+
+        current_role = resolve_current_autonomy_role(
+            self.session, str(run.owner or ''),
+        )
+        if current_role is None:
+            self._fail_run(
+                run, 'authorization_revoked',
+                'run owner is inactive or has no supported role',
+            )
+            return RESULT_FAILED
+        self.role = current_role
 
         try:
             self._configure_duration_budget(run)

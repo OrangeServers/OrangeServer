@@ -66,7 +66,7 @@ const statusLabel = computed(() => {
 function openRun(): void {
   const runId = props.draft.run_id
   if (!runId) return
-  router.push({ name: 'AiRunDetail', params: { runId } })
+  router.push({ name: 'AiOpsRunDetail', params: { runId } })
 }
 </script>
 

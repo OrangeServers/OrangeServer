@@ -55,6 +55,13 @@ class FakePlatform:
     def validate_asset_ids(self, asset_ids):
         return self.state["asset_ok"]
 
+    def validate_asset_sys_user_id_pair(self, asset_ids, sys_user_id):
+        return (
+            self.state.get("pair_ok", True)
+            and self.state["asset_ok"]
+            and self.state["credential_ok"]
+        )
+
     def resolve_system_user(self, sys_user_id):
         if not self.state["credential_ok"]:
             return None
@@ -81,6 +88,7 @@ def repo_env(monkeypatch):
     platform_state = {
         "asset_ok": True,
         "credential_ok": True,
+        "pair_ok": True,
         "calls": [],
     }
 
@@ -607,6 +615,17 @@ def test_create_run_maps_active_host_unique_violation(
         )
 
 
+def test_create_run_requires_combined_asset_credential_authorization(repo_env):
+    """Separate grants must not authorize an invalid host/credential pair."""
+    repo_env["platform_state"]["pair_ok"] = False
+    with pytest.raises(AutonomyPermissionError, match="asset and credential"):
+        repo_env["repo"].create_run(
+            "admin", "admin",
+            goal="diagnose", host_id=repo_env["host_id"],
+            system_user_id=19, mode="ask",
+        )
+
+
 def test_create_run_does_not_remap_unrelated_integrity_error(
     repo_env, monkeypatch,
 ):
@@ -710,13 +729,28 @@ def test_cancel_queued_run_is_atomic_terminal_and_releases_host(repo_env):
     ]
 
 
-def test_cancel_requires_owner_and_admin_role(repo_env):
+def test_cancel_allows_user_owner_and_keeps_cross_owner_boundary(repo_env):
     repo = repo_env["repo"]
-    run = repo_env["create_started_run"]()
+    session = repo_env["session"]
+    host = t_host(
+        alias="web-02", host_ip="203.0.113.11", host_port=22,
+        ai_environment="production",
+    )
+    session.add(host)
+    session.commit()
+    run = repo.create_run(
+        "bob", "user", goal="user-owned run", host_id=int(host.id),
+        system_user_id=19, mode="ask",
+    )
     with pytest.raises(AutonomyNotFound):
         repo.request_cancel("someone-else", "admin", run["id"])
     with pytest.raises(AutonomyPermissionError):
-        repo.request_cancel("admin", "user", run["id"])
+        repo.request_cancel("bob", "support", run["id"])
+
+    repo_env["platform_state"]["asset_ok"] = False
+    repo_env["platform_state"]["credential_ok"] = False
+    cancelled = repo.request_cancel("bob", "user", run["id"])
+    assert cancelled["status"] == "cancelled"
 
 
 def test_cancel_draft_is_terminal_without_permission_revalidation(repo_env):

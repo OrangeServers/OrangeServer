@@ -1,21 +1,21 @@
 <!--
   AI 自治任务列表页（M1/S3 切片 6）
   原则：列表只转述服务端权威状态；创建按钮可用性由 /ai/autonomy/status 决定，
-  其余操作交给详情页的 allowed_operations。
+  其余操作交给详情页的 allowed_operations。任务按服务端状态分组展示。
 -->
 <template>
   <div class="ai-runs-page">
     <header class="page-header">
       <div class="page-title">
         <div>
-          <span class="page-eyebrow">{{ t('aiRuns.eyebrow') }}</span>
-          <h2>{{ t('aiRuns.title') }}</h2>
-          <p class="page-subtitle">{{ t('aiRuns.subtitle') }}</p>
+          <span class="page-eyebrow">{{ t(props.alertsOnly ? 'aiRuns.alerts.eyebrow' : 'aiRuns.eyebrow') }}</span>
+          <h2>{{ t(props.alertsOnly ? 'aiRuns.alerts.title' : 'aiRuns.title') }}</h2>
+          <p class="page-subtitle">{{ t(props.alertsOnly ? 'aiRuns.alerts.subtitle' : 'aiRuns.subtitle') }}</p>
         </div>
       </div>
       <div class="page-actions">
         <el-button :icon="Refresh" @click="loadRuns">{{ t('common.action.refresh') }}</el-button>
-        <el-button type="primary" :icon="Plus" :disabled="!canCreate" @click="openCreate">
+        <el-button v-if="!props.alertsOnly" type="primary" :icon="Plus" :disabled="!canCreate" @click="openCreate">
           {{ t('aiRuns.create') }}
         </el-button>
       </div>
@@ -59,11 +59,11 @@
         />
       </el-select>
       <span class="runs-count">
-        {{ t('aiRuns.filter.count', { visible: filteredRuns.length, total: runs.length }) }}
+        {{ t('aiRuns.filter.count', { visible: filteredRuns.length, total: scopedRuns.length }) }}
       </span>
     </div>
 
-    <!-- 列表主体：loading / error / empty / table 四态 -->
+    <!-- 列表主体：loading / error / empty / 分组任务行四态 -->
     <div v-loading="loading" class="panel runs-panel">
       <el-alert
         v-if="loadError && !loading"
@@ -73,83 +73,65 @@
         <el-button size="small" @click="loadRuns">{{ t('common.action.retry') }}</el-button>
       </el-alert>
       <el-empty
-        v-else-if="!loading && !loadError && runs.length === 0"
-        :description="t('aiRuns.empty')"
+        v-else-if="!loading && !loadError && scopedRuns.length === 0"
+        :description="t(props.alertsOnly ? 'aiRuns.alerts.empty' : 'aiRuns.empty')"
       />
       <el-empty
         v-else-if="!loading && !loadError && filteredRuns.length === 0"
-        :description="t('aiRuns.empty')"
+        :description="t('aiRuns.emptyFiltered')"
       />
-      <el-table
-        v-else
-        :data="filteredRuns"
-        class="runs-table"
-        @row-click="openRun"
-      >
-        <el-table-column :label="t('aiRuns.table.goal')" min-width="260">
-          <template #default="{ row }">
-            <div class="runs-goal" :title="row.goal">{{ summarizeAutonomyGoal(row.goal) }}</div>
-            <div class="runs-goal-id" :title="row.id">#{{ row.id.slice(0, 8) }}</div>
-            <div class="runs-narrow-meta">
-              <span class="runs-narrow-asset" :title="row.host_alias">{{ row.host_alias }}</span>
-              <span>{{ modeLabel(row.mode) }}</span>
-              <el-tag size="small" :type="statusTagType(row.status)" effect="light" round>
-                {{ t(`aiRuns.status.${row.status}`) }}
-              </el-tag>
-              <el-tag v-if="row.outcome" size="small" :type="outcomeTagType(row.outcome)" effect="plain" round>
-                {{ t(`aiRuns.outcome.${row.outcome}`) }}
-              </el-tag>
+      <div v-else class="runs-groups">
+        <section v-for="group in runGroups" :key="group.key" class="runs-group">
+          <header class="runs-group-head">
+            <div class="runs-group-title">
+              <span>{{ t(`aiRuns.group.${group.key}.title`) }}</span>
+              <span class="runs-group-count">{{ group.runs.length }}</span>
             </div>
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('aiRuns.table.host')" min-width="150">
-          <template #default="{ row }">
-            <div>{{ row.host_alias }}</div>
-            <div class="runs-cell-sub">#{{ row.host_id }}</div>
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('aiRuns.table.credential')" prop="system_user_alias" min-width="110" />
-        <el-table-column :label="t('aiRuns.table.mode')" min-width="110">
-          <template #default="{ row }">
-            <span class="runs-mode">{{ modeLabel(row.mode) }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('aiRuns.table.status')" min-width="130">
-          <template #default="{ row }">
-            <el-tag size="small" :type="statusTagType(row.status)" effect="light" round>
-              {{ t(`aiRuns.status.${row.status}`) }}
-            </el-tag>
-            <div v-if="row.cancel_requested && !isTerminalRunStatus(row.status)" class="runs-cell-sub">
-              {{ t('aiRuns.detail.cancelRequested') }}
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('aiRuns.table.outcome')" min-width="100">
-          <template #default="{ row }">
-            <el-tag
-              v-if="row.outcome" size="small"
-              :type="outcomeTagType(row.outcome)" effect="plain" round
+            <span class="runs-group-hint">{{ t(`aiRuns.group.${group.key}.hint`) }}</span>
+          </header>
+          <div class="runs-rows">
+            <button
+              v-for="run in group.runs"
+              :key="run.id"
+              type="button"
+              class="runs-row"
+              :class="`is-${run.status}`"
+              :aria-label="`${targetSummary(run)} · ${t(`aiRuns.status.${run.status}`)}`"
+              @click="openRun(run)"
             >
-              {{ t(`aiRuns.outcome.${row.outcome}`) }}
-            </el-tag>
-            <span v-else class="runs-cell-sub">—</span>
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('aiRuns.table.owner')" prop="owner" min-width="100" />
-        <el-table-column :label="t('aiRuns.table.updated')" min-width="110">
-          <template #default="{ row }">
-            <span class="runs-time">{{ lastActivity(row) }}</span>
-            <span class="runs-time-abs">{{ lastActivityAbsolute(row) }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column :label="t('aiRuns.table.open')" width="112" fixed="right">
-          <template #default="{ row }">
-            <el-button text type="primary" @click.stop="openRun(row)">
-              {{ t('aiRuns.table.open') }}
-            </el-button>
-          </template>
-        </el-table-column>
-      </el-table>
+              <span class="runs-row-main">
+                <span class="runs-row-title" :title="run.trigger_summary || run.goal">
+                  {{ targetSummary(run) }}
+                </span>
+                <span class="runs-row-context">
+                  <span class="runs-row-trigger">{{ t('aiRuns.row.trigger') }} · {{ triggerSource(run.trigger_type) }}</span>
+                  <span aria-hidden="true">·</span>
+                  <span class="runs-row-asset" :title="run.host_alias">{{ t('aiRuns.row.asset') }} · {{ run.host_alias }}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>{{ t('aiRuns.row.credential') }} · {{ run.system_user_alias }}</span>
+                </span>
+              </span>
+              <span class="runs-row-status">
+                <el-tag size="small" :type="statusTagType(run.status)" effect="light" round>
+                  {{ t(`aiRuns.status.${run.status}`) }}
+                </el-tag>
+                <el-tag v-if="run.outcome" size="small" :type="outcomeTagType(run.outcome)" effect="plain" round>
+                  {{ t(`aiRuns.outcome.${run.outcome}`) }}
+                </el-tag>
+              </span>
+              <span class="runs-row-next">
+                <span class="runs-row-label">{{ t('aiRuns.row.next') }}</span>
+                <span>{{ nextStep(run.status) }}</span>
+              </span>
+              <span class="runs-row-time">
+                <span>{{ lastActivity(run) }}</span>
+                <time :datetime="activityTimestamp(run)">{{ lastActivityAbsolute(run) }}</time>
+              </span>
+              <span class="runs-row-arrow" aria-hidden="true">→</span>
+            </button>
+          </div>
+        </section>
+      </div>
     </div>
 
     <!-- 新建草稿对话框 -->
@@ -255,6 +237,8 @@ import { formatTimeAbs, formatTimeRel } from '@/utils/datetime'
 import { summarizeAutonomyGoal } from '@/utils/autonomyPresentation'
 
 const router = useRouter()
+const props = defineProps<{ alertsOnly?: boolean }>()
+const emit = defineEmits<{ (event: 'runs-changed'): void }>()
 
 // ===== 列表状态 =====
 const runs = ref<AutonomyRun[]>([])
@@ -276,11 +260,36 @@ const BUDGET_FIELDS = [
   'command_timeout_seconds', 'step_output_bytes', 'run_artifact_bytes',
 ] as const
 
-const KNOWN_MODES = new Set([
-  'ask', 'ai_review', 'auto', 'custom', 'read_only', 'assisted', 'lab_autonomous',
-])
+const RUN_GROUPS: ReadonlyArray<{
+  key: 'waiting' | 'running' | 'attention' | 'recent'
+  statuses: readonly AutonomyRunStatus[]
+}> = [
+  { key: 'waiting', statuses: ['draft', 'waiting_approval'] },
+  { key: 'running', statuses: ['queued', 'running', 'recovering'] },
+  { key: 'attention', statuses: ['needs_attention', 'failed'] },
+  { key: 'recent', statuses: ['completed', 'cancelled', 'expired'] },
+]
 
-const filteredRuns = computed<AutonomyRun[]>(() => runs.value.filter((run) => {
+const NEXT_STEP_KEYS: Record<AutonomyRunStatus, string> = {
+  draft: 'aiRuns.nextStep.draft',
+  queued: 'aiRuns.nextStep.queued',
+  running: 'aiRuns.nextStep.running',
+  waiting_approval: 'aiRuns.nextStep.waiting_approval',
+  recovering: 'aiRuns.nextStep.recovering',
+  needs_attention: 'aiRuns.nextStep.needs_attention',
+  completed: 'aiRuns.nextStep.completed',
+  failed: 'aiRuns.nextStep.failed',
+  cancelled: 'aiRuns.nextStep.cancelled',
+  expired: 'aiRuns.nextStep.expired',
+}
+
+const scopedRuns = computed<AutonomyRun[]>(() => (
+  props.alertsOnly
+    ? runs.value.filter(run => run.trigger_type === 'alertmanager')
+    : runs.value
+))
+
+const filteredRuns = computed<AutonomyRun[]>(() => scopedRuns.value.filter((run) => {
   if (statusFilter.value !== 'all' && run.status !== statusFilter.value) return false
   if (outcomeFilter.value !== 'all' && run.outcome !== outcomeFilter.value) return false
   const query = searchText.value.trim().toLocaleLowerCase()
@@ -293,6 +302,13 @@ const filteredRuns = computed<AutonomyRun[]>(() => runs.value.filter((run) => {
   return true
 }))
 
+const runGroups = computed(() => RUN_GROUPS
+  .map(group => ({
+    key: group.key,
+    runs: filteredRuns.value.filter(run => group.statuses.includes(run.status)),
+  }))
+  .filter(group => group.runs.length > 0))
+
 /** 创建按钮可用性只由服务端就绪度决定；未加载完成前不禁用 */
 const canCreate = computed<boolean>(() => readiness.value === null || readiness.value.ready)
 
@@ -301,8 +317,19 @@ function reasonText(reason: string): string {
   return known.includes(reason) ? t(`aiRuns.reason.${reason}`) : reason
 }
 
-function modeLabel(mode: string): string {
-  return KNOWN_MODES.has(mode) ? t(`aiRuns.mode.${mode}`) : mode
+function targetSummary(run: AutonomyRun): string {
+  return summarizeAutonomyGoal(run.trigger_summary || run.goal, 112)
+}
+
+function triggerSource(triggerType: string): string {
+  if (triggerType === 'manual') return t('aiRuns.trigger.manual')
+  if (triggerType === 'chat') return t('aiRuns.trigger.chat')
+  if (triggerType === 'alertmanager') return t('aiRuns.trigger.alertmanager')
+  return triggerType || t('aiRuns.trigger.unknown')
+}
+
+function nextStep(status: AutonomyRunStatus): string {
+  return t(NEXT_STEP_KEYS[status])
 }
 
 function statusTagType(status: string): '' | 'success' | 'warning' | 'info' | 'danger' {
@@ -321,17 +348,21 @@ function outcomeTagType(outcome: string): '' | 'success' | 'warning' | 'info' | 
 
 /** 最近动态：优先 completed_at，其次 started_at / created_at */
 function lastActivity(run: AutonomyRun): string {
-  const stamp = run.completed_at || run.started_at || run.created_at
+  const stamp = activityTimestamp(run)
   return stamp ? formatTimeRel(stamp) : '—'
 }
 
 function lastActivityAbsolute(run: AutonomyRun): string {
-  const stamp = run.completed_at || run.started_at || run.created_at
+  const stamp = activityTimestamp(run)
   return stamp ? formatTimeAbs(stamp) || '—' : '—'
 }
 
+function activityTimestamp(run: AutonomyRun): string {
+  return run.completed_at || run.started_at || run.created_at || ''
+}
+
 function openRun(run: AutonomyRun): void {
-  router.push(`/ai-runs/${run.id}`)
+  void router.push({ name: 'AiOpsRunDetail', params: { runId: run.id } })
 }
 
 async function loadRuns(): Promise<void> {
@@ -452,7 +483,8 @@ async function submitCreate(): Promise<void> {
       ...(form.mode === 'custom' ? { profile: { action_categories: form.categories } } : {}),
     })
     dialogVisible.value = false
-    router.push(`/ai-runs/${run.id}`)
+    emit('runs-changed')
+    void router.push({ name: 'AiOpsRunDetail', params: { runId: run.id } })
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('common.crud.operationFail'))
   } finally {
@@ -482,42 +514,160 @@ async function submitCreate(): Promise<void> {
   color: var(--ogs-text-tertiary);
 }
 .runs-panel { min-height: 320px; }
-.runs-table { cursor: pointer; }
-.runs-goal {
-  font-weight: 600;
+.runs-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-width: 0;
+}
+.runs-group { min-width: 0; }
+.runs-group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 0 4px 8px;
+  border-bottom: 1px solid var(--ogs-border);
+}
+.runs-group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   color: var(--ogs-text);
+  font-size: 13px;
+  font-weight: 700;
+}
+.runs-group-count {
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  color: var(--ogs-text-secondary);
+  background: var(--ogs-bg-sunken);
+  font: 11px/1.5 var(--ogs-mono);
+  text-align: center;
+}
+.runs-group-hint {
+  color: var(--ogs-text-tertiary);
+  font-size: 11px;
+}
+.runs-rows {
+  overflow: hidden;
+  border: 1px solid var(--ogs-border);
+  border-top: 0;
+  border-radius: 0 0 5px 5px;
+}
+.runs-row {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(220px, 1.65fr) auto minmax(170px, 1fr) auto 16px;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 14px;
+  border: 0;
+  border-bottom: 1px solid var(--ogs-border-subtle);
+  color: var(--ogs-text);
+  background: var(--ogs-surface);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color .15s ease, box-shadow .15s ease;
+}
+.runs-row:last-child { border-bottom: 0; }
+.runs-row:hover,
+.runs-row:focus-visible { background: var(--ogs-bg-sunken); }
+.runs-row:focus-visible {
+  outline: 2px solid var(--ogs-primary);
+  outline-offset: -2px;
+}
+.runs-row.is-waiting_approval,
+.runs-row.is-running,
+.runs-row.is-needs_attention {
+  box-shadow: inset 2px 0 0 var(--ogs-primary);
+}
+.runs-row-main,
+.runs-row-next,
+.runs-row-status,
+.runs-row-time { min-width: 0; }
+.runs-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.runs-row-title {
+  display: block;
+  overflow: hidden;
+  color: var(--ogs-text);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.runs-row-context {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ogs-text-tertiary);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.runs-row-trigger {
+  flex: 0 0 auto;
+  color: var(--ogs-primary);
+  font-family: var(--ogs-mono);
+}
+.runs-row-asset {
   overflow: hidden;
   text-overflow: ellipsis;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  max-width: 420px;
-  line-height: 1.45;
 }
-.runs-goal-id, .runs-cell-sub {
-  font-family: var(--ogs-mono);
-  font-size: 11px;
-  color: var(--ogs-text-tertiary);
-  margin-top: 2px;
+.runs-row-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 5px;
 }
-.runs-narrow-meta { display: none; }
-.runs-mode {
-  font-family: var(--ogs-mono);
-  font-size: 12px;
+.runs-row-next {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow: hidden;
   color: var(--ogs-text-secondary);
-}
-.runs-time {
   font-size: 12px;
-  color: var(--ogs-text-secondary);
+  line-height: 1.35;
+}
+.runs-row-next > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.runs-time-abs {
-  display: block;
-  margin-top: 2px;
-  color: var(--ogs-text-tertiary);
-  font-family: var(--ogs-mono);
-  font-size: 10px;
+.runs-row-label {
+  color: var(--ogs-text-muted);
+  font: 10px/1.2 var(--ogs-mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.runs-row-time {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  color: var(--ogs-text-secondary);
+  font-size: 12px;
+  line-height: 1.2;
   white-space: nowrap;
+}
+.runs-row-time time {
+  color: var(--ogs-text-tertiary);
+  font: 10px/1.2 var(--ogs-mono);
+}
+.runs-row-arrow {
+  color: var(--ogs-text-muted);
+  font-size: 16px;
+  text-align: right;
 }
 .runs-dialog-grid {
   display: grid;
@@ -582,24 +732,32 @@ async function submitCreate(): Promise<void> {
   .runs-dialog-grid { grid-template-columns: 1fr; }
   .runs-mode-options { grid-template-columns: 1fr; }
   .runs-budget-grid { grid-template-columns: repeat(2, 1fr); }
-  .runs-goal { max-width: 220px; }
-  .runs-narrow-meta {
-    min-width: 0;
-    margin-top: 7px;
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 5px 7px;
-    color: var(--ogs-text-secondary);
-    font-size: 11px;
+  .runs-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 9px 12px;
+    padding: 12px;
   }
-  .runs-narrow-asset {
-    max-width: 100%;
+  .runs-row-main { grid-column: 1; grid-row: 1; }
+  .runs-row-status { grid-column: 2; grid-row: 1; justify-content: flex-end; }
+  .runs-row-next { grid-column: 1 / -1; grid-row: 2; }
+  .runs-row-time { grid-column: 1; grid-row: 3; align-items: flex-start; }
+  .runs-row-arrow { grid-column: 2; grid-row: 3; }
+  .runs-row-context { flex-wrap: wrap; white-space: normal; }
+  .runs-row-title { white-space: normal; }
+  .runs-row-status :deep(.el-tag) { font-size: 10px; }
+  .runs-group-hint {
+    max-width: 48%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--ogs-mono);
   }
-  .runs-narrow-meta :deep(.el-tag) { font-size: 10px; }
+}
+@media (max-width: 520px) {
+  .runs-filter-item { width: 100%; }
+  .runs-count { width: 100%; margin-left: 0; }
+  .runs-group-head { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .runs-group-hint { max-width: 100%; }
+  .runs-row-context { gap: 4px; }
+  .runs-row-context > span:last-child { display: none; }
 }
 </style>

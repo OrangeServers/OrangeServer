@@ -180,7 +180,7 @@ export interface AutonomyReadiness {
     | string
 }
 
-/** GET /ai/ops/status：管理员 AIOps 首页聚合，只引用现有 Run。 */
+/** GET /ai/ops/status：当前用户可见的 AIOps 聚合，只引用现有 Run。 */
 export interface AIOpsStatus extends AutonomyReadiness {
   web_worker_class: string
   autonomy_pool: string
@@ -232,6 +232,20 @@ export interface KnowledgeDocumentPayload {
   title: string
   scope: string
   content: string
+}
+
+export interface KnowledgeSearchResult {
+  citation_id: string
+  document_id: string
+  version: number
+  title: string
+  source_type: KnowledgeDocument['source_type']
+  source_ref: string | null
+  heading: string
+  scope: string
+  excerpt: string
+  score: number | null
+  match_reason: string
 }
 
 /** 创建草稿请求体 */
