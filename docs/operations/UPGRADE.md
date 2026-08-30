@@ -343,7 +343,7 @@ make docker-health
 
 - 应用启动失败但 schema 向后兼容时，可先恢复上一镜像。
 - 如果旧应用不能识别新 schema，停止写入后恢复升级前 MySQL 备份。
-- rev48/rev49/rev50/rev53/rev54/rev55/rev56/rev57/rev58/rev59 不提供自动 down migration；
+- rev48/rev49/rev50/rev53/rev54/rev55/rev56/rev57/rev58/rev59/rev60 不提供自动 down migration；
   不要在生产手工删除列或表。rev58 的 Redis 向量可从 MySQL 文档重建。
 - 恢复数据库前先保留失败现场的日志和当前数据库快照。
 - Release bundle 安装可停止前后端，将当前安装目录移回

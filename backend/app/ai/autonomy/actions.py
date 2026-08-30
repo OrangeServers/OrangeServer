@@ -756,11 +756,15 @@ def build_probe_command(
 
 def redacted_summary(action: StructuredAction, max_chars=255) -> str:
     """生成不含凭据的动作摘要（供快照与列表展示）。"""
+    from app.ai.diagnostic_adapters import sanitize_evidence
+
     params = _normalize_params(action.parameters)
     param_text = ' '.join('%s=%s' % (k, v) for k, v in params.items())
     summary = '%s %s' % (action.kind, param_text)
     # 控制字符清洗，防止 ANSI/换行注入 UI 与日志。
-    cleaned = re.sub(r'[\x00-\x1f\x7f]', '', summary).strip()
+    cleaned = re.sub(
+        r'[\x00-\x1f\x7f]', '', sanitize_evidence(summary),
+    ).strip()
     return cleaned if max_chars is None else cleaned[:max_chars]
 
 

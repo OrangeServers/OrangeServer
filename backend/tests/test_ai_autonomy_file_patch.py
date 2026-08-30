@@ -19,6 +19,7 @@ from app.ai.autonomy.actions import (
     build_file_patch_command,
     build_file_restore_command,
     patch_backup_path,
+    redacted_summary,
 )
 from app.ai.autonomy.policy import ApprovalDecision, classify_action
 
@@ -102,6 +103,17 @@ def test_patch_content_rejects_credential_like_material(content):
     backup = patch_backup_path("/etc/app.conf", RUN_ID, STEP_ID)
     with pytest.raises(ActionValidationError, match='credential-like'):
         build_file_patch_command("/etc/app.conf", content, backup)
+
+
+def test_redacted_summary_sanitizes_legacy_patch_content():
+    summary = redacted_summary(_action('file_patch', {
+        'path': '/etc/app.conf',
+        'content': 'password=legacy-secret\nworkers=4',
+    }), max_chars=None)
+
+    assert 'legacy-secret' not in summary
+    assert 'password=[REDACTED]' in summary
+    assert 'workers=4' in summary
 
 
 def test_patch_content_cannot_break_shell_quoting():

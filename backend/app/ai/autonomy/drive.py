@@ -62,6 +62,7 @@ from app.ai.autonomy.recovery import (
     RecoveryService,
 )
 from app.ai.autonomy.repository import (
+    MAX_EVIDENCE_CITATIONS,
     fallback_conclusion_details,
     redacted_summary,
     sanitize_text,
@@ -1415,6 +1416,12 @@ class AutonomyDriver:
                 # 独立 session 在 Redis 写期间持有 exact-claim Run 行
                 # 锁；这里不能先用主 session 持同一锁，否则真实
                 # MySQL 会与 wrapper 自锁。
+                if outcome.as_node == 'decide':
+                    # 已完成的调查探针可能在 execute 提交后、observe
+                    # 落 Evidence 前崩溃。先补齐幂等 Evidence，再回到
+                    # planner，避免后续结论失去可引用的观察。
+                    self._guard()
+                    self._record_run_evidence(run_id)
                 try:
                     compiled.update_state(
                         cfg, outcome.entry, as_node=outcome.as_node,
@@ -1567,10 +1574,15 @@ class AutonomyDriver:
             run.completed_at = run.completed_at or _utcnow()
         run.outcome = run.outcome or _default_outcome(result)
         if run.outcome and not run.conclusion_json:
+            evidence_ids = [
+                item['id'] for item in self.repo.list_evidence(
+                    str(run.owner), run_id,
+                )
+            ][-MAX_EVIDENCE_CITATIONS:]
             run.conclusion_json = json.dumps({
                 **fallback_conclusion_details(),
                 'final_status': run.outcome,
-                'evidence_ids': [],
+                'evidence_ids': evidence_ids,
             }, ensure_ascii=False, separators=(',', ':'))
         self.repo._bump(run)
         if event is not None:

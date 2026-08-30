@@ -505,6 +505,7 @@ def test_checkpoint_loss_resumes_after_terminal_investigation_probes(env):
     assert result == drive_mod.RESULT_COMPLETED
     assert len(planner_contexts) == 1
     assert planner_contexts[0]["loops"] == 3
+    assert len(planner_contexts[0]["evidence"]) == 3
     assert env["runner"].calls == []
     assert [_step_row(env, step_id).status for step_id in step_ids] == [
         "succeeded", "failed", "failed",

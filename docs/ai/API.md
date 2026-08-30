@@ -252,7 +252,7 @@ SSE 事件使用 MySQL 内的 Run 级单调 `sequence`。客户端断线后应�
 
 全新安装由 `backend/mysqldir/orange.sql` 一次创建；已有实例按
 [统一升级流程](../operations/UPGRADE.md) 依次执行 rev53、rev54、rev55、rev56、rev57、
-rev58、rev59。表是业务事实源，Redis 8 保存 LangGraph checkpoint、Celery broker 和可重建
+rev58、rev59、rev60。表是业务事实源，Redis 8 保存 LangGraph checkpoint、Celery broker 和可重建
 知识向量。
 
 | 表/字段 | 用途 | 关键约束 |

@@ -1650,7 +1650,6 @@ def test_completed_run_without_conclusion_defaults_to_inconclusive(env):
     conclusion = json.loads(row.conclusion_json)
     assert conclusion["final_status"] == "inconclusive"
     assert conclusion["confidence"] == "low"
-    assert conclusion["evidence_ids"] == []
     assert "run_concluded" not in [
         e.event_type for e in _events(env, run["id"])
     ]
@@ -1658,6 +1657,7 @@ def test_completed_run_without_conclusion_defaults_to_inconclusive(env):
     evidence = _evidence_rows(env, run["id"])
     assert len(evidence) == 1
     assert evidence[0].kind == "action_observation"
+    assert conclusion["evidence_ids"] == [evidence[0].id]
 
 
 def test_resolved_without_verification_observation_is_downgraded(env):
