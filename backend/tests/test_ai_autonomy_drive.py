@@ -650,14 +650,19 @@ def test_planner_context_carries_authoritative_budget_and_history(env):
 
 
 def test_planner_context_forces_plan_after_three_distinct_probes(env):
-    """The phase handoff is derived from authoritative successful actions."""
+    """Failure observations also count after their probes finish."""
     run = env["create_queued_run"]()
-    for probe_id in ("system.load", "system.memory", "system.disk_usage"):
+    for index, probe_id in enumerate((
+        "system.load", "system.memory", "system.disk_usage",
+    )):
         step = env["repo"].propose_probe(
             "admin", "admin", run["id"], probe_id,
         )
         row = _step_row(env, step["id"])
-        row.status = StepStatus.SUCCEEDED.value
+        row.status = (
+            StepStatus.SUCCEEDED.value if index == 0
+            else StepStatus.FAILED.value
+        )
     env["session"].commit()
 
     driver = env["make_driver"]()

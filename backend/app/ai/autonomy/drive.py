@@ -99,7 +99,7 @@ RESUME_CONTINUE = 'continue'
 MAX_RESUMES_PER_DRIVE = 64
 
 # DeepSeek 等 OpenAI-compatible planner 可能在调查已经充分后继续选择
-# propose_probe。完成三类成功的只读探针且尚未出现写动作时，服务端把
+# propose_probe。完成三类只读探针且尚未出现写动作时，服务端把
 # 下一轮阶段收束到 propose_plan；这只是工具阶段约束，不替模型生成
 # 计划，也不绕过后续计划审批。
 MIN_DISTINCT_PROBES_BEFORE_PLAN = 3
@@ -448,7 +448,7 @@ class AutonomyDriver:
     def _planner_requires_plan(self, run_id):
         """Return whether the next planner turn must hand off to a plan.
 
-        This is derived only from successful server-owned probe actions and
+        This is derived only from completed server-owned probe actions and
         the presence of any structured write action. It is intentionally a
         bounded phase guard for providers that keep selecting a read tool;
         it never creates a plan or changes the action/approval policy.
@@ -470,7 +470,9 @@ class AutonomyDriver:
                 return False
             if (
                 kind == 'probe'
-                and row.status == StepStatus.SUCCEEDED.value
+                and row.status in {
+                    StepStatus.SUCCEEDED.value, StepStatus.FAILED.value,
+                }
             ):
                 probe_id = str(action.parameters.get('probe_id') or '')
                 if probe_id:
