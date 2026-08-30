@@ -628,7 +628,7 @@ class ToolCallingPlanner:
             raise PlannerProposalError(
                 REASON_AMBIGUOUS_PROPOSAL,
                 repair_tool=PLAN_TOOL_NAME if context.get('require_plan')
-                else None,
+                else PROPOSAL_TOOL_NAME,
             )
         call = calls[0]
         if context.get('require_plan') and call.name != PLAN_TOOL_NAME:

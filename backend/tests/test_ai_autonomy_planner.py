@@ -273,14 +273,35 @@ def test_truncated_provider_output_fails_closed(result):
     (),
     (probe_call(), probe_call()),
 ])
-def test_ambiguous_tool_calls_fail_closed(calls):
+def test_ambiguous_tool_calls_fail_closed_after_one_probe_repair(calls):
     repo = FakeRepo()
-    adapter = FakeAdapter(results=[FakeChatResult(list(calls))])
+    adapter = FakeAdapter(results=[
+        FakeChatResult(list(calls)),
+        FakeChatResult(list(calls)),
+    ])
 
     with pytest.raises(PlannerProposalError) as excinfo:
         make_planner(adapter)(make_context(repo))
     assert excinfo.value.reason == "ambiguous_proposal"
     assert repo.calls == []
+    assert adapter.requests[1]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": PROPOSAL_TOOL_NAME},
+    }
+
+
+def test_deepseek_ambiguous_investigation_is_repaired_to_probe():
+    repo = FakeRepo()
+    adapter = FakeAdapter(results=[
+        FakeChatResult([]),
+        FakeChatResult([probe_call()]),
+    ])
+
+    assert make_planner(adapter)(make_context(repo)) == ["step-1"]
+    assert adapter.requests[1]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": PROPOSAL_TOOL_NAME},
+    }
 
 
 def test_unknown_tool_name_is_unsupported():
