@@ -153,8 +153,15 @@ curl -fsSL https://github.com/OrangeServers/OrangeServer/releases/download/vX.Y.
 安装后验证：4 个产品容器全部 `Up`，app/worker/mysql/redis healthy；setup 完成
 前 worker 保持等待、不 crash-loop（见第 1 节）；`/local/health` 返回 200；完成
 `/setup` 后登录、资产、审计、AI Provider、只读诊断正常。
-随后新建一个无敏感信息的示例 Runbook，重建索引并完成一次带版本引用的检索；删除
+随后分别上传无敏感信息的 Markdown、TXT、DOCX 和文本型 PDF，确认图片型 PDF 会明确
+提示未启用 OCR；核对转换预览后保存其中一个示例 Runbook，重建索引，并用关键词命中
+与同义表达各完成一次带版本引用的检索；删除
 示例文档后再次重建，确认索引回到预期状态。
+
+混合检索的确定性回归使用独立 Redis 8（不能指向业务实例）：设置
+`OGS_TEST_KNOWLEDGE_REDIS_URL` 后运行
+`python -m pytest backend/tests/test_ai_knowledge_redis_integration.py -q -s`。公开合成语料
+同时覆盖精确故障码与语义改写，门槛为 `Recall@8=1.000`、`MRR=1.000`。
 
 ## 5. 已知坑（踩过，别重蹈）
 

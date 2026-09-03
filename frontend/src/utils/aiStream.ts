@@ -142,3 +142,18 @@ export async function aiJsonRequest<T>(
   if (!response.ok) throw await responseError(response)
   return await response.json() as T
 }
+
+export async function aiFormRequest<T>(url: string, body: FormData): Promise<T> {
+  const response = await fetch(url, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { Accept: 'application/json', ...csrfHeaders() },
+    body,
+  })
+  if (response.status === 401) {
+    window.location.href = '/login'
+    throw new Error(t('common.http.sessionExpired'))
+  }
+  if (!response.ok) throw await responseError(response)
+  return await response.json() as T
+}

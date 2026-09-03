@@ -627,6 +627,8 @@ def test_dockerfile_pins_and_verifies_local_embedding_model():
     requirements = (BACKEND / "requirements.txt").read_text(encoding="utf-8")
     assert "fastembed==0.8.0" in requirements
     assert "langchain-text-splitters==1.1.2" in requirements
+    assert "markitdown[pdf,docx]==0.1.7" in requirements
+    assert "redisvl==0.25.0" in requirements
     assert "fast-bge-small-zh-v1.5.tar.gz" in dockerfile
     assert "bf023219b6029148fddf764d248808816c0ca1f107f058231bb1ae0fa526f83f" in dockerfile
     assert "sha256sum -c -" in dockerfile

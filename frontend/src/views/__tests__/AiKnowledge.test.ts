@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   search: vi.fn(),
   saveConfig: vi.fn(),
   createDocument: vi.fn(),
+  previewDocument: vi.fn(),
   getDocument: vi.fn(),
   updateDocument: vi.fn(),
   deleteDocument: vi.fn(),
@@ -35,6 +36,7 @@ vi.mock('@/api/autonomy', () => ({
   searchKnowledge: mocks.search,
   saveKnowledgeConfig: mocks.saveConfig,
   createKnowledgeDocument: mocks.createDocument,
+  previewKnowledgeDocument: mocks.previewDocument,
   getKnowledgeDocument: mocks.getDocument,
   updateKnowledgeDocument: mocks.updateDocument,
   deleteKnowledgeDocument: mocks.deleteDocument,
@@ -65,6 +67,7 @@ const ButtonStub = defineComponent({
   setup(props, { emit, slots }) {
     return () => h('button', {
       disabled: props.disabled,
+      'data-loading': String(props.loading),
       onClick: (event: MouseEvent) => emit('click', event),
     }, slots.default?.())
   },
@@ -84,6 +87,10 @@ describe('AiKnowledge', () => {
     mocks.getStatus.mockResolvedValue({ knowledge_index_state: 'empty' })
     mocks.listDocuments.mockResolvedValue([])
     mocks.search.mockResolvedValue({ results: [], count: 0, index_state: 'empty' })
+    mocks.previewDocument.mockResolvedValue({
+      title: 'disk-runbook', content: '# Disk\n\nCheck usage.',
+      detected_type: 'markdown', warnings: [],
+    })
     mocks.confirm.mockResolvedValue(undefined)
   })
 
@@ -115,6 +122,89 @@ describe('AiKnowledge', () => {
     expect(mocks.getStatus).toHaveBeenCalledOnce()
     expect(mocks.listDocuments).toHaveBeenCalledOnce()
     expect(root.textContent).toContain('BAAI/bge-small-zh-v1.5')
+    app.unmount()
+  })
+
+  it('loads an uploaded preview into the existing review form without saving it', async () => {
+    const { app, root } = await mountKnowledge()
+    Array.from(root.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('ai.knowledgeManager.add'))?.click()
+    await nextTick()
+    const input = root.querySelector<HTMLInputElement>('[data-testid="knowledge-file"]')
+    expect(input).not.toBeNull()
+    const file = new File(['# Disk'], 'disk-runbook.md', { type: 'text/markdown' })
+    Object.defineProperty(input, 'files', { value: [file] })
+    input!.dispatchEvent(new Event('change'))
+    await Promise.resolve()
+    await nextTick()
+
+    expect(mocks.previewDocument).toHaveBeenCalledWith(file)
+    expect(mocks.createDocument).not.toHaveBeenCalled()
+    expect(root.textContent).toContain('ai.knowledgeManager.previewReady')
+    app.unmount()
+  })
+
+  it('shows upload progress and reports conversion errors without saving', async () => {
+    let rejectPreview!: (error: Error) => void
+    mocks.previewDocument.mockReturnValue(new Promise((_resolve, reject) => {
+      rejectPreview = reject
+    }))
+    const { app, root } = await mountKnowledge()
+    Array.from(root.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('ai.knowledgeManager.add'))?.click()
+    await nextTick()
+    const input = root.querySelector<HTMLInputElement>('[data-testid="knowledge-file"]')!
+    const file = new File(['broken'], 'broken.pdf', { type: 'application/pdf' })
+    Object.defineProperty(input, 'files', { value: [file] })
+    input.dispatchEvent(new Event('change'))
+    await nextTick()
+
+    const upload = Array.from(root.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('ai.knowledgeManager.upload'))
+    expect(upload?.dataset.loading).toBe('true')
+
+    rejectPreview(new Error('encrypted PDF is not supported'))
+    await Promise.resolve()
+    await nextTick()
+
+    expect(upload?.dataset.loading).toBe('false')
+    expect(mocks.messageError).toHaveBeenCalledWith('encrypted PDF is not supported')
+    expect(mocks.createDocument).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('ignores an older upload response when a newer preview finishes first', async () => {
+    let resolveFirst!: (value: object) => void
+    let resolveSecond!: (value: object) => void
+    mocks.previewDocument
+      .mockReturnValueOnce(new Promise(resolve => { resolveFirst = resolve }))
+      .mockReturnValueOnce(new Promise(resolve => { resolveSecond = resolve }))
+    const { app, root } = await mountKnowledge()
+    Array.from(root.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('ai.knowledgeManager.add'))?.click()
+    await nextTick()
+    const input = root.querySelector<HTMLInputElement>('[data-testid="knowledge-file"]')!
+
+    Object.defineProperty(input, 'files', {
+      configurable: true,
+      value: [new File(['first'], 'first.md', { type: 'text/markdown' })],
+    })
+    input.dispatchEvent(new Event('change'))
+    Object.defineProperty(input, 'files', {
+      configurable: true,
+      value: [new File(['second'], 'second.md', { type: 'text/markdown' })],
+    })
+    input.dispatchEvent(new Event('change'))
+    resolveSecond({ title: 'second', content: '# Second', detected_type: 'markdown', warnings: [] })
+    await Promise.resolve()
+    resolveFirst({ title: 'first', content: '# First', detected_type: 'markdown', warnings: [] })
+    await Promise.resolve()
+    await nextTick()
+
+    const values = Array.from(root.querySelectorAll<HTMLInputElement>('input'))
+      .map(element => element.value)
+    expect(values).toContain('second')
+    expect(values).not.toContain('first')
     app.unmount()
   })
 
@@ -187,6 +277,40 @@ describe('AiKnowledge', () => {
     expect(root.textContent).toContain('Disk runbook')
     expect(mocks.listDocuments).toHaveBeenCalledOnce()
     app.unmount()
+  })
+
+  it('waits for an asynchronous rebuild to finish before reporting success', async () => {
+    vi.useFakeTimers()
+    const empty = {
+      provider_type: 'local', base_url: '', model: 'BAAI/bge-small-zh-v1.5',
+      dimension: 512, api_key_configured: false, model_fingerprint: 'f',
+      indexed_fingerprint: null, index_state: 'empty', indexed_chunks: 0,
+      created_at: null, updated_at: null,
+    }
+    mocks.reindex.mockResolvedValue({ ...empty, index_state: 'rebuilding' })
+    mocks.getConfig
+      .mockResolvedValueOnce(empty)
+      .mockResolvedValue({ ...empty, index_state: 'ready', indexed_chunks: 2 })
+
+    const { app, root } = await mountKnowledge()
+    try {
+      Array.from(root.querySelectorAll('button'))
+        .find(button => button.textContent?.includes('ai.knowledgeManager.tabs.status'))?.click()
+      await nextTick()
+      Array.from(root.querySelectorAll('button'))
+        .find(button => button.textContent?.includes('ai.knowledgeManager.reindex'))?.click()
+      await Promise.resolve()
+
+      expect(mocks.messageSuccess).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1000)
+      await nextTick()
+
+      expect(mocks.messageSuccess).toHaveBeenCalledWith('ai.knowledgeManager.indexed')
+      expect(root.textContent).toContain('ai.ops.knowledge.ready')
+    } finally {
+      app.unmount()
+      vi.useRealTimers()
+    }
   })
 
   it.each([

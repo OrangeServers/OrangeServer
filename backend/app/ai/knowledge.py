@@ -1,4 +1,4 @@
-"""M2/S2 reviewed knowledge truth and bounded RedisStore retrieval."""
+"""Reviewed knowledge truth and bounded RedisVL hybrid retrieval."""
 from __future__ import annotations
 
 import hashlib
@@ -28,10 +28,11 @@ MAX_DOCUMENT_BYTES = 1024 * 1024
 MAX_INDEX_CHUNKS = 20_000
 MAX_RESULTS = 8
 MAX_CONTEXT_BYTES = 16 * 1024
-NAMESPACE = ('ogs', 'knowledge')
-INDEX_LAYOUT_VERSION = 'scope-namespaces-v1'
-STORE_PREFIX = 'ogs_knowledge'
-VECTOR_PREFIX = 'ogs_knowledge_vectors'
+INDEX_LAYOUT_VERSION = 'redisvl-hybrid-v2'
+STORE_PREFIX = 'ogs_knowledge_hybrid'
+KEY_PREFIX = 'ogs:knowledge:chunk:'
+HYBRID_CANDIDATES = 32
+LEGACY_INDEXES = ('ogs_knowledge', 'ogs_knowledge_vectors')
 _HEADING_RE = re.compile(r'(?m)^(#{1,6})\s+(.+?)\s*$')
 _SCOPE_RE = re.compile(r'^(?:global|host:[1-9][0-9]*)$')
 
@@ -193,35 +194,115 @@ def _embed(row: Any, texts: Iterable[str]) -> list[list[float]]:
     return vectors
 
 
-def _missing_index_error(error: Exception) -> bool:
-    message = str(error).lower()
-    return 'unknown index name' in message or 'index not found' in message
+class _HybridKnowledgeStore:
+    """RedisVL query adapter with deterministic reciprocal-rank fusion."""
+
+    _RETURN_FIELDS = [
+        'document_id', 'version', 'title', 'source_type', 'source_ref',
+        'heading', 'scope', 'text',
+    ]
+
+    def __init__(self, row: Any, index: Any) -> None:
+        self.row = row
+        self.index = index
+
+    def load(self, records: list[dict[str, Any]]) -> None:
+        from redisvl.redis.utils import array_to_buffer
+
+        if not records:
+            return
+        vectors = _embed(self.row, [record['text'] for record in records])
+        for record, vector in zip(records, vectors):
+            record['embedding'] = array_to_buffer(vector, 'float32')
+        self.index.load(records, id_field='id', batch_size=64)
+
+    def search(
+        self, query: str, *, scopes: tuple[str, ...], limit: int,
+    ) -> list[dict[str, Any]]:
+        from redisvl.query import TextQuery, VectorQuery
+        from redisvl.query.filter import Tag
+
+        scope_filter = None
+        for scope in scopes:
+            expression = Tag('scope') == scope
+            scope_filter = (
+                expression if scope_filter is None else scope_filter | expression
+            )
+        text_query = TextQuery(
+            text=query,
+            text_field_name='text',
+            filter_expression=scope_filter,
+            num_results=HYBRID_CANDIDATES,
+            return_fields=self._RETURN_FIELDS,
+            stopwords=None,
+        )
+        vector_query = VectorQuery(
+            vector=_embed(self.row, [query])[0],
+            vector_field_name='embedding',
+            filter_expression=scope_filter,
+            num_results=HYBRID_CANDIDATES,
+            return_fields=self._RETURN_FIELDS,
+        )
+        fused: dict[str, dict[str, Any]] = {}
+        for hits in (self.index.query(text_query), self.index.query(vector_query)):
+            for rank, hit in enumerate(hits, 1):
+                key = '|'.join(str(hit.get(field, '')) for field in (
+                    'document_id', 'version', 'heading', 'text',
+                ))
+                item = fused.setdefault(key, {'value': hit, 'score': 0.0})
+                item['score'] += 1.0 / (60 + rank)
+        return sorted(fused.values(), key=lambda item: item['score'], reverse=True)[:limit]
 
 
 @contextmanager
 def _redis_store(row: Any, *, reset: bool = False):
-    from langgraph.store.redis import RedisStore
     from redis.exceptions import ResponseError
+    from redisvl.index import SearchIndex
 
-    with RedisStore.from_conn_string(
-        autonomy_redis_url(0),
-        index={
-            'dims': int(row.dimension),
-            'embed': lambda texts: _embed(row, texts),
-            'fields': ['text'],
+    schema = {
+        'index': {
+            'name': STORE_PREFIX,
+            'prefix': KEY_PREFIX,
+            'storage_type': 'hash',
+            'stopwords': [],
         },
-        store_prefix=STORE_PREFIX,
-        vector_prefix=VECTOR_PREFIX,
-    ) as store:
+        'fields': [
+            {'name': 'document_id', 'type': 'tag'},
+            {'name': 'version', 'type': 'numeric'},
+            {'name': 'title', 'type': 'text'},
+            {'name': 'source_type', 'type': 'tag'},
+            {'name': 'source_ref', 'type': 'tag'},
+            {'name': 'heading', 'type': 'text'},
+            {'name': 'scope', 'type': 'tag'},
+            {'name': 'text', 'type': 'text'},
+            {
+                'name': 'embedding',
+                'type': 'vector',
+                'attrs': {
+                    'algorithm': 'flat',
+                    'dims': int(row.dimension),
+                    'distance_metric': 'cosine',
+                    'datatype': 'float32',
+                },
+            },
+        ],
+    }
+    with SearchIndex.from_dict(schema, redis_url=autonomy_redis_url(0)) as index:
+        index.create(overwrite=reset, drop=reset)
         if reset:
-            for index_name in (VECTOR_PREFIX, STORE_PREFIX):
+            for legacy_index in LEGACY_INDEXES:
                 try:
-                    store._redis.execute_command('FT.DROPINDEX', index_name, 'DD')
+                    index.client.execute_command(
+                        'FT.DROPINDEX', legacy_index, 'DD',
+                    )
                 except ResponseError as exc:
-                    if not _missing_index_error(exc):
+                    message = str(exc).lower()
+                    if (
+                        'unknown index name' not in message
+                        and 'index not found' not in message
+                    ):
                         raise
-        store.setup()
-        yield store
+        yield _HybridKnowledgeStore(row, index)
 
 
 class KnowledgeService:
@@ -558,7 +639,6 @@ class KnowledgeService:
         return self._document_dict(document)
 
     def reindex(self) -> dict[str, Any]:
-        from langgraph.store.base import PutOp
         from app.core.db.database import t_ai_embedding_config, t_ai_knowledge_document
 
         config_row = self._config_row(create=True)
@@ -598,24 +678,22 @@ class KnowledgeService:
                 )
             with self.store_factory(config_row, reset=True) as store:
                 for start in range(0, len(prepared), 64):
-                    operations = []
+                    records = []
                     for doc, position, chunk in prepared[start:start + 64]:
-                        operations.append(PutOp(
-                            NAMESPACE + (doc.scope,),
-                            '%s:%d:%d' % (doc.id, int(doc.version), position),
-                            {
-                                'text': chunk['text'],
-                                'document_id': doc.id,
-                                'version': int(doc.version),
-                                'title': doc.title,
-                                'source_type': doc.source_type,
-                                'source_ref': doc.source_ref or '',
-                                'heading': chunk['heading'],
-                                'scope': doc.scope,
-                            },
-                            index=['text'],
-                        ))
-                    store.batch(operations)
+                        records.append({
+                            'id': '%s:%d:%d' % (
+                                doc.id, int(doc.version), position,
+                            ),
+                            'text': chunk['text'],
+                            'document_id': doc.id,
+                            'version': int(doc.version),
+                            'title': doc.title,
+                            'source_type': doc.source_type,
+                            'source_ref': doc.source_ref or '',
+                            'heading': chunk['heading'],
+                            'scope': doc.scope,
+                        })
+                    store.load(records)
             self.session.expire_all()
             config_row = self.session.query(t_ai_embedding_config).filter_by(
                 id=1,
@@ -683,16 +761,15 @@ class KnowledgeService:
         ):
             return []
         with self.store_factory(row, reset=False) as store:
-            hits = []
-            for scope in allowed_scopes:
-                hits.extend(store.search(
-                    NAMESPACE + (scope,), query=query, limit=MAX_RESULTS,
-                ))
+            hits = store.search(
+                query, scopes=allowed_scopes, limit=HYBRID_CANDIDATES,
+            )
         hits.sort(
-            key=lambda hit: float(hit.score or 0.0), reverse=True,
+            key=lambda hit: float(hit.get('score') or 0.0), reverse=True,
         )
         document_ids = {
-            str((hit.value or {}).get('document_id') or '') for hit in hits
+            str((hit.get('value') or {}).get('document_id') or '')
+            for hit in hits
         }
         valid = {
             doc.id: doc
@@ -705,7 +782,7 @@ class KnowledgeService:
         result = []
         used_bytes = 0
         for hit in hits:
-            value = dict(hit.value or {})
+            value = dict(hit.get('value') or {})
             doc = valid.get(str(value.get('document_id') or ''))
             if (
                 doc is None
@@ -718,7 +795,8 @@ class KnowledgeService:
             if used_bytes + encoded > MAX_CONTEXT_BYTES:
                 break
             used_bytes += encoded
-            score = float(hit.score) if hit.score is not None else None
+            raw_score = hit.get('score')
+            score = float(raw_score) if raw_score is not None else None
             result.append({
                 'citation_id': 'K%d' % (len(result) + 1),
                 'document_id': doc.id,
@@ -730,7 +808,7 @@ class KnowledgeService:
                 'scope': doc.scope,
                 'excerpt': excerpt,
                 'score': score,
-                'match_reason': 'semantic similarity',
+                'match_reason': 'hybrid BM25 + semantic',
             })
             if len(result) >= limit:
                 break

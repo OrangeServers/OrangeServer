@@ -673,6 +673,37 @@ def knowledge_documents():
         return _handle_knowledge(exc)
 
 
+def knowledge_document_preview():
+    """Convert one bounded upload for administrator review; persist nothing."""
+    _holder, _owner, role = _identity()
+    blocked = _admin_only(role)
+    if blocked:
+        return blocked
+    try:
+        from werkzeug.exceptions import RequestEntityTooLarge
+        from app.ai.knowledge import KnowledgeValidationError
+        from app.ai.knowledge_ingestion import (
+            MAX_MULTIPART_OVERHEAD_BYTES,
+            MAX_UPLOAD_BYTES,
+            preview_document,
+        )
+
+        request.max_content_length = MAX_UPLOAD_BYTES + MAX_MULTIPART_OVERHEAD_BYTES
+        if (
+            request.content_length is not None
+            and request.content_length > request.max_content_length
+        ):
+            raise KnowledgeValidationError('upload exceeds 10 MiB')
+        try:
+            upload = request.files.get('file')
+        except RequestEntityTooLarge as exc:
+            raise KnowledgeValidationError('upload exceeds 10 MiB') from exc
+        return api_response(data=preview_document(upload))
+    except Exception as exc:
+        db.session.rollback()
+        return _handle_knowledge(exc)
+
+
 def knowledge_document(document_id):
     """GET/PATCH/DELETE one reviewed knowledge document."""
     _holder, _owner, role = _identity()

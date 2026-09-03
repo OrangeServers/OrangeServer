@@ -16,6 +16,10 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   model or a separate OpenAI-compatible embedding endpoint. Chat and the
   Autonomy Planner return bounded, versioned citations without granting
   permissions or replacing live evidence.
+- Administrators can upload Markdown, text, PDF, and DOCX files into a
+  review-before-save preview. Original binaries are not retained, and RedisVL
+  now fuses BM25 keyword matching with embedding similarity in the existing
+  Redis service.
 
 ### Changed
 

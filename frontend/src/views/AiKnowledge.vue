@@ -132,13 +132,31 @@
 
     <el-dialog v-model="dialogOpen" append-to-body :title="dialogTitle" width="min(720px, 94vw)" destroy-on-close>
       <el-form v-if="isAdmin" :model="documentForm" label-position="top">
+        <div v-if="!editingId" class="document-upload">
+          <input
+            ref="fileInput"
+            data-testid="knowledge-file"
+            type="file"
+            accept=".md,.txt,.pdf,.docx"
+            :disabled="previewing"
+            :aria-label="$t('ai.knowledgeManager.upload')"
+            @change="previewUpload"
+          />
+          <el-button plain :loading="previewing" @click="fileInput?.click()">
+            {{ $t('ai.knowledgeManager.upload') }}
+          </el-button>
+          <span>{{ $t('ai.knowledgeManager.uploadHint') }}</span>
+        </div>
+        <p v-if="previewName" class="preview-ready" role="status" aria-live="polite">
+          {{ $t('ai.knowledgeManager.previewReady', { name: previewName }) }}
+        </p>
         <el-form-item :label="$t('ai.knowledgeManager.titleLabel')"><el-input v-model="documentForm.title" maxlength="128" show-word-limit /></el-form-item>
         <el-form-item :label="$t('ai.knowledgeManager.scope')"><el-input v-model="documentForm.scope" :placeholder="$t('ai.knowledgeManager.scopeHint')" maxlength="128" /></el-form-item>
         <el-form-item :label="$t('ai.knowledgeManager.content')"><el-input v-model="documentForm.content" type="textarea" :rows="14" maxlength="1048576" /></el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogOpen = false">{{ $t('ai.knowledgeManager.cancel') }}</el-button>
-        <el-button type="primary" :loading="savingDocument" @click="saveDocument">{{ $t('ai.knowledgeManager.save') }}</el-button>
+        <el-button type="primary" :loading="savingDocument" :disabled="previewing" @click="saveDocument">{{ $t('ai.knowledgeManager.save') }}</el-button>
       </template>
     </el-dialog>
   </section>
@@ -155,6 +173,7 @@ import {
   getKnowledgeConfig,
   getKnowledgeDocument,
   listKnowledgeDocuments,
+  previewKnowledgeDocument,
   reindexKnowledge,
   saveKnowledgeConfig,
   searchKnowledge,
@@ -182,6 +201,7 @@ const activeTab = ref<KnowledgeTab>('sources')
 const loading = ref(false)
 const savingConfig = ref(false)
 const savingDocument = ref(false)
+const previewing = ref(false)
 const reindexing = ref(false)
 const searching = ref(false)
 const config = ref<KnowledgeEmbeddingConfig | null>(null)
@@ -193,6 +213,9 @@ const searchQuery = ref('')
 const searchFeedback = ref('')
 const configDrawer = ref(false)
 const dialogOpen = ref(false)
+const fileInput = ref<HTMLInputElement | null>(null)
+const previewName = ref('')
+let previewRequestId = 0
 const editingId = ref('')
 const configForm = reactive({ provider_type: 'local' as 'local' | 'openai_compatible', base_url: '', model: '', dimension: 512, api_key: '' })
 const documentForm = reactive({ title: '', scope: 'global', content: '' })
@@ -271,6 +294,8 @@ async function runSearch(): Promise<void> {
   searchFeedback.value = ''
   try {
     const response = await searchKnowledge(query, 8)
+    if (config.value) config.value = { ...config.value, index_state: response.index_state }
+    if (opsStatus.value) opsStatus.value = { ...opsStatus.value, knowledge_index_state: response.index_state }
     searchResults.value = response.results || []
     if (!searchResults.value.length) {
       searchFeedback.value = response.index_state === 'ready'
@@ -303,13 +328,42 @@ async function saveConfig(): Promise<void> {
 
 function openCreate(): void {
   if (!isAdmin.value) return
+  previewRequestId += 1
+  previewing.value = false
   editingId.value = ''
   Object.assign(documentForm, { title: '', scope: 'global', content: '' })
+  previewName.value = ''
   dialogOpen.value = true
+}
+
+async function previewUpload(event: Event): Promise<void> {
+  if (!isAdmin.value) return
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  previewName.value = ''
+  previewing.value = true
+  const requestId = ++previewRequestId
+  try {
+    const preview = await previewKnowledgeDocument(file)
+    if (requestId !== previewRequestId || !dialogOpen.value) return
+    Object.assign(documentForm, { title: preview.title, content: preview.content })
+    previewName.value = file.name
+  } catch (error) {
+    if (requestId === previewRequestId && dialogOpen.value) {
+      ElMessage.error(error instanceof Error ? error.message : t('ai.knowledgeManager.previewFailed'))
+    }
+  } finally {
+    if (requestId === previewRequestId) previewing.value = false
+    input.value = ''
+  }
 }
 
 async function openEdit(document: KnowledgeDocument): Promise<void> {
   if (!isAdmin.value) return
+  previewRequestId += 1
+  previewing.value = false
+  previewName.value = ''
   loading.value = true
   try {
     const detail = await getKnowledgeDocument(document.id)
@@ -362,7 +416,12 @@ async function reindex(): Promise<void> {
   reindexing.value = true
   try {
     applyConfig(await reindexKnowledge())
-    ElMessage.success(t('ai.knowledgeManager.indexed'))
+    for (let attempt = 0; config.value?.index_state === 'rebuilding' && attempt < 60; attempt += 1) {
+      await new Promise(resolve => window.setTimeout(resolve, 1000))
+      applyConfig(await getKnowledgeConfig())
+    }
+    if (config.value?.index_state === 'ready') ElMessage.success(t('ai.knowledgeManager.indexed'))
+    else ElMessage.error(t('ai.knowledgeManager.loadFailed'))
     await load()
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : t('ai.knowledgeManager.loadFailed'))
@@ -429,6 +488,10 @@ onMounted(load)
 .config-form :deep(.el-select), .config-form :deep(.el-input-number) { width: 100%; }
 .local-model { display: flex; flex-direction: column; gap: 5px; margin-bottom: 20px; color: var(--ogs-text-muted); font-size: 12px; }
 .local-model code { color: var(--ogs-text); }
+.document-upload { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; padding: 12px; border: 1px dashed var(--ogs-border); }
+.document-upload input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.document-upload span, .preview-ready { color: var(--ogs-text-muted); font-size: 11px; }
+.preview-ready { margin: 0 0 14px; color: var(--el-color-success); }
 
 @media (max-width: 760px) {
   .knowledge-inner { padding: 22px 12px 42px; }
@@ -450,5 +513,6 @@ onMounted(load)
   .knowledge-state div { border-right: 0; border-bottom: 1px solid var(--ogs-border); }
   .knowledge-search { grid-template-columns: 1fr; }
   .index-panel dl { grid-template-columns: 1fr; }
+  .document-upload { align-items: flex-start; flex-direction: column; }
 }
 </style>
