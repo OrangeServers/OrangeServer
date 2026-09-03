@@ -423,8 +423,16 @@ class AgentRunner:
         run_id = uuid.uuid4().hex
         lock_token = None
         try:
-            conversation = self.store.get_conversation(owner, conversation_id)
             lock_token = self.store.acquire_run_lock(owner, conversation_id)
+
+            def renew_lock():
+                self.store.refresh_run_lock(
+                    owner, conversation_id, lock_token,
+                )
+
+            conversation = self.store.get_conversation(owner, conversation_id)
+            autonomy_mode = conversation.get("autonomy_mode") or "ask"
+            autonomy_profile = conversation.get("autonomy_profile")
             yield sse_event(
                 "run.started",
                 run_id=run_id,
@@ -465,6 +473,8 @@ class AgentRunner:
                 owner=owner,
                 role=role,
                 conversation_id=conversation_id,
+                autonomy_mode=autonomy_mode,
+                autonomy_profile=autonomy_profile,
                 diagnostic_executor=lambda arguments: {},
             )
             diagnostic_event_queue = [None]
@@ -497,6 +507,7 @@ class AgentRunner:
             registry.diagnostic_executor = execute_diagnostic
 
             for _step in range(self.max_steps):
+                renew_lock()
                 context_manager.set_runtime_reservations(
                     system_prompt=build_system_prompt(),
                     tools=registry.definitions(),
@@ -565,6 +576,7 @@ class AgentRunner:
                 result = None
                 while result is None:
                     item_type, item = queue.get()
+                    renew_lock()
                     if item_type == "delta":
                         yield sse_event(
                             "assistant.delta",
@@ -612,6 +624,7 @@ class AgentRunner:
                         owner, conversation_id, assistant_tool_message
                     )
                     for call in result.tool_calls:
+                        renew_lock()
                         event_id = uuid.uuid4().hex
                         self._record_event(
                             owner,
@@ -662,6 +675,7 @@ class AgentRunner:
                                 tool_result = None
                                 while tool_result is None:
                                     item_type, item = tool_queue.get()
+                                    renew_lock()
                                     if item_type == "diagnostic":
                                         event_type = str(
                                             item.get("type")
@@ -792,6 +806,7 @@ class AgentRunner:
                                 error="平台工具执行失败",
                                 run_id=run_id,
                             )
+                        renew_lock()
                         conversation = self.store.append_message(
                             owner,
                             conversation_id,

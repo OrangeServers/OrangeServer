@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""M1/S1: 自治任务最小 API 契约测试（Issue #11）。
+"""自治任务 owner-scoped API 契约测试（Issue #27）。
 
-覆盖：路由形状、feature flag 默认禁用、v1 管理员限定、异常到 HTTP
-状态码的映射、decision 输入恰好为 {operation, expected_revision}，
-以及功能禁用时不影响既有 AI 聊天/诊断/批量审批路由。
+覆盖：路由形状、feature flag 默认禁用、admin/user owner 隔离、异常到
+HTTP 状态码的映射、知识目录与搜索边界，以及功能禁用时不影响既有
+AI 聊天/诊断/批量审批路由。
 """
+from types import SimpleNamespace
+
 import pytest
 from flask import Flask
 
@@ -112,6 +114,41 @@ def _enable(monkeypatch, flag=True):
     monkeypatch.setattr(views, "is_autonomy_enabled", lambda: flag)
 
 
+def test_identity_uses_current_database_role(monkeypatch):
+    session = object()
+    monkeypatch.setattr(views, "db", SimpleNamespace(session=session))
+    monkeypatch.setattr(
+        views, "get_current_user", lambda: ("redis", "alice"),
+    )
+    monkeypatch.setattr(
+        views, "resolve_current_autonomy_role",
+        lambda current_session, owner: (
+            "user" if current_session is session and owner == "alice" else None
+        ),
+    )
+
+    assert views._identity() == ("redis", "alice", "user")
+
+
+@pytest.mark.parametrize(("method", "path", "payload"), [
+    ("get", "/ai/autonomy/status", None),
+    ("get", "/ai/ops/status", None),
+    ("get", "/ai/autonomy/system-users", None),
+    ("get", "/ai/knowledge/documents", None),
+    ("post", "/ai/knowledge/search", {"query": "disk"}),
+])
+def test_read_endpoints_reject_identity_without_current_database_role(
+    api, method, path, payload,
+):
+    client, state = api
+    state["identity"] = ("stale-redis-session", "deleted-user", "")
+
+    response = getattr(client, method)(path, json=payload)
+
+    assert response.status_code == 403
+    assert state["repo"].calls == []
+
+
 def test_routes_are_registered_with_expected_verbs():
     app = Flask(__name__)
     routes_module.register_autonomy_routes(app)
@@ -121,6 +158,7 @@ def test_routes_are_registered_with_expected_verbs():
         rules.setdefault(rule.rule, set()).update(rule.methods)
     assert "GET" in rules["/ai/autonomy/status"]
     assert "GET" in rules["/ai/ops/status"]
+    assert "GET" in rules["/ai/autonomy/system-users"]
     assert "POST" in rules["/ai/ops/alertmanager/webhook"]
     assert "POST" in rules["/ai/autonomous-runs"]
     assert "GET" in rules["/ai/autonomous-runs"]
@@ -151,6 +189,7 @@ def test_routes_are_registered_with_expected_verbs():
     ]
     assert {"GET", "PATCH"}.issubset(rules["/ai/knowledge/config"])
     assert {"GET", "POST"}.issubset(rules["/ai/knowledge/documents"])
+    assert "POST" in rules["/ai/knowledge/search"]
     assert {"GET", "PATCH", "DELETE"}.issubset(rules[
         "/ai/knowledge/documents/<string:document_id>"
     ])
@@ -158,6 +197,62 @@ def test_routes_are_registered_with_expected_verbs():
     assert "POST" in rules[
         "/ai/autonomous-runs/<string:run_id>/knowledge"
     ]
+
+
+def test_route_role_gates_split_owner_lifecycle_from_admin_controls(monkeypatch):
+    observed = {}
+
+    def fake_secure(view, *roles):
+        observed.setdefault(view.__name__, []).append(tuple(roles))
+        return view
+
+    monkeypatch.setattr(routes_module, "_secure", fake_secure)
+    app = Flask(__name__)
+    routes_module.register_autonomy_routes(app)
+
+    assert observed["create_run"] == [("admin", "user")]
+    assert observed["list_runs"] == [("admin", "user")]
+    assert observed["decide_step"] == [("admin", "user")]
+    assert observed["stream_run"] == [("admin", "user")]
+    assert observed["ops_status"] == [("admin", "user")]
+    assert observed["system_user_options"] == [("admin", "user")]
+    assert observed["propose_step"] == [("admin",)]
+    assert observed["set_host_environment"] == [("admin",)]
+    assert observed["knowledge_documents"] == [
+        ("admin", "user"), ("admin",),
+    ]
+    assert observed["knowledge_search"] == [("admin", "user")]
+
+
+def test_system_user_options_return_only_authorized_public_metadata(
+    api, monkeypatch,
+):
+    client, state = api
+    _enable(monkeypatch, True)
+    state["identity"] = (None, "bob", "user")
+
+    class FakePlatformQuery:
+        def __init__(self, owner, role, session=None):
+            assert (owner, role, session) == ("bob", "user", views.db.session)
+
+        def list_authorized_system_users(self):
+            return SimpleNamespace(rows=[{
+                "id": 7,
+                "alias": "readonly",
+                "host_user": "root",
+                "remarks": "must not leave the server",
+            }])
+
+    monkeypatch.setattr(
+        "app.ai.tools.PlatformQueryService", FakePlatformQuery,
+    )
+
+    response = client.get("/ai/autonomy/system-users")
+
+    assert response.status_code == 200
+    assert response.get_json()["data"] == {
+        "system_users": [{"id": 7, "alias": "readonly"}],
+    }
 
 
 def test_knowledge_routes_delegate_to_reviewed_service(api, monkeypatch):
@@ -177,6 +272,14 @@ def test_knowledge_routes_delegate_to_reviewed_service(api, monkeypatch):
         def request_reindex(self):
             self.calls.append(("reindex",))
             return {"index_state": "rebuilding", "indexed_chunks": 0}
+
+        def list_documents(self, scopes=None):
+            self.calls.append(("list", scopes))
+            return [{"id": "doc-1", "scope": "global"}]
+
+        def search(self, query, *, limit, scopes):
+            self.calls.append(("search", query, limit, scopes))
+            return [{"citation_id": "K1", "scope": scopes[0]}]
 
         def mark_index_error(self):
             self.calls.append(("error",))
@@ -203,6 +306,112 @@ def test_knowledge_routes_delegate_to_reviewed_service(api, monkeypatch):
         ("reindex",),
         ("capture", "admin", "run-1"),
     ]
+
+
+def test_user_knowledge_catalog_is_metadata_only_and_server_scoped(
+    api, monkeypatch,
+):
+    client, state = api
+    state["identity"] = (None, "bob", "user")
+    scopes = ("global", "host:7")
+
+    class Catalog:
+        def __init__(self):
+            self.scopes = None
+
+        def list_documents(self, scopes=None):
+            self.scopes = scopes
+            return [{
+                "id": "doc-1",
+                "scope": "host:7",
+                "content_sha256": "internal-hash",
+                "created_by": "admin",
+            }]
+
+    service = Catalog()
+    monkeypatch.setattr(views, "_knowledge_service", lambda: service)
+    monkeypatch.setattr(views, "_knowledge_scopes", lambda *_: scopes)
+
+    response = client.get("/ai/knowledge/documents")
+
+    assert response.status_code == 200
+    assert service.scopes == scopes
+    document = response.get_json()["data"]["documents"][0]
+    assert "content" not in document
+    assert "content_sha256" not in document
+    assert "created_by" not in document
+
+
+def test_user_knowledge_search_ignores_client_scopes_and_caps_limit(
+    api, monkeypatch,
+):
+    client, state = api
+    state["identity"] = (None, "bob", "user")
+    server_scopes = ("global", "host:7")
+    observed = {}
+
+    class Search:
+        def search(self, query, *, limit, scopes):
+            observed.update(query=query, limit=limit, scopes=scopes)
+            return [{"citation_id": "K1", "scope": "global"}]
+
+        def index_state(self):
+            return "ready"
+
+    monkeypatch.setattr(views, "_knowledge_service", lambda: Search())
+    monkeypatch.setattr(
+        views, "_knowledge_scopes", lambda *_: server_scopes,
+    )
+
+    response = client.post("/ai/knowledge/search", json={
+        "query": "磁盘空间",
+        "limit": 99,
+        "scopes": ["host:999"],
+    })
+
+    assert response.status_code == 200
+    assert observed == {
+        "query": "磁盘空间", "limit": 8, "scopes": server_scopes,
+    }
+    assert response.get_json()["data"]["count"] == 1
+    assert response.get_json()["data"]["index_state"] == "ready"
+    assert response.get_json()["data"]["results"][0]["citation_id"] == "K1"
+
+
+@pytest.mark.parametrize("payload", [
+    {"query": "disk", "limit": 0},
+    {"query": "disk", "limit": "not-an-integer"},
+    {"query": "x" * 513},
+])
+def test_knowledge_search_rejects_out_of_bound_inputs(api, payload):
+    client, _state = api
+    response = client.post("/ai/knowledge/search", json=payload)
+    assert response.status_code == 400
+
+
+def test_user_cannot_use_knowledge_management_endpoints(api):
+    client, state = api
+    state["identity"] = (None, "bob", "user")
+    targets = [
+        ("get", "/ai/knowledge/config", None),
+        ("post", "/ai/knowledge/documents", {}),
+        ("get", "/ai/knowledge/documents/doc-1", None),
+        ("patch", "/ai/knowledge/documents/doc-1", {}),
+        ("delete", "/ai/knowledge/documents/doc-1", None),
+        ("post", "/ai/knowledge/reindex", {}),
+        ("post", "/ai/autonomous-runs/run-1/knowledge", {}),
+    ]
+    for method, url, payload in targets:
+        if method == "get":
+            response = client.get(url)
+        elif method == "delete":
+            response = client.delete(url)
+        elif method == "patch":
+            response = client.patch(url, json=payload)
+        else:
+            response = client.post(url, json=payload)
+        assert response.status_code == 403, url
+        assert "管理员" in response.get_json()["msg"]
 
 
 def test_status_probe_reports_flag_without_being_blocked(
@@ -285,16 +494,70 @@ def test_every_mutating_endpoint_is_rejected_when_flag_disabled(
         assert "未启用" in response.get_json()["msg"]
 
 
-def test_non_admin_is_rejected_even_when_enabled(api, monkeypatch):
+def test_user_can_create_an_own_run_when_enabled(api, monkeypatch):
     client, state = api
     _enable(monkeypatch, True)
     state["identity"] = (None, "bob", "user")
+    state["repo"] = FakeRepo(result={"id": "run-1", "status": "draft"})
     response = client.post(
         "/ai/autonomous-runs",
         json={"goal": "g", "host_id": 1, "system_user_id": 2,
               "mode": "ask"},
     )
-    assert response.status_code == 403
+    assert response.status_code == 200
+    assert state["repo"].calls[0][:2] == ("create_run", ("bob", "user"))
+
+
+def test_user_lifecycle_and_readers_remain_owner_scoped(api, monkeypatch):
+    client, state = api
+    _enable(monkeypatch, True)
+    state["identity"] = (None, "bob", "user")
+
+    for method, url, expected in [
+        ("get", "/ai/autonomous-runs", ("list_runs", ("bob",))),
+        ("get", "/ai/autonomous-runs/r1", ("snapshot", ("bob", "r1"))),
+        ("post", "/ai/autonomous-runs/r1/start", ("start_run", ("bob", "user", "r1"))),
+        ("post", "/ai/autonomous-runs/r1/cancel", ("request_cancel", ("bob", "user", "r1"))),
+        ("post", "/ai/autonomous-runs/r1/steps/s1/decision", ("decide", ("bob", "user", "r1", "s1"))),
+        ("get", "/ai/autonomous-runs/r1/artifacts", ("list_artifacts", ("bob", "r1"))),
+        ("get", "/ai/autonomous-runs/r1/artifacts/a1", ("get_artifact", ("bob", "r1", "a1"))),
+        ("get", "/ai/autonomous-runs/r1/evidence", ("list_evidence", ("bob", "r1"))),
+    ]:
+        state["repo"] = FakeRepo(result={"status": "cancelled"})
+        if method == "get":
+            response = client.get(url)
+        else:
+            payload = {
+                "operation": "approve", "expected_revision": 1,
+            } if expected[0] == "decide" else {}
+            response = client.post(url, json=payload)
+        assert response.status_code == 200, url
+        assert state["repo"].calls[0][0] == expected[0]
+        assert state["repo"].calls[0][1][:len(expected[1])] == expected[1]
+
+
+def test_user_cannot_propose_probe_or_change_host_environment(api, monkeypatch):
+    client, state = api
+    _enable(monkeypatch, True)
+    state["identity"] = (None, "bob", "user")
+    for url, payload in [
+        ("/ai/autonomous-runs/r1/steps", {"probe_id": "system.load"}),
+        ("/ai/autonomy/hosts/1/environment", {"environment": "lab"}),
+    ]:
+        response = client.post(url, json=payload)
+        assert response.status_code == 403, url
+        assert "管理员" in response.get_json()["msg"]
+
+
+def test_user_ops_status_is_owner_scoped(api, monkeypatch):
+    client, state = api
+    state["identity"] = (None, "bob", "user")
+    monkeypatch.setattr(views, "autonomy_readiness", lambda **_: {
+        "enabled": True, "configured": True, "ready": True,
+    })
+    response = client.get("/ai/ops/status")
+    assert response.status_code == 200
+    assert state["repo"].calls[0] == ("ops_summary", ("bob",), {})
 
 
 def test_create_run_passes_boundary_inputs_to_repository(api, monkeypatch):

@@ -1,30 +1,6 @@
 <template>
   <div class="ai-agent-page">
-    <header class="page-header agent-header">
-      <div>
-        <span class="page-eyebrow">AI OPS · {{ $t('ai.header.eyebrow') }}</span>
-        <h2>{{ $t('ai.header.title') }}</h2>
-        <p class="agent-subtitle">{{ $t('ai.header.subtitle') }}</p>
-      </div>
-      <div class="page-actions agent-actions">
-        <el-button v-if="isAdmin" plain @click="openModelSettings">
-          <el-icon><Setting /></el-icon>
-          {{ $t('ai.header.modelSettings') }}
-        </el-button>
-        <el-button plain @click="conversationDrawer = true">
-          <el-icon><Clock /></el-icon>
-          {{ $t('ai.header.recent') }}
-        </el-button>
-        <el-button type="primary" @click="startNewConversation">
-          <el-icon><Plus /></el-icon>
-          {{ $t('ai.header.new') }}
-        </el-button>
-      </div>
-    </header>
-
-    <AIOpsOverview v-if="isAdmin" />
-
-    <div class="agent-workspace">
+    <div class="agent-workspace" :class="{ 'context-open': !contextCollapsed }">
       <section class="conversation-panel" :aria-label="$t('ai.conversation.aria')">
         <div class="conversation-head">
           <div class="conversation-identity">
@@ -34,10 +10,64 @@
               <strong :title="currentTitle">{{ currentTitle }}</strong>
             </div>
           </div>
-          <el-button class="mobile-context-button" text @click="contextDrawer = true">
-            <el-icon><View /></el-icon>
-            {{ $t('ai.conversation.contextButton') }}
-          </el-button>
+          <div class="conversation-head-actions">
+            <el-button
+              v-if="isAdmin" class="head-action-button" text
+              :aria-label="$t('ai.header.modelSettings')"
+              @click="openModelSettings"
+            >
+              <el-icon><Setting /></el-icon><span class="head-action-label">{{ $t('ai.header.modelSettings') }}</span>
+            </el-button>
+            <el-button
+              class="head-action-button" text :aria-label="$t('ai.header.recent')"
+              @click="conversationDrawer = true"
+            >
+              <el-icon><Clock /></el-icon><span class="head-action-label">{{ $t('ai.header.recent') }}</span>
+            </el-button>
+            <el-button
+              class="head-action-button" text :aria-label="$t('ai.header.new')"
+              @click="startNewConversation"
+            >
+              <el-icon><Plus /></el-icon><span class="head-action-label">{{ $t('ai.header.new') }}</span>
+            </el-button>
+            <el-button
+              class="head-action-button desktop-context-button" text
+              :aria-label="$t(contextCollapsed ? 'ai.header.contextShow' : 'ai.header.contextHide')"
+              :aria-expanded="!contextCollapsed"
+              @click="contextCollapsed = !contextCollapsed"
+            >
+              <el-icon><View v-if="contextCollapsed" /><Hide v-else /></el-icon>
+              <span class="head-action-label">{{ $t(contextCollapsed ? 'ai.header.contextShow' : 'ai.header.contextHide') }}</span>
+            </el-button>
+            <el-button
+              class="head-action-button mobile-context-button" text
+              :aria-label="$t('ai.conversation.contextButton')"
+              @click="contextDrawer = true"
+            >
+              <el-icon><View /></el-icon><span class="head-action-label">{{ $t('ai.conversation.contextButton') }}</span>
+            </el-button>
+            <el-dropdown class="mobile-head-menu" trigger="click" @command="handleHeaderAction">
+              <el-button text circle :aria-label="$t('ai.header.moreActions')">
+                <el-icon><MoreFilled /></el-icon>
+              </el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item v-if="isAdmin" command="settings">
+                    <el-icon><Setting /></el-icon>{{ $t('ai.header.modelSettings') }}
+                  </el-dropdown-item>
+                  <el-dropdown-item command="recent">
+                    <el-icon><Clock /></el-icon>{{ $t('ai.header.recent') }}
+                  </el-dropdown-item>
+                  <el-dropdown-item command="new">
+                    <el-icon><Plus /></el-icon>{{ $t('ai.header.new') }}
+                  </el-dropdown-item>
+                  <el-dropdown-item command="context">
+                    <el-icon><View /></el-icon>{{ $t('ai.conversation.contextButton') }}
+                  </el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+          </div>
         </div>
 
         <div
@@ -51,12 +81,6 @@
           </div>
 
           <div v-else-if="!timeline.length" class="agent-empty">
-            <div class="empty-terminal" aria-hidden="true">
-              <span class="terminal-led" />
-              <span class="terminal-led" />
-              <span class="terminal-led" />
-              <code>ops@orangeserver:~$ <b>ask agent</b></code>
-            </div>
             <h3>{{ $t('ai.empty.title') }}</h3>
             <p>{{ $t('ai.empty.desc') }}</p>
             <div class="prompt-grid">
@@ -170,6 +194,7 @@
         <footer class="composer-shell">
           <div class="composer">
             <el-input
+              ref="composerInput"
               v-model="draft"
               type="textarea"
               resize="none"
@@ -180,64 +205,104 @@
               @keydown="handleComposerKeydown"
             />
             <div class="composer-toolbar">
-              <div class="composer-controls">
-                <el-select
-                  v-model="selectedProvider"
-                  class="provider-select"
-                  popper-class="provider-select-popper"
-                  :placeholder="$t('ai.composer.selectModel')"
-                  size="small"
-                  :disabled="sending"
-                  @change="handleProviderChange"
-                >
-                  <el-option
-                    v-for="provider in providers"
-                    :key="provider.provider_code"
-                    :value="provider.provider_code"
-                    :label="providerLabel(provider)"
-                    :disabled="!providerAvailable(provider)"
-                  >
-                    <div class="provider-option">
-                      <span class="provider-option-name">
-                        <svg viewBox="0 0 24 24" width="14" height="14" :fill="providerBrandColor(provider.provider_code)" v-html="providerIcon(provider.provider_code)" />
-                        {{ provider.name || providerName(provider.provider_code) }}
-                      </span>
-                      <span class="provider-option-detail">
-                        <span class="provider-option-model">{{ provider.model || $t('ai.provider.modelUnset') }}</span>
-                        <small v-if="!providerAvailable(provider)">{{ providerUnavailableReason(provider) }}</small>
-                      </span>
-                    </div>
-                  </el-option>
-                </el-select>
-                <el-radio-group
-                  v-model="selectedContextMode"
-                  size="small"
-                  class="context-mode-toggle"
-                  :disabled="sending"
-                  @change="handleContextModeChange"
-                >
-                  <el-radio-button value="standard_256k">256K</el-radio-button>
-                  <el-radio-button
-                    value="deep_diagnostic_1m"
-                    :disabled="!activeProviderSupportsDeep"
-                    :title="activeProviderSupportsDeep ? $t('ai.composer.deepAvailable') : $t('ai.composer.deepMissing')"
-                  >{{ $t('ai.composer.deepOption') }}</el-radio-button>
-                </el-radio-group>
-                <span v-if="!activeProviderReady" class="provider-status">
-                  <i />
-                  {{ providerUnavailableReason(activeProvider) }}
-                </span>
-              </div>
-              <el-button
-                class="send-button"
-                type="primary"
-                :disabled="!draft.trim() || !canChat"
-                :loading="sending"
-                :aria-label="$t('ai.composer.sendAria')"
-                @click="sendMessage"
+              <el-dropdown
+                trigger="click"
+                popper-class="autonomy-mode-popper"
+                :disabled="sending || savingAutonomyProfile"
+                @command="handleAutonomyModeCommand"
               >
-                <el-icon v-if="!sending"><Promotion /></el-icon>
-              </el-button>
+                <el-button
+                  class="autonomy-mode-trigger"
+                  text
+                  :disabled="sending || savingAutonomyProfile"
+                  :aria-label="$t('ai.composer.autonomyPermission')"
+                >
+                  <el-icon><Lock /></el-icon>
+                  <span>{{ currentAutonomyModeLabel }}</span>
+                  <el-icon><ArrowDown /></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item
+                      v-for="mode in AUTONOMY_MODES"
+                      :key="mode"
+                      :command="mode"
+                      :data-autonomy-mode="mode"
+                      :class="{ 'is-current': selectedAutonomyMode === mode }"
+                    >
+                      <span class="autonomy-mode-option">
+                        <strong>{{ $t(`aiRuns.mode.${mode}`) }}</strong>
+                        <small>{{ $t(`aiRuns.dialog.modeHint.${mode}`) }}</small>
+                      </span>
+                    </el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+              <div class="composer-actions">
+                <div class="composer-controls">
+                  <el-select
+                    v-model="selectedProvider"
+                    class="provider-select"
+                    popper-class="provider-select-popper"
+                    :placeholder="$t('ai.composer.selectModel')"
+                    :aria-label="$t('ai.composer.selectModel')"
+                    size="small"
+                    :disabled="sending"
+                    @change="handleProviderChange"
+                  >
+                    <el-option
+                      v-for="provider in providers"
+                      :key="provider.provider_code"
+                      :value="provider.provider_code"
+                      :label="providerLabel(provider)"
+                      :disabled="!providerAvailable(provider)"
+                    >
+                      <div class="provider-option">
+                        <span class="provider-option-name">
+                          <svg viewBox="0 0 24 24" width="14" height="14" :fill="providerBrandColor(provider.provider_code)" v-html="providerIcon(provider.provider_code)" />
+                          {{ provider.name || providerName(provider.provider_code) }}
+                        </span>
+                        <span class="provider-option-detail">
+                          <span class="provider-option-model">{{ provider.model || $t('ai.provider.modelUnset') }}</span>
+                          <small v-if="!providerAvailable(provider)">{{ providerUnavailableReason(provider) }}</small>
+                        </span>
+                      </div>
+                    </el-option>
+                  </el-select>
+                  <el-select
+                    v-model="selectedContextMode"
+                    class="context-mode-select"
+                    popper-class="context-mode-select-popper"
+                    placement="top-start"
+                    :fallback-placements="['top-start']"
+                    :aria-label="$t('ai.composer.contextWindow')"
+                    size="small"
+                    :disabled="sending"
+                    @change="handleContextModeChange"
+                  >
+                    <el-option value="standard_256k" label="256K" />
+                    <el-option
+                      v-if="activeProviderSupportsDeep"
+                      value="deep_diagnostic_1m"
+                      label="1M"
+                    />
+                  </el-select>
+                  <span v-if="!activeProviderReady" class="provider-status">
+                    <i />
+                    {{ providerUnavailableReason(activeProvider) }}
+                  </span>
+                </div>
+                <el-button
+                  class="send-button"
+                  type="primary"
+                  :disabled="!draft.trim() || !canChat"
+                  :loading="sending"
+                  :aria-label="$t('ai.composer.sendAria')"
+                  @click="sendMessage"
+                >
+                  <el-icon v-if="!sending"><Promotion /></el-icon>
+                </el-button>
+              </div>
             </div>
           </div>
           <div class="composer-hint">
@@ -252,7 +317,47 @@
       </aside>
     </div>
 
-    <el-drawer v-model="conversationDrawer" :title="$t('ai.drawer.conversations')" size="380px" class="conversation-drawer">
+    <el-dialog
+      v-model="customProfileDialog"
+      class="custom-profile-dialog"
+      :title="$t('ai.composer.customTitle')"
+      width="min(520px, 92vw)"
+      :close-on-click-modal="false"
+    >
+      <p class="custom-profile-desc">{{ $t('ai.composer.customDesc') }}</p>
+      <div class="custom-category-grid" role="group" :aria-label="$t('aiRuns.dialog.categories')">
+        <label
+          v-for="category in AUTONOMY_ACTION_CATEGORIES"
+          :key="category"
+          class="custom-category-option"
+          :class="{ active: customCategoryDraft.includes(category) }"
+        >
+          <input
+            type="checkbox"
+            :data-action-category="category"
+            :checked="customCategoryDraft.includes(category)"
+            @change="handleCustomCategoryChange(category, $event)"
+          >
+          <span>{{ $t(`aiRuns.dialog.category.${category}`) }}</span>
+        </label>
+      </div>
+      <template #footer>
+        <el-button :disabled="savingAutonomyProfile" @click="customProfileDialog = false">
+          {{ $t('common.action.cancel') }}
+        </el-button>
+        <el-button
+          class="custom-profile-confirm"
+          type="primary"
+          :loading="savingAutonomyProfile"
+          :disabled="!customCategoryDraft.length || savingAutonomyProfile"
+          @click="confirmCustomProfile"
+        >
+          {{ $t('ai.composer.customConfirm') }}
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-drawer v-model="conversationDrawer" :title="$t('ai.drawer.conversations')" size="min(380px, 92vw)" class="conversation-drawer">
       <div class="drawer-toolbar">
         <span>{{ $t('ai.drawer.keepRecent') }}</span>
         <el-button type="primary" plain @click="startNewConversation">
@@ -395,18 +500,21 @@ import {
   type Component,
   type PropType,
 } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox, type InputInstance } from 'element-plus'
 import { useRouter } from 'vue-router'
 import {
   ArrowRight,
+  ArrowDown,
   ChatLineRound,
   CircleCheckFilled,
   Clock,
-  DataAnalysis,
   Delete,
   Document,
+  Hide,
   Loading,
+  Lock,
   Monitor,
+  MoreFilled,
   Plus,
   Promotion,
   Setting,
@@ -419,7 +527,6 @@ import { currentLocale, t } from '@/i18n'
 import { providerBrandColor, providerIcon } from '@/assets/provider-logos'
 import DiagnosticRunCard from '@/components/ai/DiagnosticRunCard.vue'
 import AutonomyDraftCard from '@/components/ai/AutonomyDraftCard.vue'
-import AIOpsOverview from '@/components/ai/AIOpsOverview.vue'
 import OrangeMark from '@/components/OrangeMark.vue'
 import {
   cancelDiagnostic,
@@ -430,6 +537,10 @@ import {
 import { aiJsonRequest, postAiStream } from '@/utils/aiStream'
 import { sortAutonomyDrafts } from '@/utils/autonomyDrafts'
 import {
+  AUTONOMY_ACTION_CATEGORIES,
+  type AutonomyActionCategory,
+} from '@/types/autonomy'
+import {
   AI_CONTEXT_MODE_DEEP,
   AI_CONTEXT_MODE_STANDARD,
   AI_CONTEXT_TOKENS_DEEP,
@@ -439,6 +550,8 @@ import type {
   AiAutonomyDraft,
   AiChatMessage,
   AiConversation,
+  AiConversationAutonomyMode,
+  AiConversationAutonomyProfile,
   AiConversationDetail,
   AiContextMode,
   AiDiagnosticAssetProgress,
@@ -469,11 +582,13 @@ const PROVIDER_NAMES: Record<string, string> = {
   siliconflow: '硅基流动', // i18n-ignore 厂商品牌名，非 UI 文案
 }
 
+const AUTONOMY_MODES = ['ask', 'ai_review', 'auto', 'custom'] as const
+
 const examplePrompts = computed<Array<{ title: string; text: string; icon: Component }>>(() => [
-  { title: t('ai.prompts.overviewTitle'), text: t('ai.prompts.overviewText'), icon: DataAnalysis },
-  { title: t('ai.prompts.assetsTitle'), text: t('ai.prompts.assetsText'), icon: Monitor },
-  { title: t('ai.prompts.cronTitle'), text: t('ai.prompts.cronText'), icon: Tickets },
-  { title: t('ai.prompts.auditTitle'), text: t('ai.prompts.auditText'), icon: Document },
+  { title: t('ai.prompts.inspectTitle'), text: t('ai.prompts.inspectText'), icon: Monitor },
+  { title: t('ai.prompts.troubleshootTitle'), text: t('ai.prompts.troubleshootText'), icon: WarningFilled },
+  { title: t('ai.prompts.repairTitle'), text: t('ai.prompts.repairText'), icon: Tickets },
+  { title: t('ai.prompts.knowledgeTitle'), text: t('ai.prompts.knowledgeText'), icon: Document },
 ])
 
 const providers = ref<AiProvider[]>([])
@@ -481,6 +596,8 @@ const router = useRouter()
 const isAdmin = computed<boolean>(() => store.user.role === 'admin')
 const selectedProvider = ref('')
 const selectedContextMode = ref<AiContextMode>(AI_CONTEXT_MODE_STANDARD)
+const selectedAutonomyMode = ref<AiConversationAutonomyMode>('ask')
+const selectedAutonomyCategories = ref<AutonomyActionCategory[]>([])
 const conversations = ref<AiConversation[]>([])
 const currentConversationId = ref('')
 const messages = ref<AiChatMessage[]>([])
@@ -490,10 +607,15 @@ const resultScope = ref<AiResultScope | null>(null)
 const diagnosticRuns = ref<AiDiagnosticRun[]>([])
 const providerObservability = ref<AiProviderObservability | null>(null)
 const draft = ref('')
+const composerInput = ref<InputInstance>()
 const sending = ref(false)
+const savingAutonomyProfile = ref(false)
+const customProfileDialog = ref(false)
+const customCategoryDraft = ref<AutonomyActionCategory[]>([])
 const loadingConversation = ref(false)
 const conversationDrawer = ref(false)
 const contextDrawer = ref(false)
+const contextCollapsed = ref(true)
 const resultDrawer = ref(false)
 const resultLoading = ref(false)
 const resultRows = ref<Array<Record<string, unknown>>>([])
@@ -539,6 +661,7 @@ const canChat = computed(() =>
   activeProviderReady.value
   && contextModeAvailable.value
   && !sending.value
+  && !savingAutonomyProfile.value
 )
 const hasStreamingMessage = computed(() => messages.value.some(message => message.streaming))
 /** 思考态：请求中或流式回复中 → 橘子旋转动画 */
@@ -561,6 +684,7 @@ const contextBudgetPercent = computed(() => {
   return Math.min(100, Math.max(0, Math.round((used / available) * 100)))
 })
 const currentTitle = computed(() => currentConversation.value?.title || t('ai.conversation.defaultTitle'))
+const currentAutonomyModeLabel = computed(() => t(`aiRuns.mode.${selectedAutonomyMode.value}`))
 const currentModelLabel = computed(() => {
   const provider = activeProvider.value
   if (!provider) return t('ai.provider.selectToStart')
@@ -748,6 +872,13 @@ function openModelSettings(): void {
   void router.push({ name: 'Settings', query: { tab: 'ai' } })
 }
 
+function handleHeaderAction(command: string): void {
+  if (command === 'settings') openModelSettings()
+  if (command === 'recent') conversationDrawer.value = true
+  if (command === 'new') startNewConversation()
+  if (command === 'context') contextDrawer.value = true
+}
+
 function providerAvailable(provider: AiProvider): boolean {
   return provider.available !== false
     && provider.enabled !== false
@@ -772,7 +903,10 @@ function providerUnavailableReason(provider?: AiProvider): string {
 }
 
 function providerLabel(provider: AiProvider): string {
-  const base = `${provider.name || providerName(provider.provider_code)} · ${provider.model || t('ai.provider.notConfigured')}`
+  const model = String(provider.model || '').trim()
+  const base = model
+    ? (model.split('/').pop() || model).replace(/[-_]+/g, ' ')
+    : provider.name || providerName(provider.provider_code)
   return providerAvailable(provider)
     ? base
     : t('ai.provider.labelUnavailable', { base, reason: providerUnavailableReason(provider) })
@@ -1146,8 +1280,106 @@ function removeDiagnosticToolEvents(data: Record<string, unknown>): void {
   )
 }
 
+function applyConversationAutonomyPermission(
+  conversation: Pick<AiConversation, 'autonomy_mode' | 'autonomy_profile'>,
+): void {
+  const rawMode = String(conversation.autonomy_mode || 'ask')
+  const mode = AUTONOMY_MODES.includes(rawMode as AiConversationAutonomyMode)
+    ? rawMode as AiConversationAutonomyMode
+    : 'ask'
+  const categories = mode === 'custom'
+    ? (conversation.autonomy_profile?.action_categories || []).filter(
+        (item): item is AutonomyActionCategory => (
+          AUTONOMY_ACTION_CATEGORIES.includes(item as AutonomyActionCategory)
+        ),
+      )
+    : []
+  selectedAutonomyMode.value = mode === 'custom' && !categories.length ? 'ask' : mode
+  selectedAutonomyCategories.value = categories
+}
+
+async function saveAutonomyPermission(
+  mode: AiConversationAutonomyMode,
+  categories: AutonomyActionCategory[] = [],
+): Promise<boolean> {
+  if (sending.value || savingAutonomyProfile.value) return false
+  const previousMode = selectedAutonomyMode.value
+  const previousCategories = [...selectedAutonomyCategories.value]
+  selectedAutonomyMode.value = mode
+  selectedAutonomyCategories.value = mode === 'custom' ? [...categories] : []
+  const conversationId = currentConversationId.value
+  if (!conversationId) return true
+
+  savingAutonomyProfile.value = true
+  try {
+    const autonomyProfile: AiConversationAutonomyProfile | undefined = mode === 'custom'
+      ? { action_categories: [...categories] }
+      : undefined
+    const payload = await aiJsonRequest<AiApiResponse<AiConversation> & { conversation?: AiConversation }>(
+      `/ai/conversations/${encodeURIComponent(conversationId)}`,
+      {
+        method: 'PATCH',
+        body: { autonomy_mode: mode, autonomy_profile: autonomyProfile },
+      },
+    )
+    const updated = unwrapObject<AiConversation>(payload, 'conversation') || {
+      id: conversationId,
+      title: currentConversation.value?.title || '',
+      autonomy_mode: mode,
+      autonomy_profile: autonomyProfile,
+    }
+    if (currentConversationId.value === conversationId) {
+      applyConversationAutonomyPermission(updated)
+    }
+    conversations.value = conversations.value.map(item => (
+      item.id === conversationId ? { ...item, ...updated } : item
+    ))
+    return true
+  } catch (error) {
+    if (currentConversationId.value === conversationId) {
+      selectedAutonomyMode.value = previousMode
+      selectedAutonomyCategories.value = previousCategories
+    }
+    ElMessage.error(errorMessage(error, t('ai.msg.updateAutonomyFail')))
+    return false
+  } finally {
+    savingAutonomyProfile.value = false
+  }
+}
+
+function handleAutonomyModeCommand(command: string): void {
+  if (sending.value || savingAutonomyProfile.value) return
+  if (!AUTONOMY_MODES.includes(command as AiConversationAutonomyMode)) return
+  const mode = command as AiConversationAutonomyMode
+  if (mode === 'custom') {
+    customCategoryDraft.value = selectedAutonomyMode.value === 'custom'
+      ? [...selectedAutonomyCategories.value]
+      : []
+    customProfileDialog.value = true
+    return
+  }
+  void saveAutonomyPermission(mode)
+}
+
+function handleCustomCategoryChange(
+  category: AutonomyActionCategory,
+  event: Event,
+): void {
+  const checked = (event.target as HTMLInputElement).checked
+  customCategoryDraft.value = checked
+    ? [...new Set([...customCategoryDraft.value, category])]
+    : customCategoryDraft.value.filter(item => item !== category)
+}
+
+async function confirmCustomProfile(): Promise<void> {
+  if (!customCategoryDraft.value.length) return
+  if (await saveAutonomyPermission('custom', customCategoryDraft.value)) {
+    customProfileDialog.value = false
+  }
+}
+
 async function openConversation(id: string, closeDrawer = true): Promise<void> {
-  if (sending.value) return
+  if (sending.value || savingAutonomyProfile.value) return
   stopDiagnosticPoll()
   resetScrollState()
   loadingConversation.value = true
@@ -1169,6 +1401,7 @@ async function openConversation(id: string, closeDrawer = true): Promise<void> {
     }
     if (detail.provider_code) selectedProvider.value = detail.provider_code
     selectedContextMode.value = detail.context_mode || AI_CONTEXT_MODE_STANDARD
+    applyConversationAutonomyPermission(detail)
     lastAppliedProvider = selectedProvider.value
     lastAppliedContextMode = selectedContextMode.value
     localStorage.setItem('ogs:ai-conversation', currentConversationId.value)
@@ -1198,7 +1431,7 @@ async function refreshProviderObservability(conversationId: string): Promise<voi
 }
 
 function startNewConversation(): void {
-  if (sending.value) return
+  if (sending.value || savingAutonomyProfile.value) return
   stopDiagnosticPoll()
   resetScrollState()
   currentConversationId.value = ''
@@ -1210,6 +1443,9 @@ function startNewConversation(): void {
   providerObservability.value = null
   draft.value = ''
   selectedContextMode.value = AI_CONTEXT_MODE_STANDARD
+  selectedAutonomyMode.value = 'ask'
+  selectedAutonomyCategories.value = []
+  customProfileDialog.value = false
   lastAppliedContextMode = AI_CONTEXT_MODE_STANDARD
   localStorage.removeItem('ogs:ai-conversation')
   conversationDrawer.value = false
@@ -1268,6 +1504,10 @@ async function ensureConversation(firstMessage: string): Promise<string> {
         provider_code: selectedProvider.value,
         title: firstMessage.trim().slice(0, 32),
         context_mode: selectedContextMode.value,
+        autonomy_mode: selectedAutonomyMode.value,
+        autonomy_profile: selectedAutonomyMode.value === 'custom'
+          ? { action_categories: [...selectedAutonomyCategories.value] }
+          : undefined,
       },
     },
   )
@@ -1281,7 +1521,7 @@ async function ensureConversation(firstMessage: string): Promise<string> {
 
 function useExample(text: string): void {
   draft.value = text
-  void nextTick(() => sendMessage())
+  void nextTick(() => composerInput.value?.focus())
 }
 
 async function sendMessage(): Promise<void> {
@@ -1470,12 +1710,16 @@ function restoreToolEvents(items: AiToolEvent[]): AiToolEvent[] {
 function normalizeAutonomyDraft(data: Record<string, unknown>): AiAutonomyDraft | null {
   const runId = String(data.run_id || '')
   if (!runId) return null
+  const actionCategories = Array.isArray(data.action_categories)
+    ? data.action_categories.map(String).filter(Boolean)
+    : []
   return {
     id: String(data.id || ''),
     run_id: runId,
     goal: String(data.goal || ''),
     status: String(data.status || 'draft'),
     mode: String(data.mode || ''),
+    action_categories: actionCategories,
     host_alias: String(data.host_alias || ''),
     created_at: typeof data.created_at === 'string' ? data.created_at : nowIso(),
   }
@@ -1816,36 +2060,82 @@ onBeforeUnmount(() => {
   flex-direction: column;
 }
 
-.agent-header { flex: 0 0 auto; align-items: center; }
-.agent-subtitle {
-  margin-top: 5px;
-  color: var(--ogs-text-secondary);
-  font-size: 13px;
-  line-height: 1.6;
+.autonomy-mode-trigger {
+  min-width: 108px;
+  height: 28px;
+  padding: 0 8px !important;
+  display: inline-flex;
+  justify-content: flex-start;
+  gap: 6px;
+  color: var(--ogs-primary) !important;
+  border: 1px solid color-mix(in srgb, var(--ogs-primary) 42%, var(--ogs-border)) !important;
+  border-radius: 7px !important;
+  background: var(--ogs-primary-soft) !important;
+  font-size: 11px;
+  white-space: nowrap;
 }
-.agent-actions { flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.autonomy-mode-trigger > span { min-width: 0; display: inline-flex; align-items: center; gap: 6px; }
+.autonomy-mode-trigger .el-icon:last-child { margin-left: auto; color: var(--ogs-text-muted); }
+.autonomy-mode-popper { max-width: min(360px, calc(100vw - 24px)); }
+.autonomy-mode-popper .el-dropdown-menu__item { padding: 9px 12px; }
+.autonomy-mode-popper .el-dropdown-menu__item.is-current { background: var(--ogs-primary-soft); }
+.autonomy-mode-option { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.autonomy-mode-option strong { color: var(--ogs-text); font-size: 12px; font-weight: 600; }
+.autonomy-mode-option small { color: var(--ogs-text-muted); font-size: 10.5px; line-height: 1.45; white-space: normal; }
+.custom-profile-desc {
+  margin: 0 0 14px;
+  color: var(--ogs-text-secondary);
+  font-size: 12px;
+  line-height: 1.65;
+}
+.custom-category-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.custom-category-option {
+  min-width: 0;
+  padding: 10px 11px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--ogs-border);
+  border-radius: 8px;
+  color: var(--ogs-text-secondary);
+  background: var(--ogs-bg-sunken);
+  cursor: pointer;
+  font-size: 12px;
+}
+.custom-category-option.active {
+  color: var(--ogs-text);
+  border-color: var(--ogs-primary);
+  background: var(--ogs-primary-soft);
+}
+.custom-category-option input { margin: 0; accent-color: var(--ogs-primary); }
+.custom-category-option:focus-within { outline: 3px solid var(--ogs-primary-ring); outline-offset: 1px; }
+
 /* —— composer 工具栏：模型与上下文选择贴着输入位，安静版控件 —— */
 .provider-select { width: 230px; }
-.provider-select :deep(.el-select__wrapper) {
+.provider-select .el-select__wrapper {
   min-height: 28px;
+  height: 28px;
   padding: 0 8px;
   font-size: 12px;
   background: transparent !important;
   border-radius: 6px;
-  box-shadow: none !important;
+  box-shadow: 0 0 0 1px var(--ogs-border) inset !important;
 }
-.provider-select :deep(.el-select__wrapper:hover) { background: var(--ogs-bg-elevated) !important; }
-.provider-select :deep(.el-select__wrapper.is-focused) {
+.provider-select .el-select__wrapper:hover { background: var(--ogs-bg-elevated) !important; }
+.provider-select .el-select__wrapper.is-focused {
   background: var(--ogs-bg-elevated) !important;
   box-shadow: 0 0 0 1px var(--ogs-primary) inset !important;
 }
-.provider-select :deep(.el-select__selected-item),
-.provider-select :deep(.el-select__placeholder) {
+.provider-select .el-select__selected-item,
+.provider-select .el-select__placeholder {
+  display: flex;
+  align-items: center;
+  line-height: 1;
   font-size: 12px;
   color: var(--ogs-text) !important;
 }
-.provider-select :deep(.el-select__placeholder.is-transparent) { color: var(--ogs-text-muted) !important; }
-.provider-select :deep(.el-select__suffix) { color: var(--ogs-text-muted) !important; }
+.provider-select .el-select__placeholder.is-transparent { color: var(--ogs-text-muted) !important; }
+.provider-select .el-select__suffix { color: var(--ogs-text-muted) !important; }
 .provider-status {
   display: inline-flex;
   align-items: center;
@@ -1860,31 +2150,29 @@ onBeforeUnmount(() => {
   border-radius: 50%;
   background: var(--ogs-warning);
 }
-/* 用 EP 的 CSS 变量覆盖选中态（不受样式加载顺序影响），软底描边而非实心橙 */
-.context-mode-toggle {
-  --el-radio-button-checked-bg-color: color-mix(in srgb, var(--ogs-primary) 16%, transparent);
-  --el-radio-button-checked-text-color: var(--ogs-primary-light);
-  --el-radio-button-checked-border-color: var(--ogs-primary);
-}
-.context-mode-toggle :deep(.el-radio-button__inner) {
+.context-mode-select { width: 76px; }
+.context-mode-select .el-select__wrapper {
   min-height: 28px;
-  padding: 5px 10px;
+  height: 28px;
+  padding: 0 8px;
   font-family: var(--ogs-mono);
   font-size: 11.5px;
-  color: var(--ogs-text-secondary);
-  border-color: var(--ogs-border);
-  background: transparent;
-  box-shadow: none;
+  background: transparent !important;
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px var(--ogs-border) inset !important;
 }
-.context-mode-toggle :deep(.el-radio-button__original-radio:checked + .el-radio-button__inner),
-.context-mode-toggle :deep(.el-radio-button.is-active .el-radio-button__inner) {
-  color: var(--ogs-primary-light);
-  border-color: var(--ogs-primary);
-  background: color-mix(in srgb, var(--ogs-primary) 16%, transparent);
-  box-shadow: -1px 0 0 0 var(--ogs-primary);
+.context-mode-select .el-select__wrapper:hover {
+  background: var(--ogs-bg-elevated) !important;
 }
-.context-mode-toggle :deep(.el-radio-button__inner:hover) {
-  color: var(--ogs-primary-light);
+.context-mode-select .el-select__wrapper.is-focused {
+  box-shadow: 0 0 0 1px var(--ogs-primary) inset !important;
+}
+.context-mode-select .el-select__selected-item,
+.context-mode-select .el-select__placeholder {
+  display: flex;
+  align-items: center;
+  line-height: 1;
+  color: var(--ogs-text-secondary) !important;
 }
 .provider-option { display: flex; justify-content: space-between; gap: 20px; font-size: 13px; }
 .provider-option-name { display: inline-flex; align-items: center; gap: 7px; }
@@ -1910,12 +2198,12 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 326px;
+  grid-template-columns: minmax(0, 1fr) 0;
   overflow: hidden;
-  border: 1px solid var(--ogs-border);
-  border-radius: 4px;
   background: var(--ogs-surface);
+  transition: grid-template-columns .16s ease;
 }
+.agent-workspace.context-open { grid-template-columns: minmax(0, 1fr) 326px; }
 .conversation-panel {
   min-width: 0;
   min-height: 0;
@@ -1981,7 +2269,9 @@ onBeforeUnmount(() => {
   color: var(--ogs-text);
   font-size: 14px;
 }
+.conversation-head-actions { display: flex; align-items: center; gap: 2px; }
 .mobile-context-button { display: none; }
+.mobile-head-menu { display: none; }
 
 .message-stream {
   flex: 1;
@@ -2006,26 +2296,8 @@ onBeforeUnmount(() => {
   flex-direction: column;
   justify-content: center;
 }
-.empty-terminal {
-  width: max-content;
-  max-width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 10px 14px;
-  border-radius: var(--ogs-radius);
-  background: #18181B;
-  color: rgba(255, 255, 255, 0.55);
-  box-shadow: var(--ogs-shadow-md);
-}
-.terminal-led { width: 7px; height: 7px; border-radius: 50%; background: rgba(255,255,255,.22); }
-.terminal-led:first-child { background: #ef4444; }
-.terminal-led:nth-child(2) { background: #f59e0b; }
-.terminal-led:nth-child(3) { background: #10b981; margin-right: 7px; }
-.empty-terminal code { font-size: 12px; white-space: nowrap; }
-.empty-terminal b { color: var(--ogs-primary-light); font-weight: 600; }
 .agent-empty h3 {
-  margin-top: 24px;
+  margin-top: 0;
   color: var(--ogs-text);
   font-size: 22px;
   line-height: 1.25;
@@ -2084,12 +2356,10 @@ onBeforeUnmount(() => {
 .prompt-card small {
   display: block;
   margin-top: 4px;
-  overflow: hidden;
   color: var(--ogs-text-secondary);
   font-size: 11px;
   line-height: 1.5;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
 }
 .prompt-arrow { color: var(--ogs-text-muted); }
 
@@ -2378,7 +2648,8 @@ onBeforeUnmount(() => {
   border-color: var(--ogs-primary);
   box-shadow: 0 0 0 3px var(--ogs-primary-ring);
 }
-.composer .el-textarea__inner {
+.composer .el-textarea__inner,
+.composer .el-textarea__inner:focus {
   min-height: 44px !important;
   padding: 6px 8px;
   color: var(--ogs-text) !important;
@@ -2395,12 +2666,20 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   gap: 10px;
 }
+.composer-actions {
+  min-width: 0;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
 .composer-controls {
   min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 /* 发送按钮：橙色实心发光（与审批卡确认按钮同款） */
 .send-button {
@@ -2442,9 +2721,13 @@ onBeforeUnmount(() => {
 .context-panel {
   min-width: 0;
   overflow-y: auto;
-  border-left: 1px solid var(--ogs-border);
+  visibility: hidden;
+  opacity: 0;
+  border-left: 0;
   background: var(--ogs-bg-sunken);
+  transition: opacity .12s ease;
 }
+.context-open .context-panel { visibility: visible; opacity: 1; border-left: 1px solid var(--ogs-border); }
 .context-content { padding: 16px; }
 .context-section { margin-bottom: 16px; }
 .context-label {
@@ -2611,7 +2894,7 @@ onBeforeUnmount(() => {
 .conversation-item-body strong { font-size: 13px; }
 .conversation-item-body small { margin-top: 4px; color: var(--ogs-text-muted); font-size: 11px; }
 .conversation-item-id { display: flex !important; align-items: center; gap: 6px; }
-.conversation-item-id :deep(.el-tag) { font-size: 10px; line-height: 16px; }
+.conversation-item-id .el-tag { font-size: 10px; line-height: 16px; }
 .conversation-delete { opacity: 0; }
 .conversation-item:hover .conversation-delete, .conversation-item:focus-within .conversation-delete { opacity: 1; }
 .context-technical {
@@ -2710,20 +2993,18 @@ onBeforeUnmount(() => {
 
 @media (max-width: 1180px) {
   .agent-workspace { grid-template-columns: minmax(0, 1fr); }
+  .desktop-context-button { display: none; }
   .context-panel { display: none; }
   .mobile-context-button { display: inline-flex; }
   .message-stream { padding-inline: clamp(18px, 5vw, 52px); }
 }
 
 @media (max-width: 760px) {
-  .agent-header { align-items: flex-start; }
-  .agent-actions { width: 100%; justify-content: flex-start; }
-  .provider-select { width: 150px; }
-  .agent-workspace { border-radius: var(--ogs-radius); }
+  .provider-select { width: 98px; }
   .conversation-head { padding-inline: 14px; }
   .conversation-identity { flex: 1; }
-  .empty-terminal { width: 100%; box-sizing: border-box; }
-  .empty-terminal code { overflow: hidden; text-overflow: ellipsis; }
+  .conversation-head-actions > .head-action-button { display: none; }
+  .conversation-head-actions > .mobile-head-menu { display: inline-flex; }
   .message-stream { padding: 20px 14px; }
   .prompt-grid { grid-template-columns: 1fr; }
   .agent-empty { justify-content: flex-start; padding-top: 28px; }
@@ -2731,11 +3012,23 @@ onBeforeUnmount(() => {
   .message-body { max-width: calc(100% - 38px); }
   .tool-event { width: calc(100% - 38px); margin-left: 38px; }
   .composer-shell { padding: 11px 12px 13px; }
+  .composer { padding-inline: 6px; }
+  .composer-toolbar { gap: 5px; }
+  .composer-actions, .composer-controls { gap: 4px; }
+  .autonomy-mode-trigger { min-width: 86px; max-width: 94px; padding-inline: 6px !important; }
+  .autonomy-mode-trigger .el-icon:first-child { display: none; }
+  .context-mode-select { width: 58px; }
+  .context-mode-select .el-select__wrapper { padding-inline: 6px; font-size: 10.5px; }
+  .provider-status { display: none; }
+  .send-button { width: 32px; height: 32px; }
+  .custom-category-grid { grid-template-columns: 1fr; }
   .composer-hint span:first-child { display: none; }
   .composer-hint { justify-content: flex-end; }
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .agent-workspace,
+  .context-panel { transition: none; }
   .message-stream { scroll-behavior: auto; }
   .prompt-card,
   .stream-caret,

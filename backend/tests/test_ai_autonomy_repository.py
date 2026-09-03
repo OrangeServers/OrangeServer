@@ -55,6 +55,13 @@ class FakePlatform:
     def validate_asset_ids(self, asset_ids):
         return self.state["asset_ok"]
 
+    def validate_asset_sys_user_id_pair(self, asset_ids, sys_user_id):
+        return (
+            self.state.get("pair_ok", True)
+            and self.state["asset_ok"]
+            and self.state["credential_ok"]
+        )
+
     def resolve_system_user(self, sys_user_id):
         if not self.state["credential_ok"]:
             return None
@@ -81,6 +88,7 @@ def repo_env(monkeypatch):
     platform_state = {
         "asset_ok": True,
         "credential_ok": True,
+        "pair_ok": True,
         "calls": [],
     }
 
@@ -171,6 +179,24 @@ def test_alert_trigger_roundtrip_and_unique_idempotency(repo_env):
         "admin", "alertmanager", "a" * 64,
     )["id"] == run["id"]
 
+    repo.record_evidence(
+        "admin", run["id"],
+        kind="alert_observation",
+        summary="Alertmanager firing: nginx",
+        event_type="alert_firing",
+    )
+    listed = repo.list_runs("admin")[0]
+    assert listed["alert_state"] == "firing"
+    assert listed["alert_updated_at"] is not None
+
+    repo.record_evidence(
+        "admin", run["id"],
+        kind="alert_observation",
+        summary="Alertmanager reported resolved",
+        event_type="alert_resolved",
+    )
+    assert repo.list_runs("admin")[0]["alert_state"] == "resolved"
+
     row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
     row.status = "completed"
     repo_env["session"].commit()
@@ -184,6 +210,40 @@ def test_alert_trigger_roundtrip_and_unique_idempotency(repo_env):
             trigger_type="alertmanager",
             trigger_ref="a" * 64,
         )
+
+
+def test_list_runs_keeps_old_active_run_ahead_of_recent_history(repo_env):
+    repo = repo_env["repo"]
+    session = repo_env["session"]
+    for index in range(51):
+        run = repo.create_run(
+            "admin", "admin",
+            goal=f"closed run {index}",
+            host_id=repo_env["host_id"],
+            system_user_id=19,
+            mode="ask",
+        )
+        row = session.get(t_ai_autonomous_run, run["id"])
+        row.status = "completed"
+        row.completed_at = datetime.datetime(2026, 8, 30, 0, index)
+        session.commit()
+
+    active = repo.create_run(
+        "admin", "admin",
+        goal="old active run",
+        host_id=repo_env["host_id"],
+        system_user_id=19,
+        mode="ask",
+    )
+    active_row = session.get(t_ai_autonomous_run, active["id"])
+    active_row.created_at = datetime.datetime(2025, 1, 1)
+    session.commit()
+
+    listed = repo.list_runs("admin")
+
+    assert len(listed) == 50
+    assert listed[0]["id"] == active["id"]
+    assert listed[0]["status"] == "draft"
 
 
 def test_external_evidence_appends_timeline_event(repo_env):
@@ -607,6 +667,17 @@ def test_create_run_maps_active_host_unique_violation(
         )
 
 
+def test_create_run_requires_combined_asset_credential_authorization(repo_env):
+    """Separate grants must not authorize an invalid host/credential pair."""
+    repo_env["platform_state"]["pair_ok"] = False
+    with pytest.raises(AutonomyPermissionError, match="asset and credential"):
+        repo_env["repo"].create_run(
+            "admin", "admin",
+            goal="diagnose", host_id=repo_env["host_id"],
+            system_user_id=19, mode="ask",
+        )
+
+
 def test_create_run_does_not_remap_unrelated_integrity_error(
     repo_env, monkeypatch,
 ):
@@ -710,13 +781,28 @@ def test_cancel_queued_run_is_atomic_terminal_and_releases_host(repo_env):
     ]
 
 
-def test_cancel_requires_owner_and_admin_role(repo_env):
+def test_cancel_allows_user_owner_and_keeps_cross_owner_boundary(repo_env):
     repo = repo_env["repo"]
-    run = repo_env["create_started_run"]()
+    session = repo_env["session"]
+    host = t_host(
+        alias="web-02", host_ip="203.0.113.11", host_port=22,
+        ai_environment="production",
+    )
+    session.add(host)
+    session.commit()
+    run = repo.create_run(
+        "bob", "user", goal="user-owned run", host_id=int(host.id),
+        system_user_id=19, mode="ask",
+    )
     with pytest.raises(AutonomyNotFound):
         repo.request_cancel("someone-else", "admin", run["id"])
     with pytest.raises(AutonomyPermissionError):
-        repo.request_cancel("admin", "user", run["id"])
+        repo.request_cancel("bob", "support", run["id"])
+
+    repo_env["platform_state"]["asset_ok"] = False
+    repo_env["platform_state"]["credential_ok"] = False
+    cancelled = repo.request_cancel("bob", "user", run["id"])
+    assert cancelled["status"] == "cancelled"
 
 
 def test_cancel_draft_is_terminal_without_permission_revalidation(repo_env):
@@ -782,6 +868,32 @@ def test_run_is_owner_scoped(repo_env):
         repo_env["repo"].get_run("someone-else", run["id"])
     with pytest.raises(AutonomyNotFound):
         repo_env["repo"].start_run("someone-else", "admin", run["id"])
+
+
+def test_snapshot_exposes_bounded_pre_step_failure_reason(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    row.status = "failed"
+    repo.append_event(row, "planner_failed", {
+        "note": (
+            "provider failed; Authorization: Bearer top-secret "
+            "password=orange -----BEGIN PRIVATE KEY-----abc"
+            "-----END PRIVATE KEY-----"
+        ),
+    })
+    repo_env["session"].commit()
+
+    snapshot = repo.snapshot("admin", run["id"])
+
+    assert snapshot["steps"] == []
+    reason = snapshot["failure_reason"]
+    assert "top-secret" not in reason
+    assert "orange" not in reason
+    assert "abc" not in reason
+    assert "Authorization: Bearer [REDACTED]" in reason
+    assert "password=[REDACTED]" in reason
+    assert "[REDACTED PRIVATE KEY]" in reason
 
 
 # ---------------------------------------------------------------------------

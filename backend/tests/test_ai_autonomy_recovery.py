@@ -35,6 +35,7 @@ from app.core.db.database import (
     t_ai_autonomous_evidence,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
+    t_acc_user,
     t_group,
     t_host,
 )
@@ -48,6 +49,9 @@ class FakePlatform:
         pass
 
     def validate_asset_ids(self, asset_ids):
+        return True
+
+    def validate_asset_sys_user_id_pair(self, asset_ids, sys_user_id):
         return True
 
     def resolve_system_user(self, sys_user_id):
@@ -92,12 +96,18 @@ def env(monkeypatch, tmp_path):
     db.metadata.create_all(
         engine,
         tables=[t_group.__table__, t_host.__table__,
+                t_acc_user.__table__,
                 t_ai_autonomous_run.__table__,
                 t_ai_autonomous_step.__table__,
                 t_ai_autonomous_event.__table__,
                 t_ai_autonomous_artifact.__table__,
                 t_ai_autonomous_evidence.__table__],
     )
+    session.add(t_acc_user(
+        alias="Administrator", name="admin", password="fake-hash",
+        usrole="admin", mail="admin@example.com", group="admins",
+    ))
+    session.commit()
 
     repo = AutonomyRepository(
         session, SECRET_KEY,

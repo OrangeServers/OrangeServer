@@ -145,15 +145,11 @@ TOOL_DEFINITIONS = {
         "创建 AI 自治任务草稿（仅落库，绝不执行）。创建后由用户在自治任务"
         "工作台打开并自行决定是否启动；聊天侧不能启动、批准或取消。"
         "host_id 与 system_user_id 必须来自已有查询工具返回的授权 ID。"
-        "自定义模式需在工作台配置动作类别，不能在聊天中创建。",
+        "审批档案由用户在当前对话中选择，模型不能设置或更改。",
         {
             "goal": {"type": "string", "minLength": 1, "maxLength": 512},
             "host_id": {"type": "integer", "minimum": 1},
             "system_user_id": {"type": "integer", "minimum": 1},
-            "mode": {
-                "type": "string",
-                "enum": ["ask", "ai_review", "auto"],
-            },
         },
         required=["goal", "host_id", "system_user_id"],
     ),
@@ -174,8 +170,7 @@ TOOL_DEFINITIONS = {
 
 
 ADMIN_ONLY_TOOLS = frozenset({
-    "search_accounts", "search_audit_logs", "create_autonomy_draft",
-    "search_knowledge",
+    "search_accounts", "search_audit_logs",
 })
 
 
@@ -188,6 +183,8 @@ class ToolRegistry:
         owner: str,
         role: str,
         conversation_id: str,
+        autonomy_mode: str = "ask",
+        autonomy_profile: Optional[Dict[str, Any]] = None,
         command_checker: Optional[Callable[[str], Optional[str]]] = None,
         diagnostic_executor: Optional[
             Callable[[Dict[str, Any]], Dict[str, Any]]
@@ -198,6 +195,28 @@ class ToolRegistry:
         self.owner = owner
         self.role = role
         self.conversation_id = conversation_id
+        from app.ai.autonomy.repository import (
+            AutonomyValidationError,
+            parse_custom_profile,
+        )
+        from app.ai.autonomy.state import (
+            AutonomyStateError,
+            CANONICAL_RUN_MODES,
+            RunMode,
+            normalize_run_mode,
+        )
+        try:
+            mode = normalize_run_mode(autonomy_mode or RunMode.ASK.value)
+            if mode not in CANONICAL_RUN_MODES:
+                raise AutonomyStateError("non-canonical conversation mode")
+            profile = (
+                parse_custom_profile(autonomy_profile)
+                if mode == RunMode.CUSTOM else None
+            )
+        except (AutonomyStateError, AutonomyValidationError):
+            mode, profile = RunMode.ASK, None
+        self.autonomy_mode = mode.value
+        self.autonomy_profile = profile
         self.command_checker = command_checker or self._default_command_checker
         self.diagnostic_executor = diagnostic_executor
 
@@ -301,6 +320,10 @@ class ToolRegistry:
 
         if not AI_AUTONOMY_ENABLED:
             raise ToolNotAllowed("autonomy feature is disabled")
+        if {"mode", "autonomy_mode", "autonomy_profile", "profile"} & set(arguments):
+            raise ToolValidationError(
+                "autonomy permission is selected by the user for this conversation"
+            )
         goal = str(arguments.get("goal") or "").strip()
         if not goal:
             raise ToolValidationError("missing required fields: goal")
@@ -311,11 +334,6 @@ class ToolRegistry:
             raise ToolValidationError(
                 "host_id and system_user_id must be integers"
             ) from None
-        mode = str(arguments.get("mode") or "ask").strip() or "ask"
-        if mode not in ("ask", "ai_review", "auto"):
-            raise ToolValidationError(
-                "chat can only create ask/ai_review/auto drafts"
-            )
         try:
             run = AutonomyRepository(db.session, FLASK_SECRET_KEY).create_run(
                 self.owner,
@@ -323,9 +341,9 @@ class ToolRegistry:
                 goal=goal,
                 host_id=host_id,
                 system_user_id=system_user_id,
-                mode=mode,
+                mode=self.autonomy_mode,
                 budget_payload=None,
-                profile_payload=None,
+                profile_payload=self.autonomy_profile,
                 trigger_type="chat",
                 trigger_summary="AI chat draft",
             )
@@ -346,15 +364,19 @@ class ToolRegistry:
         except Exception as exc:
             db.session.rollback()
             raise ToolError("autonomy draft creation failed") from exc
-        return {
-            "autonomy_draft": {
-                "run_id": run["id"],
-                "goal": run["goal"],
-                "status": run["status"],
-                "mode": run["mode"],
-                "host_alias": run.get("host_alias") or "",
-            },
+        draft = {
+            "run_id": run["id"],
+            "goal": run["goal"],
+            "status": run["status"],
+            "mode": run["mode"],
+            "host_alias": run.get("host_alias") or "",
         }
+        if run["mode"] == "custom":
+            profile = run.get("custom_profile") or self.autonomy_profile or {}
+            draft["action_categories"] = list(
+                profile.get("action_categories") or []
+            )
+        return {"autonomy_draft": draft}
 
     def _run_diagnostic(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         required = ("profile_id", "result_set_id", "system_user_id")
@@ -383,9 +405,26 @@ class ToolRegistry:
 class PlatformQueryService:
     """Thin, request-independent queries over existing OrangeServer models."""
 
-    def __init__(self, owner: str, role: str):
+    def __init__(self, owner: str, role: str, session=None):
         self.owner = owner
         self.role = role
+        self.session = session
+
+    def _query(self, model):
+        return self.session.query(model) if self.session is not None else model.query
+
+    def _active_auth_ids(self, auth_ids: Iterable[int]) -> Set[int]:
+        from app.core.db.database import t_auth_host
+
+        if not auth_ids:
+            return set()
+        return {
+            int(row.id)
+            for row in self._query(t_auth_host).filter(
+                t_auth_host.id.in_(auth_ids),
+                t_auth_host.is_deleted.is_(False),
+            ).all()
+        }
 
     def _allowed_groups(self) -> Set[str]:
         from app.core.db.database import (
@@ -399,23 +438,32 @@ class PlatformQueryService:
         if self.role == "admin":
             return {
                 row.name
-                for row in t_group.query.filter_by(is_deleted=False).all()
+                for row in self._query(t_group).filter_by(
+                    is_deleted=False,
+                ).all()
             }
         auth_ids = {
             row.auth_id
-            for row in t_auth_host_user.query.filter_by(user_name=self.owner).all()
+            for row in self._query(t_auth_host_user).filter_by(
+                user_name=self.owner,
+            ).all()
         }
-        user = t_acc_user.query.filter_by(name=self.owner, is_deleted=False).first()
+        user = self._query(t_acc_user).filter_by(
+            name=self.owner, is_deleted=False,
+        ).first()
         if user and user.group:
             auth_ids.update(
                 row.auth_id
-                for row in t_auth_host_user_group.query.filter_by(group_name=user.group).all()
+                for row in self._query(t_auth_host_user_group).filter_by(
+                    group_name=user.group,
+                ).all()
             )
+        auth_ids = self._active_auth_ids(auth_ids)
         if not auth_ids:
             return set()
         return {
             row.group_name
-            for row in t_auth_host_host_group.query.filter(
+            for row in self._query(t_auth_host_host_group).filter(
                 t_auth_host_host_group.auth_id.in_(auth_ids)
             ).all()
         }
@@ -429,17 +477,21 @@ class PlatformQueryService:
 
         auth_ids = {
             int(row.auth_id)
-            for row in t_auth_host_user.query.filter_by(user_name=self.owner).all()
+            for row in self._query(t_auth_host_user).filter_by(
+                user_name=self.owner,
+            ).all()
         }
-        user = t_acc_user.query.filter_by(name=self.owner, is_deleted=False).first()
+        user = self._query(t_acc_user).filter_by(
+            name=self.owner, is_deleted=False,
+        ).first()
         if user and user.group:
             auth_ids.update(
                 int(row.auth_id)
-                for row in t_auth_host_user_group.query.filter_by(
+                for row in self._query(t_auth_host_user_group).filter_by(
                     group_name=user.group
                 ).all()
             )
-        return auth_ids
+        return self._active_auth_ids(auth_ids)
 
     def authorized_system_user_aliases(self) -> Set[str]:
         from app.core.db.database import (
@@ -453,23 +505,32 @@ class PlatformQueryService:
         if self.role == "admin":
             return {
                 row.alias
-                for row in t_sys_user.query.filter_by(is_deleted=False).all()
+                for row in self._query(t_sys_user).filter_by(
+                    is_deleted=False,
+                ).all()
             }
         auth_ids = {
             row.auth_id
-            for row in t_auth_host_user.query.filter_by(user_name=self.owner).all()
+            for row in self._query(t_auth_host_user).filter_by(
+                user_name=self.owner,
+            ).all()
         }
-        user = t_acc_user.query.filter_by(name=self.owner, is_deleted=False).first()
+        user = self._query(t_acc_user).filter_by(
+            name=self.owner, is_deleted=False,
+        ).first()
         if user and user.group:
             auth_ids.update(
                 row.auth_id
-                for row in t_auth_host_user_group.query.filter_by(group_name=user.group).all()
+                for row in self._query(t_auth_host_user_group).filter_by(
+                    group_name=user.group,
+                ).all()
             )
+        auth_ids = self._active_auth_ids(auth_ids)
         if not auth_ids:
             return set()
         return {
             row.sys_user_alias
-            for row in t_auth_host_sys_user.query.filter(
+            for row in self._query(t_auth_host_sys_user).filter(
                 t_auth_host_sys_user.auth_id.in_(auth_ids)
             ).all()
         }
@@ -481,7 +542,7 @@ class PlatformQueryService:
             credential_id = int(sys_user_id)
         except (TypeError, ValueError):
             return None
-        row = t_sys_user.query.filter_by(
+        row = self._query(t_sys_user).filter_by(
             id=credential_id,
             is_deleted=False,
         ).first()
@@ -509,6 +570,7 @@ class PlatformQueryService:
                 username=self.owner,
                 role=self.role,
                 host_ids=asset_ids,
+                session=self.session,
             )
             return True
         except BatchOperationValidationError:
@@ -530,6 +592,7 @@ class PlatformQueryService:
                 role=self.role,
                 host_ids=asset_ids,
                 sys_user=sys_user,
+                session=self.session,
             )
             return True
         except BatchOperationValidationError:
@@ -547,6 +610,21 @@ class PlatformQueryService:
                 asset_ids,
                 str(credential["alias"]),
             )
+        )
+
+    def authorized_knowledge_scopes(self) -> tuple[str, ...]:
+        """Return server-derived global and currently visible host scopes."""
+        from app.core.db.database import t_host
+
+        query = self._query(t_host).filter(t_host.is_deleted.is_(False))
+        if self.role != "admin":
+            allowed_groups = self._allowed_groups()
+            if not allowed_groups:
+                return ("global",)
+            query = query.filter(t_host.group.in_(allowed_groups))
+        host_ids = sorted(int(row.id) for row in query.all())
+        return ("global",) + tuple(
+            f"host:{host_id}" for host_id in host_ids
         )
 
     def get_platform_overview(self, _arguments: Dict[str, Any]) -> ToolData:
@@ -708,7 +786,7 @@ class PlatformQueryService:
                 "agreement": row.agreement,
                 "remarks": row.remarks,
             }
-            for row in t_sys_user.query.filter(
+            for row in self._query(t_sys_user).filter(
                 t_sys_user.alias.in_(aliases),
                 t_sys_user.is_deleted.is_(False),
             ).order_by(t_sys_user.alias.asc()).all()

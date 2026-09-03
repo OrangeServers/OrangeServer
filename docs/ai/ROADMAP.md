@@ -57,8 +57,9 @@ Alertmanager → Prometheus/SSH → Autonomy Run 闭环；S2 增加只索引审�
 也不新增默认监控或向量数据库容器。
 
 当前 Unreleased 已完成 S0、S1 和 S2 实现：单条 Alertmanager 告警入口、固定
-Prometheus 可用性观察、Run 触发契约、运维态势首页，以及只索引审核 Runbook 与
-独立验证 Run 的本地/远程 embedding 知识库。测试机真实告警、并行 Run、知识复用与
+Prometheus 可用性观察、Run 触发契约、运维状态聚合，以及只索引审核 Runbook 与
+独立验证 Run 的本地/远程 embedding 知识库。AI 运维入口已统一为 Agent 工作台、
+分组任务和告警视图，知识库保持独立一级入口。测试机真实告警、并行 Run、知识复用与
 从零四容器纵向验收仍由 Issue #25 跟踪，未完成前不视为 M2 发布门通过。
 
 - Prometheus 和 Loki 请求必须经过服务端查询代理；模型不能提供任意 URL、Header、
@@ -101,11 +102,13 @@ Prometheus 可用性观察、Run 触发契约、运维态势首页，以及只�
 
 ### 产品形态
 
-M1 增加独立的自治任务工作台，已实现路由为 `/ai-runs` 和
-`/ai-runs/:runId`。现有 AI 对话只增加“创建自治任务草稿”和“打开任务”的引用卡；
-模型不能从聊天直接启动任务。
+当前产品将自治任务融入 AI 运维工作台，路由为 `/ai-ops`、`/ai-ops/tasks`、
+`/ai-ops/tasks/:runId` 和 `/ai-ops/alerts`，旧 `/ai-agent` 与 `/ai-runs*` 地址保留
+重定向。现有 AI 对话只增加“创建自治任务草稿”和“打开任务”的引用卡；模型不能从
+聊天绕过工作台直接执行远程写操作。
 
-v1 仅管理员可用，一次 Run 固定一个目标资产、一个系统用户和一个 Agent。Run 启动后，
+管理员和普通用户都可以管理自己拥有、且资产与系统凭据组合已授权的 Run；跨 owner
+访问保持拒绝。一次 Run 固定一个目标资产、一个系统用户和一个 Agent。Run 启动后，
 模型不能改变目标、凭据、模式或服务端预算。同一资产最多存在一个活动自治 Run。
 
 ### 模块职责

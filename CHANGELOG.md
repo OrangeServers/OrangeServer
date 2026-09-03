@@ -19,8 +19,23 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- AI operations now uses a Codex-style workbench with grouped task and alert
+  views, a collapsible recent-task rail, an in-place evidence and raw-output
+  inspector, on-demand run context, compact mobile actions, legacy-route
+  redirects, and a separate first-level knowledge destination. Task rows now
+  lead with a readable target and next action; alert groups show Alertmanager's
+  latest firing/resolved state separately from Run outcome. Terminal failures
+  now lead with the blocking step instead of a pending-conclusion message;
+  task, knowledge, and evidence read failures remain visible instead of being
+  presented as empty or zero-result states.
+  Authorized users can manage their own Runs and search scoped knowledge;
+  knowledge mutations remain administrator-only.
 - Chat now handles query, explanation, diagnosis, and Autonomy Run drafts;
   every remote write is executed through the existing approval-gated Run path.
+  Its composer now offers four real operations starters and a user-owned
+  `ask`/`ai_review`/`auto`/`custom` permission selector. The server stores and
+  enforces that conversation profile for future drafts, so the model cannot
+  choose or widen execution permissions.
 - The Autonomy Worker keeps Celery prefork and defaults to two configurable
   execution slots. DeepSeek reasoning is preserved across tool-call turns.
 - The standard Compose deployment now serves the bundled SPA from the app
@@ -42,6 +57,10 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Existing and renamed administrator accounts now retain direct permission
   bindings used by asset and automation authorization, and the upgrade
   migration backfills custom admin names into the existing all-access rule.
+- The Run composer now loads owner-scoped credential options for normal users
+  instead of calling an administrator-only credential-management endpoint.
+  Conversation profile changes and Agent turns share the existing run lock so
+  neither can overwrite the other's Redis conversation state.
 
 ## [1.1.1] - 2026-08-19
 

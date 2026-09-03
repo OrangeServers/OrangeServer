@@ -72,22 +72,42 @@ const routes: RouteRecordRaw[] = [
         meta: { titleKey: 'menu.batchScript' },
       },
       {
-        path: 'ai-agent',
-        name: 'AIAgent',
-        component: () => import('@/views/AIAgent.vue'),
+        path: 'ai-ops',
+        component: () => import('@/views/AiOpsShell.vue'),
         meta: { titleKey: 'menu.aiAgent' },
+        children: [
+          {
+            path: '',
+            name: 'AiOpsWorkbench',
+            component: () => import('@/views/AIAgent.vue'),
+            meta: { titleKey: 'menu.aiAgent' },
+          },
+          {
+            path: 'tasks',
+            name: 'AiOpsTasks',
+            component: () => import('@/views/AiRuns.vue'),
+            meta: { titleKey: 'menu.aiRuns' },
+          },
+          {
+            path: 'tasks/:runId',
+            name: 'AiOpsRunDetail',
+            component: () => import('@/views/AiRunDetail.vue'),
+            meta: { titleKey: 'menu.aiRuns' },
+          },
+          {
+            path: 'alerts',
+            name: 'AiOpsAlerts',
+            component: () => import('@/views/AiRuns.vue'),
+            props: { alertsOnly: true },
+            meta: { titleKey: 'aiRuns.alerts.title' },
+          },
+        ],
       },
-      {
-        path: 'ai-runs',
-        name: 'AiRuns',
-        component: () => import('@/views/AiRuns.vue'),
-        meta: { titleKey: 'menu.aiRuns' },
-      },
+      { path: 'ai-agent', redirect: { name: 'AiOpsWorkbench' } },
+      { path: 'ai-runs', redirect: { name: 'AiOpsTasks' } },
       {
         path: 'ai-runs/:runId',
-        name: 'AiRunDetail',
-        component: () => import('@/views/AiRunDetail.vue'),
-        meta: { titleKey: 'menu.aiRuns' },
+        redirect: to => ({ name: 'AiOpsRunDetail', params: { runId: to.params.runId } }),
       },
       {
         path: 'ai-knowledge',
@@ -113,11 +133,13 @@ const router: Router = createRouter({
 })
 
 // 需要 admin 角色的路由
-const adminRoutes: readonly string[] = ['/authority', '/settings', '/user-list', '/user-group', '/sys-user', '/batch-script', '/ai-runs', '/ai-knowledge']
+const adminRoutes: readonly string[] = ['/authority', '/settings', '/user-list', '/user-group', '/sys-user', '/batch-script']
 // 需要 admin 或 audit 角色的路由
 const auditRoutes: readonly string[] = ['/log-login', '/log-exec', '/log-op']
 // 需要 admin 或 user 角色的运维路由
-const operatorRoutes: readonly string[] = ['/ai-agent', '/batch-command']
+const operatorRoutes: readonly string[] = [
+  '/ai-ops', '/ai-knowledge', '/ai-agent', '/ai-runs', '/batch-command',
+]
 
 // 守卫匹配：精确命中或子路径命中（/ai-runs/:runId 这类参数路由按路由族前缀匹配）
 function matchesGuard(routes: readonly string[], path: string): boolean {

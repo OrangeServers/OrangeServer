@@ -239,6 +239,25 @@ def test_search_enforces_global_and_current_host_scopes(knowledge_env):
     assert ('ogs', 'knowledge', 'host:7') in store.search_namespaces
 
 
+def test_list_documents_filters_metadata_by_requested_scopes(knowledge_env):
+    _session, _store, service = knowledge_env
+    global_doc = service.create_document('admin', {
+        'title': 'Global runbook', 'scope': 'global', 'content': 'global',
+    })
+    host_doc = service.create_document('admin', {
+        'title': 'Host runbook', 'scope': 'host:7', 'content': 'host seven',
+    })
+    service.create_document('admin', {
+        'title': 'Other host runbook', 'scope': 'host:8',
+        'content': 'host eight',
+    })
+
+    documents = service.list_documents(scopes=('global', 'host:7'))
+
+    assert {item['id'] for item in documents} == {global_doc['id'], host_doc['id']}
+    assert all('content' not in item for item in documents)
+
+
 def test_previous_index_layout_is_stale_until_rebuilt(knowledge_env):
     session, store, service = knowledge_env
     service.create_document('admin', {

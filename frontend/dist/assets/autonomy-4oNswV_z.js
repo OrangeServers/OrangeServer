@@ -1,0 +1,1 @@
+var e=[`file_read`,`file_patch`,`file_restore`,`package_install`,`shell`,`systemd`],t=[`completed`,`failed`,`cancelled`,`expired`];function n(e){return t.includes(e)}export{n,e as t};

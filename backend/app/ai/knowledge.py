@@ -370,10 +370,22 @@ class KnowledgeService:
             result['content'] = row.content
         return result
 
-    def list_documents(self) -> list[dict[str, Any]]:
+    def list_documents(
+        self, scopes: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
         from app.core.db.database import t_ai_knowledge_document
 
-        rows = self.session.query(t_ai_knowledge_document).order_by(
+        query = self.session.query(t_ai_knowledge_document)
+        if scopes is not None:
+            allowed_scopes = tuple(dict.fromkeys(
+                _document_scope(scope) for scope in scopes
+            ))
+            if not allowed_scopes:
+                return []
+            query = query.filter(
+                t_ai_knowledge_document.scope.in_(allowed_scopes),
+            )
+        rows = query.order_by(
             t_ai_knowledge_document.updated_at.desc(),
         ).limit(200).all()
         return [self._document_dict(row, include_content=False) for row in rows]
@@ -652,7 +664,13 @@ class KnowledgeService:
         from app.core.db.database import t_ai_knowledge_document
 
         query = _bounded_text(query, 'query', 512)
-        limit = max(1, min(int(limit), MAX_RESULTS))
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise KnowledgeValidationError('limit must be an integer') from exc
+        if limit < 1:
+            raise KnowledgeValidationError('limit must be at least 1')
+        limit = min(limit, MAX_RESULTS)
         allowed_scopes = tuple(dict.fromkeys(
             _document_scope(scope) for scope in scopes
         ))

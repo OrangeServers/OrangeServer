@@ -12,6 +12,18 @@ from app.ai.context import normalize_context_mode
 
 CONVERSATION_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_CONVERSATIONS_PER_USER = 20
+_LOCK_REFRESH_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"""
+_LOCK_RELEASE_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 class AgentStoreError(RuntimeError):
@@ -82,6 +94,8 @@ class AgentStore:
         *,
         title: str = "新会话",
         context_mode: Optional[str] = None,
+        autonomy_mode: str = "ask",
+        autonomy_profile: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         conversation_id = uuid.uuid4().hex
         now = self.now()
@@ -92,6 +106,8 @@ class AgentStore:
             "provider_code": provider_code,
             "model": model,
             "context_mode": normalize_context_mode(context_mode),
+            "autonomy_mode": str(autonomy_mode or "ask"),
+            "autonomy_profile": copy.deepcopy(autonomy_profile),
             "summary": "",
             "messages": [],
             "events": [],
@@ -142,6 +158,7 @@ class AgentStore:
                 key: conversation.get(key)
                 for key in (
                     "id", "title", "provider_code", "model", "context_mode",
+                    "autonomy_mode", "autonomy_profile",
                     "created_at", "updated_at",
                 )
             })
@@ -197,11 +214,22 @@ class AgentStore:
         token: str,
     ) -> None:
         key = self._run_lock_key(owner, conversation_id)
-        current = self.redis.get(key)
-        if isinstance(current, bytes):
-            current = current.decode("utf-8")
-        if current == token:
-            self.redis.delete(key)
+        self.redis.eval(_LOCK_RELEASE_SCRIPT, 1, key, token)
+
+    def refresh_run_lock(
+        self,
+        owner: str,
+        conversation_id: str,
+        token: str,
+        *,
+        ttl: int = 10 * 60,
+    ) -> None:
+        key = self._run_lock_key(owner, conversation_id)
+        renewed = self.redis.eval(
+            _LOCK_REFRESH_SCRIPT, 1, key, token, max(30, int(ttl)),
+        )
+        if not renewed:
+            raise AgentStoreConflict("conversation run lock lost")
 
     def delete_conversation(self, owner: str, conversation_id: str) -> None:
         self.get_conversation(owner, conversation_id)

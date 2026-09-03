@@ -38,26 +38,23 @@ def test_admin_definitions_include_create_autonomy_draft():
     assert "create_autonomy_draft" in names
 
 
-def test_normal_user_does_not_receive_create_autonomy_draft():
+def test_normal_user_receives_create_autonomy_draft():
     from app.ai.tools import ADMIN_ONLY_TOOLS
 
     _, _, registry = _registry(role="user")
     names = {item["function"]["name"] for item in registry.definitions()}
 
-    assert "create_autonomy_draft" not in names
-    assert "create_autonomy_draft" in ADMIN_ONLY_TOOLS
+    assert "create_autonomy_draft" in names
+    assert "create_autonomy_draft" not in ADMIN_ONLY_TOOLS
 
 
-def test_normal_user_cannot_execute_create_autonomy_draft():
-    from app.ai.tools import ToolNotAllowed
+def test_create_autonomy_draft_schema_does_not_let_model_choose_mode():
+    from app.ai.tools import TOOL_DEFINITIONS
 
-    _, _, registry = _registry(role="user")
-
-    with pytest.raises(ToolNotAllowed):
-        registry.execute(
-            "create_autonomy_draft",
-            {"goal": "巡检", "host_id": 1, "system_user_id": 1},
-        )
+    properties = TOOL_DEFINITIONS["create_autonomy_draft"]["function"][
+        "parameters"
+    ]["properties"]
+    assert "mode" not in properties
 
 
 # =============================================================================
@@ -82,6 +79,7 @@ class FakeAutonomyRepository:
             "status": "draft",
             "mode": kwargs["mode"],
             "host_alias": "web-01",
+            "custom_profile": kwargs["profile_payload"],
         }
 
 
@@ -103,7 +101,7 @@ def autonomy_env(monkeypatch):
 
 
 def test_create_autonomy_draft_creates_draft_only(autonomy_env):
-    _, _, registry = _registry(role="admin")
+    _, _, registry = _registry(role="admin", autonomy_mode="ai_review")
 
     response = registry.execute(
         "create_autonomy_draft",
@@ -111,7 +109,6 @@ def test_create_autonomy_draft_creates_draft_only(autonomy_env):
             "goal": "清理 web 组磁盘",
             "host_id": 1,
             "system_user_id": 2,
-            "mode": "ai_review",
         },
     )
 
@@ -130,6 +127,26 @@ def test_create_autonomy_draft_creates_draft_only(autonomy_env):
     assert kwargs["profile_payload"] is None
     assert kwargs["trigger_type"] == "chat"
     assert kwargs["trigger_summary"] == "AI chat draft"
+
+
+def test_user_create_autonomy_draft_still_uses_existing_run_path(autonomy_env):
+    _, _, registry = _registry(role="user")
+
+    response = registry.execute(
+        "create_autonomy_draft",
+        {
+            "goal": "检查授权主机",
+            "host_id": 1,
+            "system_user_id": 2,
+        },
+    )
+
+    assert response["autonomy_draft"]["status"] == "draft"
+    (repo,) = autonomy_env
+    (owner, role, kwargs), = repo.create_run_calls
+    assert owner == "alice"
+    assert role == "user"
+    assert kwargs["trigger_type"] == "chat"
 
 
 def test_create_autonomy_draft_disabled_flag_blocks_execution(monkeypatch):
@@ -167,11 +184,32 @@ def test_create_autonomy_draft_requires_goal(autonomy_env):
     assert all(not repo.create_run_calls for repo in autonomy_env)
 
 
-def test_create_autonomy_draft_rejects_custom_mode(autonomy_env):
-    """自定义模式需要动作类别 profile，聊天侧不收集，必须拒绝。"""
+def test_create_autonomy_draft_uses_server_selected_custom_profile(autonomy_env):
+    _, _, registry = _registry(
+        role="admin",
+        autonomy_mode="custom",
+        autonomy_profile={"action_categories": ["systemd", "file_read"]},
+    )
+
+    result = registry.execute(
+        "create_autonomy_draft",
+        {"goal": "巡检", "host_id": 1, "system_user_id": 1},
+    )
+
+    assert result["autonomy_draft"]["mode"] == "custom"
+    assert result["autonomy_draft"]["action_categories"] == [
+        "systemd", "file_read",
+    ]
+    (repo,) = autonomy_env
+    assert repo.create_run_calls[0][2]["profile_payload"] == {
+        "action_categories": ["systemd", "file_read"],
+    }
+
+
+def test_create_autonomy_draft_rejects_model_mode_override(autonomy_env):
     from app.ai.tools import ToolValidationError
 
-    _, _, registry = _registry(role="admin")
+    _, _, registry = _registry(role="admin", autonomy_mode="ask")
 
     with pytest.raises(ToolValidationError):
         registry.execute(
@@ -180,9 +218,10 @@ def test_create_autonomy_draft_rejects_custom_mode(autonomy_env):
                 "goal": "巡检",
                 "host_id": 1,
                 "system_user_id": 1,
-                "mode": "custom",
+                "mode": "auto",
             },
         )
+    assert all(not repo.create_run_calls for repo in autonomy_env)
 
 
 def test_create_autonomy_draft_conflict_becomes_readable_validation_error(
@@ -259,7 +298,6 @@ def test_runner_emits_and_persists_autonomy_draft_reference_card(
                             "goal": "清理磁盘",
                             "host_id": 1,
                             "system_user_id": 2,
-                            "mode": "ask",
                         },
                     ),),
                     used_stream=False,
@@ -272,7 +310,13 @@ def test_runner_emits_and_persists_autonomy_draft_reference_card(
         pass
 
     store = AgentStore(FakeRedis())
-    conversation = store.create_conversation("alice", "minimax", "demo")
+    conversation = store.create_conversation(
+        "alice",
+        "minimax",
+        "demo",
+        autonomy_mode="custom",
+        autonomy_profile={"action_categories": ["systemd"]},
+    )
     monkeypatch.setattr(
         runner_module,
         "PlatformQueryService",
@@ -322,7 +366,8 @@ def test_runner_emits_and_persists_autonomy_draft_reference_card(
     assert card["run_id"] == "run-draft-1"
     assert card["goal"] == "清理磁盘"
     assert card["status"] == "draft"
-    assert card["mode"] == "ask"
+    assert card["mode"] == "custom"
+    assert card["action_categories"] == ["systemd"]
 
     # 持久化：刷新页面后仍能恢复引用卡
     saved = store.get_conversation("alice", conversation["id"])
@@ -336,7 +381,10 @@ def test_runner_emits_and_persists_autonomy_draft_reference_card(
     # 边界：聊天侧只调用过 create_run，没有任何 Run 生命周期操作
     (repo,) = autonomy_env
     assert len(repo.create_run_calls) == 1
-    assert repo.create_run_calls[0][2]["mode"] == "ask"
+    assert repo.create_run_calls[0][2]["mode"] == "custom"
+    assert repo.create_run_calls[0][2]["profile_payload"] == {
+        "action_categories": ["systemd"],
+    }
 
 
 # =============================================================================
@@ -361,7 +409,8 @@ def test_conversation_detail_exposes_autonomy_drafts(monkeypatch):
             "run_id": "run-1",
             "goal": "清理日志",
             "status": "draft",
-            "mode": "ai_review",
+            "mode": "custom",
+            "action_categories": ["file_read", "systemd"],
             "host_alias": "web-01",
             "created_at": "2026-08-13T02:00:00+00:00",
         },
@@ -380,7 +429,158 @@ def test_conversation_detail_exposes_autonomy_drafts(monkeypatch):
         "run_id": "run-1",
         "goal": "清理日志",
         "status": "draft",
-        "mode": "ai_review",
+        "mode": "custom",
+        "action_categories": ["file_read", "systemd"],
         "host_alias": "web-01",
         "created_at": "2026-08-13T02:00:00+00:00",
     }]
+
+
+def test_conversation_api_persists_and_updates_authoritative_autonomy_profile(
+    monkeypatch,
+):
+    from flask import Flask
+
+    from app.ai import views
+    from app.ai.storage import AgentStore
+
+    class FakeProviders:
+        def configured_row(self, _code):
+            return SimpleNamespace(provider_code="minimax", model="demo")
+
+        def context_mode(self, _row, _value):
+            return "standard_256k"
+
+    store = AgentStore(FakeRedis())
+    monkeypatch.setattr(views, "_identity", lambda: (None, "alice", "admin"))
+    monkeypatch.setattr(views, "_store", lambda: store)
+    monkeypatch.setattr(views, "ProviderConfigService", FakeProviders)
+    app = Flask(__name__)
+
+    with app.test_request_context(json={
+        "provider_code": "minimax",
+        "autonomy_mode": "custom",
+        "autonomy_profile": {"action_categories": ["systemd"]},
+    }):
+        created = views.create_conversation().get_json()["conversation"]
+
+    assert created["autonomy_mode"] == "custom"
+    assert created["autonomy_profile"] == {"action_categories": ["systemd"]}
+
+    with app.test_request_context(json={"autonomy_mode": "ai_review"}):
+        updated = views.update_conversation(created["id"]).get_json()["conversation"]
+
+    assert updated["autonomy_mode"] == "ai_review"
+    assert updated["autonomy_profile"] is None
+    restored = store.get_conversation("alice", created["id"])
+    assert restored["autonomy_mode"] == "ai_review"
+    assert restored["autonomy_profile"] is None
+
+
+@pytest.mark.parametrize("payload", [
+    {"autonomy_mode": "unknown"},
+    {"autonomy_mode": None},
+    {"autonomy_mode": ""},
+    {"autonomy_mode": False},
+    {"autonomy_mode": 0},
+    {"autonomy_mode": "custom"},
+    {
+        "autonomy_mode": "custom",
+        "autonomy_profile": {"action_categories": ["unknown"]},
+    },
+    {
+        "autonomy_mode": "ask",
+        "autonomy_profile": {"action_categories": ["systemd"]},
+    },
+])
+def test_conversation_api_rejects_invalid_autonomy_profiles(monkeypatch, payload):
+    from flask import Flask
+
+    from app.ai import views
+    from app.ai.storage import AgentStore
+
+    class FakeProviders:
+        def configured_row(self, _code):
+            return SimpleNamespace(provider_code="minimax", model="demo")
+
+        def context_mode(self, _row, _value):
+            return "standard_256k"
+
+    store = AgentStore(FakeRedis())
+    monkeypatch.setattr(views, "_identity", lambda: (None, "alice", "admin"))
+    monkeypatch.setattr(views, "_store", lambda: store)
+    monkeypatch.setattr(views, "ProviderConfigService", FakeProviders)
+    app = Flask(__name__)
+
+    with app.test_request_context(json={"provider_code": "minimax", **payload}):
+        response = views.create_conversation()
+
+    assert response[1] == 400
+    assert store.list_conversations("alice") == []
+
+
+def test_conversation_autonomy_update_is_owner_scoped(monkeypatch):
+    from flask import Flask
+
+    from app.ai import views
+    from app.ai.storage import AgentStore
+
+    store = AgentStore(FakeRedis())
+    conversation = store.create_conversation("alice", "minimax", "demo")
+    monkeypatch.setattr(views, "_identity", lambda: (None, "bob", "user"))
+    monkeypatch.setattr(views, "_store", lambda: store)
+    app = Flask(__name__)
+
+    with app.test_request_context(json={"autonomy_mode": "auto"}):
+        response = views.update_conversation(conversation["id"])
+
+    assert response[1] == 404
+    assert store.get_conversation("alice", conversation["id"])["autonomy_mode"] == "ask"
+
+
+def test_conversation_autonomy_update_rejects_an_active_run(monkeypatch):
+    from flask import Flask
+
+    from app.ai import views
+    from app.ai.storage import AgentStore
+
+    store = AgentStore(FakeRedis())
+    conversation = store.create_conversation("alice", "minimax", "demo")
+    lock_token = store.acquire_run_lock("alice", conversation["id"])
+    monkeypatch.setattr(views, "_identity", lambda: (None, "alice", "user"))
+    monkeypatch.setattr(views, "_store", lambda: store)
+    app = Flask(__name__)
+
+    try:
+        with app.test_request_context(json={"autonomy_mode": "ai_review"}):
+            response = views.update_conversation(conversation["id"])
+
+        assert response[1] == 409
+        assert store.get_conversation(
+            "alice", conversation["id"]
+        )["autonomy_mode"] == "ask"
+    finally:
+        store.release_run_lock("alice", conversation["id"], lock_token)
+
+
+def test_old_conversation_without_autonomy_fields_defaults_to_ask(monkeypatch):
+    from flask import Flask
+
+    from app.ai import views
+    from app.ai.storage import AgentStore
+
+    store = AgentStore(FakeRedis())
+    conversation = store.create_conversation("alice", "minimax", "demo")
+    legacy = store.get_conversation("alice", conversation["id"])
+    legacy.pop("autonomy_mode")
+    legacy.pop("autonomy_profile")
+    store.save_conversation("alice", legacy)
+    monkeypatch.setattr(views, "_identity", lambda: (None, "alice", "user"))
+    monkeypatch.setattr(views, "_store", lambda: store)
+    app = Flask(__name__)
+
+    with app.test_request_context():
+        detail = views.conversation_detail(conversation["id"]).get_json()["conversation"]
+
+    assert detail["autonomy_mode"] == "ask"
+    assert detail["autonomy_profile"] is None

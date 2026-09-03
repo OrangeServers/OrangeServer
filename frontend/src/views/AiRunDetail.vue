@@ -10,12 +10,12 @@
       <div class="page-title">
         <div>
           <div class="run-detail-back">
-            <el-button text size="small" :icon="ArrowLeft" @click="router.push('/ai-runs')">
+            <el-button text size="small" :icon="ArrowLeft" @click="leaveRunDetail">
               {{ t('common.action.back') }}
             </el-button>
             <span class="run-detail-id">{{ runId }}</span>
           </div>
-          <span class="page-eyebrow">{{ t('aiRuns.eyebrow') }}</span>
+          <span class="page-eyebrow">{{ triggerLabel }}</span>
           <h2 class="run-detail-goal" :title="snapshot?.goal || undefined">
             {{ snapshot ? goalSummary : '—' }}
           </h2>
@@ -43,8 +43,11 @@
         </div>
       </div>
       <div class="page-actions">
+        <el-button v-if="snapshot" plain :icon="Document" @click="openInspector">
+          {{ t('aiRuns.detail.evidenceTitle') }} · {{ sidePanelMetric(evidence.length + artifacts.length) }}
+        </el-button>
         <el-button
-          v-if="snapshot?.status === 'completed' && snapshot.outcome === 'resolved' && stepCounts.verificationSucceeded > 0"
+          v-if="isAdmin && snapshot?.status === 'completed' && snapshot.outcome === 'resolved' && stepCounts.verificationSucceeded > 0"
           plain :loading="capturingKnowledge" @click="captureKnowledge"
         >
           {{ t('aiRuns.detail.captureKnowledge') }}
@@ -73,6 +76,12 @@
     <div v-else-if="!snapshot" v-loading="true" class="panel run-detail-loading" />
 
     <template v-else>
+      <section class="run-next-action" aria-live="polite">
+        <span>{{ t('ai.ops.next.label') }}</span>
+        <strong>{{ nextActionText }}</strong>
+        <small>{{ snapshot.host_alias }} · {{ t(`aiRuns.status.${snapshot.status}`) }}</small>
+      </section>
+
       <!-- 状态横幅：需要关注 / 恢复中 / 过期，文案只转述服务端状态 -->
       <el-alert
         v-if="snapshot.status === 'needs_attention'"
@@ -108,17 +117,30 @@
           </el-tag>
         </div>
         <p class="run-conclusion-summary">{{ conclusionSummary }}</p>
+        <div v-if="blockingStep || failureReason" class="run-conclusion-blocker">
+          <span>{{ t('aiRuns.detail.conclusion.blockingStep') }}</span>
+          <strong>{{ blockingStep
+            ? t(presentAutonomyStep(blockingStep).labelKey)
+            : t('aiRuns.detail.conclusion.preflightFailure') }}</strong>
+          <small>{{ blockingStep ? stepExecutionText(blockingStep) : failureReason }}</small>
+        </div>
         <div class="run-conclusion-facts">
           <span>
             <strong>{{ stepCounts.succeeded }}/{{ stepCounts.total }}</strong>
             {{ t('aiRuns.detail.conclusion.stepFact') }}
           </span>
-          <span>
+          <span v-if="stepCounts.failed">
+            <strong>{{ stepCounts.failed }}</strong>
+            {{ t('aiRuns.detail.conclusion.failedFact') }}
+          </span>
+          <span v-if="stepCounts.verificationTotal">
             <strong>{{ stepCounts.verificationSucceeded }}/{{ stepCounts.verificationTotal }}</strong>
-            {{ t('aiRuns.detail.conclusion.verificationFact') }}
+            {{ t(snapshot.outcome === 'resolved'
+              ? 'aiRuns.detail.conclusion.verificationFact'
+              : 'aiRuns.detail.conclusion.verificationNonFinalFact') }}
           </span>
           <span>
-            <strong>{{ evidence.length }}</strong>
+            <strong>{{ sidePanelMetric(evidence.length) }}</strong>
             {{ t('aiRuns.detail.conclusion.evidenceFact') }}
           </span>
         </div>
@@ -299,20 +321,68 @@
         </div>
 
         <!-- 右列：证据索引 + 产物 -->
-        <aside class="run-detail-side">
-          <details class="panel run-collapsible-panel" :open="evidence.length === 0">
+        <el-drawer
+          v-model="inspectorVisible"
+          append-to-body
+          size="min(560px, 100vw)"
+          class="run-inspector-drawer"
+          :title="t('ai.ops.inspector.title')"
+        >
+        <aside v-loading="sidePanelLoading" class="run-detail-side">
+          <div v-if="sidePanelError" class="panel run-side-load-error" role="alert">
+            <span>{{ sidePanelError }}</span>
+            <el-button size="small" plain @click="reloadSidePanels">{{ t('common.action.retry') }}</el-button>
+          </div>
+          <section v-if="artifactDialog.visible" class="panel run-artifact-preview" aria-live="polite">
+            <header class="run-artifact-preview-head">
+              <div>
+                <span>{{ t('aiRuns.detail.execution.rawOutput') }}</span>
+                <strong>{{ artifactDialog.title }}</strong>
+              </div>
+              <button
+                type="button"
+                :aria-label="t('aiRuns.detail.execution.closeRawOutput')"
+                @click="artifactDialog.visible = false"
+              >
+                <el-icon><Close /></el-icon>
+              </button>
+            </header>
+            <dl v-if="artifactPreviewStep" class="run-artifact-preview-meta">
+              <div>
+                <dt>{{ t('aiRuns.detail.execution.action') }}</dt>
+                <dd><code>{{ presentAutonomyStep(artifactPreviewStep).command }}</code></dd>
+              </div>
+              <div>
+                <dt>{{ t('aiRuns.detail.execution.result') }}</dt>
+                <dd>{{ stepExecutionText(artifactPreviewStep) }}</dd>
+              </div>
+            </dl>
+            <div v-loading="artifactDialog.loading">
+              <pre class="run-artifact-content run-mono">{{ artifactDialog.content }}</pre>
+            </div>
+          </section>
+
+          <details class="panel run-collapsible-panel" open>
             <summary class="panel-head run-collapsible-head">
               <span>{{ t('aiRuns.detail.evidenceTitle') }}</span>
-              <span class="run-collapsible-count run-mono">{{ evidence.length }}</span>
+              <span class="run-collapsible-count run-mono">{{ sidePanelMetric(evidence.length) }}</span>
               <el-tooltip :content="t('aiRuns.detail.evidenceUntrusted')" placement="top">
-                <el-icon class="run-side-info"><InfoFilled /></el-icon>
+                <el-icon
+                  class="run-side-info" role="img"
+                  :aria-label="t('aiRuns.detail.evidenceUntrusted')"
+                ><InfoFilled /></el-icon>
               </el-tooltip>
             </summary>
-            <div v-if="evidence.length === 0" class="run-empty">
+            <div v-if="!sidePanelLoading && !sidePanelError && evidence.length === 0" class="run-empty">
               {{ t('aiRuns.detail.evidenceEmpty') }}
             </div>
-            <ul v-else class="run-evidence">
-              <li v-for="item in evidence" :key="item.id" class="run-evidence-item">
+            <ul v-if="evidence.length" class="run-evidence">
+              <li
+                v-for="item in evidence"
+                :key="item.id"
+                class="run-evidence-item"
+                :class="{ 'is-problem': evidenceIsProblem(item) }"
+              >
                 <div class="run-evidence-line">
                   <span class="run-evidence-kind">{{ evidenceKindLabel(item.kind) }}</span>
                   <span class="run-evidence-time">{{ absTime(item.created_at) }}</span>
@@ -345,12 +415,12 @@
           <details class="panel run-collapsible-panel">
             <summary class="panel-head run-collapsible-head">
               <span>{{ t('aiRuns.detail.artifactsTitle') }}</span>
-              <span class="run-collapsible-count run-mono">{{ artifacts.length }}</span>
+              <span class="run-collapsible-count run-mono">{{ sidePanelMetric(artifacts.length) }}</span>
             </summary>
-            <div v-if="artifacts.length === 0" class="run-empty">
+            <div v-if="!sidePanelLoading && !sidePanelError && artifacts.length === 0" class="run-empty">
               {{ t('aiRuns.detail.artifactsEmpty') }}
             </div>
-            <ul v-else class="run-artifacts">
+            <ul v-if="artifacts.length" class="run-artifacts">
               <li v-for="artifact in artifacts" :key="artifact.id" class="run-artifact">
                 <button
                   class="run-artifact-open" :disabled="artifact.expired"
@@ -372,19 +442,10 @@
             </ul>
           </details>
         </aside>
+        </el-drawer>
       </div>
     </template>
 
-    <!-- 产物正文对话框（单条按需解密读取） -->
-    <el-dialog
-      v-model="artifactDialog.visible"
-      :title="artifactDialog.title || t('aiRuns.detail.artifactContent')"
-      width="720px" append-to-body destroy-on-close
-    >
-      <div v-loading="artifactDialog.loading">
-        <pre class="run-artifact-content run-mono">{{ artifactDialog.content }}</pre>
-      </div>
-    </el-dialog>
   </div>
 </template>
 
@@ -392,8 +453,9 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowLeft, InfoFilled } from '@element-plus/icons-vue'
+import { ArrowLeft, Close, Document, InfoFilled } from '@element-plus/icons-vue'
 import { t } from '@/i18n'
+import { store } from '@/store'
 import {
   cancelAutonomyRun, captureRunKnowledge, decideAutonomyStep, getAutonomyArtifact, getAutonomySnapshot,
   listAutonomyArtifacts, listAutonomyEvidence, startAutonomyRun, streamAutonomyRun,
@@ -416,20 +478,51 @@ const route = useRoute()
 const router = useRouter()
 const runId = String(route.params.runId || '')
 
+function leaveRunDetail(): void {
+  void router.push({ name: 'AiOpsTasks' })
+}
+
 // ===== 权威快照 =====
 const snapshot = ref<AutonomySnapshot | null>(null)
 const snapshotError = ref('')
 const acting = ref(false)
 const deciding = ref(false)
 const capturingKnowledge = ref(false)
+const inspectorVisible = ref(false)
+const isAdmin = computed(() => store.user.role === 'admin')
 
 const terminal = computed<boolean>(() => (
   snapshot.value ? isTerminalRunStatus(snapshot.value.status) : false
 ))
+const triggerLabel = computed(() => {
+  const trigger = snapshot.value?.trigger_type || 'manual'
+  return ['manual', 'chat', 'alertmanager'].includes(trigger)
+    ? t(`ai.ops.trigger.${trigger}`)
+    : trigger.toUpperCase()
+})
+const nextActionText = computed(() => {
+  const current = snapshot.value
+  if (!current) return '—'
+  if (current.status === 'draft') return t('ai.ops.next.start')
+  if (current.status === 'waiting_approval') return t('ai.ops.next.approve')
+  if (current.status === 'needs_attention') return t('ai.ops.next.inspect')
+  if (current.status === 'recovering') return t('ai.ops.next.recovering')
+  if (['queued', 'running'].includes(current.status)) return t('ai.ops.next.monitor')
+  if (current.status === 'failed') return t('ai.ops.next.reviewFailure')
+  if (['cancelled', 'expired'].includes(current.status)) return t('ai.ops.next.reviewTerminal')
+  return t('ai.ops.next.review')
+})
 const allowedOps = computed<string[]>(() => snapshot.value?.allowed_operations || [])
 const waitingStep = computed<AutonomyStep | null>(() => (
   snapshot.value?.steps.find((step) => step.status === 'waiting_approval') || null
 ))
+const blockingStep = computed<AutonomyStep | null>(() => {
+  const steps = snapshot.value?.steps || []
+  return steps.find((step) => step.status === 'outcome_unknown')
+    || steps.find((step) => step.status === 'failed')
+    || null
+})
+const failureReason = computed(() => String(snapshot.value?.failure_reason || '').trim())
 
 async function loadSnapshot(): Promise<void> {
   snapshotError.value = ''
@@ -532,12 +625,16 @@ function stopStream(): void {
 // ===== 证据 / 产物 =====
 const evidence = ref<AutonomyEvidence[]>([])
 const artifacts = ref<AutonomyArtifact[]>([])
+const sidePanelLoading = ref(false)
+const sidePanelError = ref('')
 const artifactDialog = reactive({
   visible: false,
   loading: false,
   content: '',
   title: '',
+  artifact: null as AutonomyArtifact | null,
 })
+const artifactPreviewStep = computed(() => stepForId(artifactDialog.artifact?.step_id || null))
 
 const stepCounts = computed(() => countAutonomySteps(snapshot.value?.steps || []))
 const goalSummary = computed(() => summarizeAutonomyGoal(snapshot.value?.goal || '', 112))
@@ -562,16 +659,22 @@ const conclusionTone = computed<'success' | 'danger' | 'warning' | 'info'>(() =>
     case 'resolved': return 'success'
     case 'not_resolved': return 'danger'
     case 'inconclusive': return 'warning'
-    default: return 'info'
+    default: return snapshot.value?.status === 'failed' ? 'danger' : 'info'
   }
 })
 
 const conclusionTitle = computed(() => {
-  switch (snapshot.value?.outcome) {
+  const current = snapshot.value
+  switch (current?.outcome) {
     case 'resolved': return t('aiRuns.detail.conclusion.resolvedTitle')
     case 'not_resolved': return t('aiRuns.detail.conclusion.notResolvedTitle')
     case 'inconclusive': return t('aiRuns.detail.conclusion.inconclusiveTitle')
-    default: return t('aiRuns.detail.conclusion.pendingTitle')
+    default:
+      if (current?.status === 'failed') return t('aiRuns.detail.conclusion.failedWithoutConclusionTitle')
+      if (current && isTerminalRunStatus(current.status)) {
+        return t('aiRuns.detail.conclusion.terminalWithoutConclusionTitle')
+      }
+      return t('aiRuns.detail.conclusion.pendingTitle')
   }
 })
 
@@ -590,7 +693,21 @@ const conclusionSummary = computed(() => {
     case 'resolved': return t('aiRuns.detail.conclusion.resolvedSummary', params)
     case 'not_resolved': return t('aiRuns.detail.conclusion.notResolvedSummary', params)
     case 'inconclusive': return t('aiRuns.detail.conclusion.inconclusiveSummary', params)
-    default: return t('aiRuns.detail.conclusion.pendingSummary', params)
+    default:
+      if (current?.status === 'failed') {
+        return t('aiRuns.detail.conclusion.failedWithoutConclusionSummary', {
+          step: blockingStep.value
+            ? t(presentAutonomyStep(blockingStep.value).labelKey)
+            : t('aiRuns.detail.conclusion.preflightFailure'),
+          result: blockingStep.value
+            ? stepExecutionText(blockingStep.value)
+            : failureReason.value || t('aiRuns.detail.conclusion.noFailureDetail'),
+        })
+      }
+      if (current && isTerminalRunStatus(current.status)) {
+        return t('aiRuns.detail.conclusion.terminalWithoutConclusionSummary', params)
+      }
+      return t('aiRuns.detail.conclusion.pendingSummary', params)
   }
 })
 
@@ -680,6 +797,11 @@ function evidenceArtifacts(item: AutonomyEvidence): AutonomyArtifact[] {
   return artifacts.value.filter((artifact) => ids.has(artifact.id))
 }
 
+function evidenceIsProblem(item: AutonomyEvidence): boolean {
+  const status = stepForId(item.step_id)?.status
+  return status === 'failed' || status === 'outcome_unknown'
+}
+
 function artifactKindLabel(kind: string): string {
   return t(`aiRuns.detail.artifactKind.${autonomyArtifactLabelKey(kind)}`)
 }
@@ -696,6 +818,8 @@ function artifactDisplayTitle(artifact: AutonomyArtifact): string {
 }
 
 async function reloadSidePanels(): Promise<void> {
+  sidePanelLoading.value = true
+  sidePanelError.value = ''
   try {
     const [artifactList, evidenceList] = await Promise.all([
       listAutonomyArtifacts(runId),
@@ -704,15 +828,24 @@ async function reloadSidePanels(): Promise<void> {
     artifacts.value = artifactList
     evidence.value = evidenceList
   } catch {
-    // 侧栏失败不阻断主视图；下次事件终局或手动刷新会重试
+    sidePanelError.value = t('aiRuns.detail.sidePanelLoadFailed')
+  } finally {
+    sidePanelLoading.value = false
   }
 }
 
+function sidePanelMetric(count: number): number | string {
+  if (sidePanelLoading.value) return '…'
+  return sidePanelError.value ? '—' : count
+}
+
 async function openArtifact(artifact: AutonomyArtifact): Promise<void> {
+  inspectorVisible.value = true
   artifactDialog.visible = true
   artifactDialog.loading = true
   artifactDialog.content = ''
   artifactDialog.title = artifactDisplayTitle(artifact)
+  artifactDialog.artifact = artifact
   try {
     const detail = await getAutonomyArtifact(runId, artifact.id)
     artifactDialog.content = detail.content
@@ -863,7 +996,7 @@ interface Phase { key: string; state: 'done' | 'active' | 'pending' }
 
 const phases = computed<Phase[]>(() => {
   const all: Phase[] = [
-    'drafted', 'executing', 'approving', 'verifying', 'concluding', 'terminal',
+    'drafted', 'approving', 'executing', 'verifying', 'concluding', 'terminal',
   ].map((key) => ({ key, state: 'pending' as const }))
   const current = snapshot.value
   if (!current) return all
@@ -885,12 +1018,12 @@ const phases = computed<Phase[]>(() => {
 
   // 提议：有步骤或已离开草稿即完成；草稿态为当前阶段
   all[0].state = (current.status !== 'draft' || steps.length > 0) ? 'done' : 'active'
-  // 执行：有已终局步骤即完成；排队/运行/恢复中为当前阶段
-  if (executedSteps.length > 0) all[1].state = 'done'
-  else if (['queued', 'running', 'recovering'].includes(current.status)) all[1].state = 'active'
   // 审批：等待审批为当前阶段；任何步骤越过审批即完成过审批
-  if (current.status === 'waiting_approval') all[2].state = 'active'
-  else if (pastApproval) all[2].state = 'done'
+  if (current.status === 'waiting_approval') all[1].state = 'active'
+  else if (pastApproval) all[1].state = 'done'
+  // 执行：有已终局步骤即完成；排队/运行/恢复中为当前阶段
+  if (executedSteps.length > 0) all[2].state = 'done'
+  else if (['queued', 'running', 'recovering'].includes(current.status)) all[2].state = 'active'
   // 验证：有验证步骤终局即完成；进行中的验证步骤为当前阶段
   if (verificationDone) all[3].state = 'done'
   else if (verificationActive && !isTerminal) all[3].state = 'active'
@@ -934,6 +1067,10 @@ async function captureKnowledge(): Promise<void> {
   }
 }
 
+function openInspector(): void {
+  inspectorVisible.value = true
+}
+
 // ===== 生命周期 =====
 onMounted(() => {
   loadSnapshot().then(() => {
@@ -953,6 +1090,10 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  width: min(100%, 980px);
+  margin: 0 auto;
+  padding: 24px clamp(16px, 3vw, 34px) 48px;
+  box-sizing: border-box;
 }
 .run-mono { font-family: var(--ogs-mono); }
 
@@ -1005,6 +1146,18 @@ onBeforeUnmount(() => {
 }
 .run-detail-loading { min-height: 240px; }
 .run-detail-error { padding: 12px; }
+.run-next-action {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px 16px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--ogs-primary) 42%, var(--ogs-border));
+  background: var(--ogs-primary-soft);
+}
+.run-next-action span { color: var(--ogs-primary); font: 700 10px/1 var(--ogs-mono); letter-spacing: .08em; text-transform: uppercase; }
+.run-next-action strong { font-size: 13px; }
+.run-next-action small { color: var(--ogs-text-muted); font-size: 11px; }
 
 /* ---- 横幅 ---- */
 .run-banner { border-radius: 4px; }
@@ -1052,6 +1205,19 @@ onBeforeUnmount(() => {
   font-size: 13px;
   line-height: 1.6;
 }
+.run-conclusion-blocker {
+  margin-top: 12px;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--ogs-danger) 34%, var(--ogs-border));
+  background: color-mix(in srgb, var(--ogs-danger) 6%, var(--ogs-surface));
+}
+.run-conclusion-blocker span { color: var(--ogs-danger); font: 700 10px/1 var(--ogs-mono); text-transform: uppercase; }
+.run-conclusion-blocker strong { min-width: 0; font-size: 13px; }
+.run-conclusion-blocker small { color: var(--ogs-text-secondary); font-size: 12px; }
 .run-conclusion-facts {
   display: flex;
   flex-wrap: wrap;
@@ -1222,12 +1388,13 @@ onBeforeUnmount(() => {
 /* ---- 双列布局 ---- */
 .run-detail-columns {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 340px;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
   align-items: start;
 }
 .run-detail-main { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 .run-detail-side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.run-side-load-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; color: var(--el-color-danger); }
 .run-collapsible-panel { overflow: hidden; }
 .run-collapsible-head {
   display: flex;
@@ -1256,18 +1423,37 @@ onBeforeUnmount(() => {
 /* ---- 计划步骤 ---- */
 .run-steps { list-style: none; margin: 0; padding: 8px 0; }
 .run-step {
+  position: relative;
   display: flex;
   gap: 12px;
-  padding: 10px 18px;
+  padding: 14px 18px 18px 54px;
 }
-.run-step + .run-step { border-top: 1px solid var(--ogs-border-subtle); }
+.run-step::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 27px;
+  width: 1px;
+  content: '';
+  background: var(--ogs-border);
+}
+.run-step:first-child::before { top: 22px; }
+.run-step:last-child::before { bottom: calc(100% - 22px); }
 .run-step-seq {
-  flex-shrink: 0;
-  width: 26px;
-  font-size: 12px;
+  position: absolute;
+  top: 15px;
+  left: 18px;
+  z-index: 1;
+  width: 19px;
+  height: 19px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--ogs-border);
+  border-radius: 50%;
+  background: var(--ogs-surface);
+  font-size: 9px;
   font-weight: 700;
   color: var(--ogs-text-tertiary);
-  padding-top: 2px;
 }
 .run-step-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .run-step-line { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
@@ -1395,10 +1581,24 @@ onBeforeUnmount(() => {
 }
 
 /* ---- 证据 ---- */
-.run-side-info { color: var(--ogs-text-tertiary); font-size: 14px; margin-left: 6px; }
+:global(.run-inspector-drawer .el-drawer__header) {
+  margin-bottom: 0;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--ogs-border);
+}
+:global(.run-inspector-drawer .el-drawer__title) {
+  color: var(--ogs-text);
+  font-size: 15px;
+  font-weight: 700;
+}
+.run-side-info { color: var(--ogs-text-secondary); font-size: 14px; margin-left: 6px; }
 .run-evidence { list-style: none; margin: 0; padding: 6px 0; }
 .run-evidence-item { padding: 8px 16px; display: flex; flex-direction: column; gap: 3px; }
 .run-evidence-item + .run-evidence-item { border-top: 1px solid var(--ogs-border-subtle); }
+.run-evidence-item.is-problem {
+  border-left: 3px solid var(--ogs-danger);
+  background: color-mix(in srgb, var(--ogs-danger) 5%, var(--ogs-surface));
+}
 .run-evidence-line { display: flex; justify-content: space-between; gap: 8px; }
 .run-evidence-kind {
   font-size: 11px;
@@ -1407,12 +1607,12 @@ onBeforeUnmount(() => {
   border-radius: 4px;
   padding: 0 6px;
 }
-.run-evidence-time { font-size: 11px; color: var(--ogs-text-tertiary); }
+.run-evidence-time { font-size: 11px; color: var(--ogs-text-secondary); }
 .run-evidence-meaning { font-size: 12px; font-weight: 700; color: var(--ogs-text); }
 .run-evidence-result { font-size: 12px; color: var(--ogs-text-secondary); overflow-wrap: anywhere; }
 .run-evidence-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
 .run-evidence-summary { font-size: 12px; color: var(--ogs-text); overflow-wrap: anywhere; padding-top: 4px; }
-.run-evidence-refs { font-size: 11px; color: var(--ogs-text-tertiary); }
+.run-evidence-refs { font-size: 11px; color: var(--ogs-text-secondary); }
 
 /* ---- 产物 ---- */
 .run-artifacts { list-style: none; margin: 0; padding: 6px 0; }
@@ -1447,14 +1647,45 @@ onBeforeUnmount(() => {
 .run-artifact-kind {
   flex-shrink: 0;
   font-size: 11px;
-  color: var(--ogs-text-tertiary);
+  color: var(--ogs-text-secondary);
 }
-.run-artifact-meta { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--ogs-text-tertiary); }
+.run-artifact-meta { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--ogs-text-secondary); }
+.run-artifact-preview { overflow: hidden; }
+.run-artifact-preview-head {
+  padding: 12px 14px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid var(--ogs-border-subtle);
+}
+.run-artifact-preview-head span,
+.run-artifact-preview-head strong { display: block; }
+.run-artifact-preview-head span { color: var(--ogs-primary); font: 700 10px/1.4 var(--ogs-mono); text-transform: uppercase; }
+.run-artifact-preview-head strong { margin-top: 3px; color: var(--ogs-text); font-size: 13px; }
+.run-artifact-preview-head button {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  color: var(--ogs-text-secondary);
+  background: transparent;
+  cursor: pointer;
+}
+.run-artifact-preview-head button:hover,
+.run-artifact-preview-head button:focus-visible { color: var(--ogs-primary); }
+.run-artifact-preview-meta { margin: 0; padding: 10px 14px; display: grid; gap: 8px; }
+.run-artifact-preview-meta div { display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 8px; }
+.run-artifact-preview-meta dt { color: var(--ogs-text-secondary); font-size: 11px; }
+.run-artifact-preview-meta dd { margin: 0; color: var(--ogs-text); font-size: 12px; overflow-wrap: anywhere; }
+.run-artifact-preview-meta code { font-family: var(--ogs-mono); white-space: pre-wrap; }
 .run-artifact-content {
   max-height: 420px;
   overflow: auto;
   background: var(--ogs-bg);
   border: 1px solid var(--ogs-border);
+  margin: 0 14px 14px;
   border-radius: 4px;
   padding: 12px;
   font-size: 12px;
@@ -1463,13 +1694,28 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 640px) {
+  .run-detail { padding: 16px 12px 38px; }
+  .run-next-action { grid-template-columns: 1fr; gap: 5px; }
+  .phase-rail { display: grid; grid-template-columns: 1fr; overflow: visible; padding: 10px 14px; }
+  .phase-node { min-width: 0; min-height: 34px; flex-direction: row; align-items: center; gap: 12px; }
+  .phase-node:not(:last-child)::after {
+    top: 22px;
+    left: 7px;
+    width: 2px;
+    height: calc(100% - 14px);
+  }
+  .phase-label { white-space: normal; }
   .run-conclusion { padding: 14px; }
   .run-conclusion-details { grid-template-columns: 1fr; }
   .run-conclusion-head { flex-direction: column; gap: 8px; }
   .run-conclusion-title { font-size: 16px; }
-  .run-step { padding: 10px 12px; gap: 8px; }
+  .run-conclusion-blocker { grid-template-columns: 1fr; gap: 5px; }
+  .run-step { padding: 12px 10px 16px 43px; gap: 8px; }
+  .run-step::before { left: 21px; }
+  .run-step-seq { left: 12px; }
   .run-step-command,
   .run-step-result { grid-template-columns: 1fr; gap: 2px; }
   .run-artifact-open { align-items: flex-start; flex-direction: column; }
+  .run-artifact-preview-meta div { grid-template-columns: 1fr; gap: 2px; }
 }
 </style>

@@ -41,8 +41,10 @@ from app.ai.autonomy.policy import (
 )
 from app.ai.autonomy.repository import (
     AutonomyConflict,
+    AutonomyPermissionError,
     AutonomyRepository,
     AutonomyValidationError,
+    resolve_current_autonomy_role,
 )
 from app.ai.autonomy.ssh_runner import (
     TERMINATION_AUTHORIZATION_REVOKED,
@@ -337,14 +339,12 @@ class AutonomyExecutor:
             try:
                 session = control_session_factory()
                 from app.core.db.database import (
-                    t_acc_user, t_ai_autonomous_run,
+                    t_ai_autonomous_run,
                     t_ai_autonomous_step, t_host, t_sys_user,
                 )
 
-                user = session.query(t_acc_user).filter_by(
-                    name=owner, usrole='admin', is_deleted=False,
-                ).first()
-                if user is None or role != 'admin':
+                current_role = resolve_current_autonomy_role(session, owner)
+                if current_role is None or current_role != str(role or ''):
                     return TERMINATION_AUTHORIZATION_REVOKED
                 current = session.query(t_ai_autonomous_run).filter_by(
                     id=run_id, owner=owner,
@@ -398,6 +398,15 @@ class AutonomyExecutor:
                     or str(host.host_ip) != host_address
                     or int(host.host_port) != int(host_port)
                     or str(host.ai_environment) != host_environment
+                ):
+                    return TERMINATION_AUTHORIZATION_REVOKED
+                from app.ai.tools import PlatformQueryService
+
+                platform = PlatformQueryService(
+                    owner, current_role, session=session,
+                )
+                if not platform.validate_asset_sys_user_id_pair(
+                    [int(action.target_id)], int(action.system_user_id),
                 ):
                     return TERMINATION_AUTHORIZATION_REVOKED
                 try:
@@ -527,6 +536,15 @@ class AutonomyExecutor:
         lease_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         """执行已审批的 Step；任何前置复核失败都不产生副作用。"""
+        effective_role = resolve_current_autonomy_role(self.session, owner)
+        if effective_role is None:
+            raise AutonomyPermissionError(
+                'run owner is inactive or has no supported role'
+            )
+        # A task payload is not an authority boundary. Resolve the role again
+        # in the executor so a stale worker argument can never elevate a user
+        # Run to admin before the first remote side effect.
+        role = effective_role
         if lease_owner is not None:
             try:
                 run, step = self._reload_execution_rows(

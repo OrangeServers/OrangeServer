@@ -19,7 +19,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
 
 from app.ai.autonomy.actions import (
@@ -117,6 +117,26 @@ CONCLUSION_ITEM_CHARS = 240
 CONCLUSION_TEXT_CHARS = 512
 CONCLUSION_CONFIDENCE = frozenset({'low', 'medium', 'high'})
 RUN_TRIGGER_TYPES = frozenset({'manual', 'chat', 'alertmanager'})
+AUTONOMY_ROLES = frozenset({'admin', 'user'})
+RUN_FAILURE_EVENT_TYPES = frozenset({
+    'authorization_revoked',
+    'budget_exhausted',
+    'planner_failed',
+    'planner_unavailable',
+    'unknown_graph_version',
+})
+
+
+def resolve_current_autonomy_role(session, owner: str) -> Optional[str]:
+    """Resolve the owner's current usable role without persisting it on Run."""
+    from app.core.db.database import t_acc_user
+
+    row = session.query(t_acc_user).filter_by(
+        name=str(owner),
+        is_deleted=False,
+    ).first()
+    role = str(getattr(row, 'usrole', '') or '').lower() if row else ''
+    return role if role in AUTONOMY_ROLES else None
 
 
 def parse_custom_profile(payload):
@@ -356,7 +376,9 @@ class AutonomyRepository:
         self.secret_key = secret_key
         if platform_factory is None:
             from app.ai.tools import PlatformQueryService
-            platform_factory = PlatformQueryService
+
+            def platform_factory(owner, role):
+                return PlatformQueryService(owner, role, session=session)
         self.platform_factory = platform_factory
 
     # ------------------------------------------------------------------
@@ -392,10 +414,12 @@ class AutonomyRepository:
     def _revalidate_boundaries(self, owner: str, role: str, run_row) -> None:
         """创建/启动/决策边界统一复核资产与凭据授权。"""
         platform = self._platform(owner, role)
-        if not platform.validate_asset_ids([int(run_row.host_id)]):
-            raise AutonomyPermissionError('asset authorization revoked')
-        if platform.resolve_system_user(int(run_row.system_user_id)) is None:
-            raise AutonomyPermissionError('credential authorization revoked')
+        if not platform.validate_asset_sys_user_id_pair(
+            [int(run_row.host_id)], int(run_row.system_user_id),
+        ):
+            raise AutonomyPermissionError(
+                'asset and credential authorization revoked'
+            )
         host = self._get_host_row(run_row.host_id)
         try:
             validate_mode_for_environment(run_row.mode, host.ai_environment)
@@ -559,11 +583,15 @@ class AutonomyRepository:
             )
 
         platform = self._platform(owner, role)
-        if not platform.validate_asset_ids([host_id]):
-            raise AutonomyPermissionError('asset authorization failed')
         credential = platform.resolve_system_user(system_user_id)
         if credential is None:
             raise AutonomyPermissionError('credential authorization failed')
+        if not platform.validate_asset_sys_user_id_pair(
+            [host_id], system_user_id,
+        ):
+            raise AutonomyPermissionError(
+                'asset and credential authorization failed'
+            )
         host = self._get_host_row(host_id)
         try:
             validate_mode_for_environment(mode, host.ai_environment)
@@ -667,8 +695,8 @@ class AutonomyRepository:
             t_ai_autonomous_run, t_ai_autonomous_step,
         )
 
-        if role != 'admin':
-            raise AutonomyPermissionError('admin role required')
+        if str(role or '') not in AUTONOMY_ROLES:
+            raise AutonomyPermissionError('unsupported autonomy role')
         run = self.session.query(t_ai_autonomous_run).filter_by(
             id=run_id, owner=owner,
         ).with_for_update().first()
@@ -760,14 +788,54 @@ class AutonomyRepository:
         return self._run_to_dict(self._get_run_row(owner, run_id))
 
     def list_runs(self, owner: str, limit: int = 50) -> List[Dict[str, Any]]:
-        from app.core.db.database import t_ai_autonomous_run
+        from app.core.db.database import (
+            t_ai_autonomous_event, t_ai_autonomous_run,
+        )
 
+        active_values = [status.value for status in ACTIVE_RUN_STATUSES]
         rows = self.session.query(t_ai_autonomous_run).filter_by(
             owner=owner,
-        ).order_by(t_ai_autonomous_run.created_at.desc()).limit(
+        ).order_by(
+            case(
+                (t_ai_autonomous_run.status.in_(active_values), 0),
+                else_=1,
+            ).asc(),
+            t_ai_autonomous_run.created_at.desc(),
+            t_ai_autonomous_run.id.desc(),
+        ).limit(
             max(1, min(int(limit), 200))
         ).all()
-        return [self._run_to_dict(row) for row in rows]
+        runs = [self._run_to_dict(row) for row in rows]
+        alert_ids = [
+            row.id for row in rows if row.trigger_type == 'alertmanager'
+        ]
+        if not alert_ids:
+            return runs
+
+        latest_sequence = self.session.query(
+            t_ai_autonomous_event.run_id.label('run_id'),
+            func.max(t_ai_autonomous_event.sequence).label('sequence'),
+        ).filter(
+            t_ai_autonomous_event.run_id.in_(alert_ids),
+            t_ai_autonomous_event.event_type.in_([
+                'alert_firing', 'alert_resolved',
+            ]),
+        ).group_by(t_ai_autonomous_event.run_id).subquery()
+        events = self.session.query(t_ai_autonomous_event).join(
+            latest_sequence,
+            (t_ai_autonomous_event.run_id == latest_sequence.c.run_id)
+            & (t_ai_autonomous_event.sequence == latest_sequence.c.sequence),
+        ).all()
+        latest = {event.run_id: event for event in events}
+        for run in runs:
+            if run['trigger_type'] != 'alertmanager':
+                continue
+            event = latest.get(run['id'])
+            run['alert_state'] = (
+                event.event_type.removeprefix('alert_') if event else None
+            )
+            run['alert_updated_at'] = event.created_at if event else None
+        return runs
 
     def ops_summary(self, owner: str, limit: int = 8) -> Dict[str, Any]:
         """Bounded data for the AIOps landing page; Run stays authoritative."""
@@ -836,6 +904,24 @@ class AutonomyRepository:
         run = self.get_run(owner, run_id)
         run['steps'] = self.list_steps(owner, run_id)
         run['allowed_operations'] = self.allowed_operations(owner, run_id)
+        if (
+            run['status'] == RunStatus.FAILED.value
+            and not any(step['status'] in {
+                StepStatus.FAILED.value, StepStatus.OUTCOME_UNKNOWN.value,
+            } for step in run['steps'])
+        ):
+            from app.core.db.database import t_ai_autonomous_event
+
+            event = self.session.query(t_ai_autonomous_event).filter(
+                t_ai_autonomous_event.run_id == run_id,
+                t_ai_autonomous_event.event_type.in_(RUN_FAILURE_EVENT_TYPES),
+            ).order_by(t_ai_autonomous_event.sequence.desc()).first()
+            if event is not None:
+                note = sanitize_evidence(
+                    self._event_to_dict(event)['payload'].get('note') or ''
+                ).strip()
+                if note:
+                    run['failure_reason'] = note[:128]
         return run
 
     # ------------------------------------------------------------------
