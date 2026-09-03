@@ -19,7 +19,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
 
 from app.ai.autonomy.actions import (
@@ -118,6 +118,13 @@ CONCLUSION_TEXT_CHARS = 512
 CONCLUSION_CONFIDENCE = frozenset({'low', 'medium', 'high'})
 RUN_TRIGGER_TYPES = frozenset({'manual', 'chat', 'alertmanager'})
 AUTONOMY_ROLES = frozenset({'admin', 'user'})
+RUN_FAILURE_EVENT_TYPES = frozenset({
+    'authorization_revoked',
+    'budget_exhausted',
+    'planner_failed',
+    'planner_unavailable',
+    'unknown_graph_version',
+})
 
 
 def resolve_current_autonomy_role(session, owner: str) -> Optional[str]:
@@ -781,14 +788,54 @@ class AutonomyRepository:
         return self._run_to_dict(self._get_run_row(owner, run_id))
 
     def list_runs(self, owner: str, limit: int = 50) -> List[Dict[str, Any]]:
-        from app.core.db.database import t_ai_autonomous_run
+        from app.core.db.database import (
+            t_ai_autonomous_event, t_ai_autonomous_run,
+        )
 
+        active_values = [status.value for status in ACTIVE_RUN_STATUSES]
         rows = self.session.query(t_ai_autonomous_run).filter_by(
             owner=owner,
-        ).order_by(t_ai_autonomous_run.created_at.desc()).limit(
+        ).order_by(
+            case(
+                (t_ai_autonomous_run.status.in_(active_values), 0),
+                else_=1,
+            ).asc(),
+            t_ai_autonomous_run.created_at.desc(),
+            t_ai_autonomous_run.id.desc(),
+        ).limit(
             max(1, min(int(limit), 200))
         ).all()
-        return [self._run_to_dict(row) for row in rows]
+        runs = [self._run_to_dict(row) for row in rows]
+        alert_ids = [
+            row.id for row in rows if row.trigger_type == 'alertmanager'
+        ]
+        if not alert_ids:
+            return runs
+
+        latest_sequence = self.session.query(
+            t_ai_autonomous_event.run_id.label('run_id'),
+            func.max(t_ai_autonomous_event.sequence).label('sequence'),
+        ).filter(
+            t_ai_autonomous_event.run_id.in_(alert_ids),
+            t_ai_autonomous_event.event_type.in_([
+                'alert_firing', 'alert_resolved',
+            ]),
+        ).group_by(t_ai_autonomous_event.run_id).subquery()
+        events = self.session.query(t_ai_autonomous_event).join(
+            latest_sequence,
+            (t_ai_autonomous_event.run_id == latest_sequence.c.run_id)
+            & (t_ai_autonomous_event.sequence == latest_sequence.c.sequence),
+        ).all()
+        latest = {event.run_id: event for event in events}
+        for run in runs:
+            if run['trigger_type'] != 'alertmanager':
+                continue
+            event = latest.get(run['id'])
+            run['alert_state'] = (
+                event.event_type.removeprefix('alert_') if event else None
+            )
+            run['alert_updated_at'] = event.created_at if event else None
+        return runs
 
     def ops_summary(self, owner: str, limit: int = 8) -> Dict[str, Any]:
         """Bounded data for the AIOps landing page; Run stays authoritative."""
@@ -857,6 +904,24 @@ class AutonomyRepository:
         run = self.get_run(owner, run_id)
         run['steps'] = self.list_steps(owner, run_id)
         run['allowed_operations'] = self.allowed_operations(owner, run_id)
+        if (
+            run['status'] == RunStatus.FAILED.value
+            and not any(step['status'] in {
+                StepStatus.FAILED.value, StepStatus.OUTCOME_UNKNOWN.value,
+            } for step in run['steps'])
+        ):
+            from app.core.db.database import t_ai_autonomous_event
+
+            event = self.session.query(t_ai_autonomous_event).filter(
+                t_ai_autonomous_event.run_id == run_id,
+                t_ai_autonomous_event.event_type.in_(RUN_FAILURE_EVENT_TYPES),
+            ).order_by(t_ai_autonomous_event.sequence.desc()).first()
+            if event is not None:
+                note = sanitize_evidence(
+                    self._event_to_dict(event)['payload'].get('note') or ''
+                ).strip()
+                if note:
+                    run['failure_reason'] = note[:128]
         return run
 
     # ------------------------------------------------------------------

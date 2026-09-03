@@ -140,6 +140,92 @@ def test_runner_streams_deltas_persists_answer_and_releases_lock():
     assert not redis.get(store._run_lock_key("alice", conversation["id"]))
 
 
+def test_runner_locks_before_reading_the_permission_snapshot():
+    from app.ai.runner import AgentRunner
+    from app.ai.storage import AgentStore
+
+    class LockFirstStore(AgentStore):
+        require_lock = False
+        acquiring = False
+        locked = False
+        refreshes = 0
+
+        def acquire_run_lock(self, owner, conversation_id, **kwargs):
+            self.acquiring = True
+            try:
+                token = super().acquire_run_lock(owner, conversation_id, **kwargs)
+            finally:
+                self.acquiring = False
+            self.locked = True
+            return token
+
+        def get_conversation(self, owner, conversation_id):
+            if self.require_lock and not self.acquiring and not self.locked:
+                raise AssertionError("permission snapshot was read before the run lock")
+            return super().get_conversation(owner, conversation_id)
+
+        def release_run_lock(self, owner, conversation_id, token):
+            super().release_run_lock(owner, conversation_id, token)
+            self.locked = False
+
+        def refresh_run_lock(self, owner, conversation_id, token, **kwargs):
+            self.refreshes += 1
+            return super().refresh_run_lock(
+                owner, conversation_id, token, **kwargs,
+            )
+
+    store = LockFirstStore(FakeRedis())
+    conversation = store.create_conversation("alice", "minimax", "demo")
+    store.require_lock = True
+    runner = AgentRunner(
+        store=store,
+        provider_service=FakeProviderService(TextAdapter()),
+    )
+
+    output = "".join(runner.run(
+        owner="alice",
+        role="user",
+        conversation_id=conversation["id"],
+        message="平台是否正常？",
+    ))
+
+    assert "event: run.completed" in output
+    assert store.locked is False
+    assert store.refreshes >= 2
+
+
+def test_runner_stops_when_the_permission_lock_is_lost():
+    from app.ai.runner import AgentRunner
+    from app.ai.storage import AgentStore, AgentStoreConflict
+
+    class LostLockStore(AgentStore):
+        def refresh_run_lock(self, *_args, **_kwargs):
+            raise AgentStoreConflict("conversation run lock lost")
+
+    store = LostLockStore(FakeRedis())
+    conversation = store.create_conversation("alice", "minimax", "demo")
+    runner = AgentRunner(
+        store=store,
+        provider_service=FakeProviderService(TextAdapter()),
+    )
+
+    output = "".join(runner.run(
+        owner="alice",
+        role="user",
+        conversation_id=conversation["id"],
+        message="平台是否正常？",
+    ))
+
+    assert "event: run.failed" in output
+    assert "conversation run lock lost" in output
+    assert all(
+        message["role"] != "assistant"
+        for message in store.get_conversation(
+            "alice", conversation["id"],
+        )["messages"]
+    )
+
+
 def test_runner_uses_the_conversation_context_mode_for_compression():
     from app.ai.context import DEEP_CONTEXT_MODE, STANDARD_CONTEXT_MODE
     from app.ai.provider import ChatResult
@@ -563,12 +649,15 @@ def test_ai_rest_and_sse_routes_use_the_expected_http_methods():
 
     app = Flask(__name__)
     register_ai_routes(app)
-    rules = {rule.rule: set(rule.methods) for rule in app.url_map.iter_rules()}
+    rules = {}
+    for rule in app.url_map.iter_rules():
+        rules.setdefault(rule.rule, set()).update(rule.methods)
 
     assert "GET" in rules["/ai/providers"]
     assert "PUT" in rules["/ai/admin/providers/<string:code>"]
     assert "POST" in rules["/ai/admin/providers/<string:code>/models"]
     assert "DELETE" in rules["/ai/conversations/<string:conversation_id>"]
+    assert "PATCH" in rules["/ai/conversations/<string:conversation_id>"]
     assert "POST" in rules["/ai/chat"]
     assert "/ai/actions/<string:action_id>/approve" not in rules
     assert "/ai/actions/<string:action_id>/cancel" not in rules

@@ -22,7 +22,7 @@ import type {
   KnowledgeDocument,
   KnowledgeDocumentPayload,
   KnowledgeEmbeddingConfig,
-  KnowledgeSearchResult,
+  KnowledgeSearchResponse,
 } from '@/types/autonomy'
 
 const BASE = '/ai/autonomous-runs'
@@ -41,6 +41,14 @@ export function getAutonomyStatus(): Promise<AutonomyReadiness> {
 /** 当前运维用户可见的 AIOps 聚合状态。 */
 export function getAIOpsStatus(): Promise<AIOpsStatus> {
   return envelopeData(aiJsonRequest<AutonomyEnvelope<AIOpsStatus>>('/ai/ops/status'))
+}
+
+/** 当前 owner 经服务端权限过滤后的 Run 凭据选项。 */
+export async function listAutonomySystemUsers(): Promise<Array<{ id: number; alias: string }>> {
+  const data = await envelopeData(aiJsonRequest<AutonomyEnvelope<{
+    system_users: Array<{ id: number; alias: string }>
+  }>>('/ai/autonomy/system-users'))
+  return data.system_users || []
 }
 
 const KNOWLEDGE_BASE = '/ai/knowledge'
@@ -99,11 +107,10 @@ export function reindexKnowledge(): Promise<KnowledgeEmbeddingConfig> {
   ))
 }
 
-export async function searchKnowledge(query: string, limit = 8): Promise<KnowledgeSearchResult[]> {
-  const data = await envelopeData(aiJsonRequest<AutonomyEnvelope<{ results: KnowledgeSearchResult[] }>>(
+export function searchKnowledge(query: string, limit = 8): Promise<KnowledgeSearchResponse> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeSearchResponse>>(
     `${KNOWLEDGE_BASE}/search`, { method: 'POST', body: { query, limit } },
   ))
-  return data.results || []
 }
 
 export function captureRunKnowledge(runId: string): Promise<KnowledgeDocument> {

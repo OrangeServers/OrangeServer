@@ -56,7 +56,12 @@ class FakePlatform:
         )
 
 
-def _registry(role="user", allowed_ids=None):
+def _registry(
+    role="user",
+    allowed_ids=None,
+    autonomy_mode="ask",
+    autonomy_profile=None,
+):
     from app.ai.storage import AgentStore
     from app.ai.tools import ToolRegistry
 
@@ -68,6 +73,8 @@ def _registry(role="user", allowed_ids=None):
         owner="alice",
         role=role,
         conversation_id=conversation["id"],
+        autonomy_mode=autonomy_mode,
+        autonomy_profile=autonomy_profile,
         command_checker=lambda command: None,
     )
     return store, conversation, registry

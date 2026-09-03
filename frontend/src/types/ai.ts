@@ -43,6 +43,12 @@ export interface AiChatMessage {
 
 export type AiToolEventStatus = 'running' | 'success' | 'error'
 
+export type AiConversationAutonomyMode = 'ask' | 'ai_review' | 'auto' | 'custom'
+
+export interface AiConversationAutonomyProfile {
+  action_categories: string[]
+}
+
 export interface AiToolEvent {
   id: string
   tool: string
@@ -59,6 +65,7 @@ export interface AiAutonomyDraft {
   goal?: string
   status?: string
   mode?: string
+  action_categories?: string[]
   host_alias?: string
   created_at?: string
 }
@@ -69,6 +76,8 @@ export interface AiConversation {
   provider_code?: AiProviderCode
   model?: string
   context_mode?: AiContextMode
+  autonomy_mode?: AiConversationAutonomyMode
+  autonomy_profile?: AiConversationAutonomyProfile | null
   updated_at?: string
   created_at?: string
 }

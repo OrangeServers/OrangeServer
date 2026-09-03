@@ -133,9 +133,14 @@
       <el-header class="layout-header" height="64px">
         <div class="header-left">
           <el-tooltip :content="collapsed ? $t('layout.expandSidebar') : $t('layout.collapseSidebar')" placement="bottom">
-            <span class="collapse-btn" @click="toggleSidebar">
+            <button
+              type="button"
+              class="collapse-btn"
+              :aria-label="collapsed ? $t('layout.expandSidebar') : $t('layout.collapseSidebar')"
+              @click="toggleSidebar"
+            >
               <el-icon :size="18"><Fold v-if="!collapsed" /><Expand v-else /></el-icon>
-            </span>
+            </button>
           </el-tooltip>
           <span class="header-divider"></span>
           <span class="breadcrumb-text">{{ $route.meta.titleKey ? $t($route.meta.titleKey) : 'OrangeServer' }}</span>
@@ -143,13 +148,13 @@
 
         <div class="header-right">
           <el-tooltip :content="$t('layout.theme')" placement="bottom">
-            <div class="header-icon-btn" @click="cycleTheme">
+            <button type="button" class="header-icon-btn" :aria-label="$t('layout.theme')" @click="cycleTheme">
               <el-icon :size="18">
                 <MagicStick v-if="store.theme.current === 'orange'" />
                 <Sunny v-else-if="store.theme.current === 'black'" />
                 <Moon v-else />
               </el-icon>
-            </div>
+            </button>
           </el-tooltip>
 
           <!-- UI修复：移除通知铃铛——仅 tooltip+假红点、无任何点击响应（死交互+假信号）。

@@ -91,6 +91,9 @@ export interface AutonomyRun {
   trigger_type: 'manual' | 'chat' | 'alertmanager' | string
   trigger_ref: string | null
   trigger_summary: string
+  /** Latest server-recorded Alertmanager event; only present on alert Runs. */
+  alert_state?: 'firing' | 'resolved' | null
+  alert_updated_at?: string | null
   revision: number
   graph_version: string
   budget: AutonomyBudget
@@ -119,6 +122,8 @@ export interface AutonomyStep {
 /** Run 权威快照 = Run + 有序步骤 + 服务端允许的操作集合 */
 export interface AutonomySnapshot extends AutonomyRun {
   steps: AutonomyStep[]
+  /** Bounded terminal-event note when a Run failed before creating a Step. */
+  failure_reason?: string
   /** 决策词汇只可能来自这里（当前为 approve/reject）；空数组 = 无待决策 */
   allowed_operations: string[]
 }
@@ -246,6 +251,12 @@ export interface KnowledgeSearchResult {
   excerpt: string
   score: number | null
   match_reason: string
+}
+
+export interface KnowledgeSearchResponse {
+  results: KnowledgeSearchResult[]
+  count: number
+  index_state: KnowledgeIndexState
 }
 
 /** 创建草稿请求体 */

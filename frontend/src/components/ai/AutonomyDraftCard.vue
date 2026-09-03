@@ -20,9 +20,14 @@
     </p>
 
     <footer class="draft-actions">
-      <span v-if="draft.host_alias">
-        {{ $t('ai.autonomyDraft.host') }} <code>{{ draft.host_alias }}</code>
-      </span>
+      <div class="draft-meta">
+        <span v-if="draft.host_alias">
+          {{ $t('ai.autonomyDraft.host') }} <code>{{ draft.host_alias }}</code>
+        </span>
+        <span v-if="customCategories">
+          {{ $t('ai.autonomyDraft.categories') }} <code>{{ customCategories }}</code>
+        </span>
+      </div>
       <el-button
         plain
         size="small"
@@ -62,6 +67,14 @@ const statusLabel = computed(() => {
   const status = props.draft.status || 'draft'
   return status === 'draft' ? t('aiRuns.status.draft') : status
 })
+
+const customCategories = computed(() => (
+  props.draft.mode === 'custom'
+    ? (props.draft.action_categories || [])
+        .map(category => t(`aiRuns.dialog.category.${category}`))
+        .join(' · ')
+    : ''
+))
 
 function openRun(): void {
   const runId = props.draft.run_id
@@ -138,14 +151,20 @@ function openRun(): void {
   padding: 8px 16px;
   border-top: 1px solid var(--ogs-border-subtle);
 }
-.draft-actions > span {
+.draft-meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.draft-meta > span {
   overflow: hidden;
   color: var(--ogs-text-muted);
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.draft-actions code {
+.draft-meta code {
   color: var(--ogs-text-secondary);
   font-family: var(--ogs-mono);
 }

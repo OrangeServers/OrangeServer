@@ -84,6 +84,12 @@ def _not_admin():
     return api_error(ApiCode.FORBIDDEN, '此自治操作仅管理员可用', 403)
 
 
+def _current_role_required(role):
+    if str(role or '') not in {'admin', 'user'}:
+        return api_error(ApiCode.FORBIDDEN, '当前账户无 AI 运维权限', 403)
+    return None
+
+
 def _handle(exc):
     """统一映射自治模块异常到 HTTP 响应。
 
@@ -105,7 +111,10 @@ def _handle(exc):
 
 def autonomy_status():
     """GET /ai/autonomy/status：功能与基础设施状态（不受 flag 阻断）。"""
-    _holder, owner, _role = _identity()
+    _holder, owner, role = _identity()
+    blocked = _current_role_required(role)
+    if blocked:
+        return blocked
     status = autonomy_readiness(enabled=is_autonomy_enabled())
     status.update(_ops_capacity(owner, status))
     return api_response(data=status, enabled=status['enabled'])
@@ -139,6 +148,9 @@ def _ops_capacity(owner, readiness=None):
 def ops_status():
     """GET /ai/ops/status: the AIOps landing-page aggregate."""
     _holder, owner, role = _identity()
+    blocked = _current_role_required(role)
+    if blocked:
+        return blocked
     from app.ai.ops import alertmanager_configured, prometheus_configured
 
     readiness = autonomy_readiness(enabled=is_autonomy_enabled())
@@ -147,6 +159,31 @@ def ops_status():
     data['alertmanager_configured'] = alertmanager_configured()
     data['prometheus_configured'] = prometheus_configured()
     return api_response(data=_jsonable(data))
+
+
+def system_user_options():
+    """GET: credentials currently authorized for the Run owner."""
+    _holder, owner, role = _identity()
+    blocked = _guarded(role)
+    if blocked:
+        return blocked
+    try:
+        from app.ai.tools import PlatformQueryService
+
+        rows = PlatformQueryService(
+            owner, role, session=db.session,
+        ).list_authorized_system_users().rows
+        system_users = [
+            {'id': int(row['id']), 'alias': str(row['alias'])}
+            for row in rows
+        ]
+        return api_response(
+            data={'system_users': system_users},
+            system_users=system_users,
+        )
+    except Exception as exc:
+        db.session.rollback()
+        return _handle(exc)
 
 
 def _configured_alert_owner():
@@ -314,8 +351,9 @@ def _guarded(role, *, admin_only=False):
     """feature flag and role checks shared by Run lifecycle endpoints."""
     if not is_autonomy_enabled():
         return _disabled()
-    if str(role or '') not in {'admin', 'user'}:
-        return _not_admin()
+    blocked = _current_role_required(role)
+    if blocked:
+        return blocked
     if admin_only and role != 'admin':
         return _not_admin()
     return None
@@ -600,6 +638,9 @@ def knowledge_config():
 def knowledge_documents():
     """GET approved documents or POST an administrator-reviewed runbook."""
     _holder, owner, role = _identity()
+    blocked = _current_role_required(role)
+    if blocked:
+        return blocked
     if request.method == 'POST':
         blocked = _admin_only(role)
         if blocked:
@@ -697,11 +738,15 @@ def knowledge_capture_run(run_id):
 def knowledge_search():
     """Search bounded, server-authorized knowledge references."""
     _holder, owner, role = _identity()
+    blocked = _current_role_required(role)
+    if blocked:
+        return blocked
     payload = _payload()
     try:
         query = _knowledge_search_query(payload.get('query'))
         limit = _knowledge_search_limit(payload.get('limit', 8))
-        items = _knowledge_service().search(
+        service = _knowledge_service()
+        items = service.search(
             query,
             limit=limit,
             scopes=_knowledge_scopes(owner, role),
@@ -709,6 +754,7 @@ def knowledge_search():
         return api_response(data={
             'results': _jsonable(items),
             'count': len(items),
+            'index_state': service.index_state(),
         })
     except (TypeError, ValueError) as exc:
         return api_error(ApiCode.TYPE_ERROR, str(exc), 400)

@@ -55,6 +55,10 @@ def register_ai_routes(app: Any) -> None:
         _secure(views.conversation_detail, *all_users), methods=["GET"],
     )
     app.add_url_rule(
+        "/ai/conversations/<string:conversation_id>", "ai_update_conversation",
+        _secure(views.update_conversation, *all_users), methods=["PATCH"],
+    )
+    app.add_url_rule(
         "/ai/conversations/<string:conversation_id>", "ai_delete_conversation",
         _secure(views.delete_conversation, *all_users), methods=["DELETE"],
     )

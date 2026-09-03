@@ -44,8 +44,12 @@
             <div><h2>{{ $t('ai.knowledgeManager.sourcesTitle') }}</h2><p>{{ $t('ai.knowledgeManager.sourcesHint') }}</p></div>
             <span v-if="!isAdmin" class="read-only">{{ $t('ai.knowledgeManager.readOnly') }}</span>
           </div>
-          <div v-if="!documents.length" class="knowledge-empty">{{ $t('ai.knowledgeManager.empty') }}</div>
-          <div v-else class="source-list">
+          <div v-if="catalogError" class="knowledge-load-error" role="alert">
+            <span>{{ catalogError }}</span>
+            <el-button size="small" plain @click="load">{{ $t('common.action.retry') }}</el-button>
+          </div>
+          <div v-if="!documents.length && !catalogError" class="knowledge-empty">{{ $t('ai.knowledgeManager.empty') }}</div>
+          <div v-if="documents.length" class="source-list">
             <article v-for="document in documents" :key="document.id" class="source-row">
               <div class="source-primary">
                 <span>{{ $t(`ai.knowledgeManager.${document.source_type}`) }}</span>
@@ -90,8 +94,8 @@
             </el-button>
           </div>
           <p class="search-scope">{{ $t('ai.knowledgeManager.searchScope') }}</p>
-          <div v-if="searched && !searchResults.length" class="knowledge-empty">{{ $t('ai.knowledgeManager.searchEmpty') }}</div>
-          <div v-else class="search-results">
+          <div v-if="searchFeedback" class="knowledge-empty" role="status">{{ $t(searchFeedback) }}</div>
+          <div v-else-if="searchResults.length" class="search-results">
             <article v-for="result in searchResults" :key="`${result.citation_id}:${result.document_id}`">
               <header><span>{{ result.citation_id }}</span><strong>{{ result.title }}</strong><code>{{ scoreText(result.score) }}</code></header>
               <small>{{ result.heading }} · {{ result.scope }} · v{{ result.version }}</small>
@@ -180,12 +184,13 @@ const savingConfig = ref(false)
 const savingDocument = ref(false)
 const reindexing = ref(false)
 const searching = ref(false)
-const searched = ref(false)
 const config = ref<KnowledgeEmbeddingConfig | null>(null)
 const opsStatus = ref<AIOpsStatus | null>(null)
 const documents = ref<KnowledgeDocument[]>([])
+const catalogError = ref('')
 const searchResults = ref<KnowledgeSearchResult[]>([])
 const searchQuery = ref('')
+const searchFeedback = ref('')
 const configDrawer = ref(false)
 const dialogOpen = ref(false)
 const editingId = ref('')
@@ -232,32 +237,51 @@ function scoreText(value: number | null): string {
 
 async function load(): Promise<void> {
   loading.value = true
+  const secondaryLoad = Promise.allSettled([
+    getAIOpsStatus(),
+    isAdmin.value ? getKnowledgeConfig() : Promise.resolve(null),
+  ] as const)
   try {
-    const [documentResult, statusResult] = await Promise.allSettled([
-      listKnowledgeDocuments(),
-      getAIOpsStatus(),
-    ])
-    if (documentResult.status === 'fulfilled') documents.value = documentResult.value
-    else throw documentResult.reason
-    if (statusResult.status === 'fulfilled') opsStatus.value = statusResult.value
-    if (isAdmin.value) applyConfig(await getKnowledgeConfig())
+    documents.value = await listKnowledgeDocuments()
+    catalogError.value = ''
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : t('ai.knowledgeManager.loadFailed'))
+    catalogError.value = t('ai.knowledgeManager.loadFailed')
+    ElMessage.error(error instanceof Error ? error.message : catalogError.value)
   } finally {
     loading.value = false
   }
+
+  const [statusResult, configResult] = await secondaryLoad
+  if (statusResult.status === 'fulfilled') opsStatus.value = statusResult.value
+  else ElMessage.error(statusResult.reason instanceof Error
+    ? statusResult.reason.message
+    : t('ai.knowledgeManager.loadFailed'))
+  if (!isAdmin.value) return
+  if (configResult.status === 'fulfilled' && configResult.value) applyConfig(configResult.value)
+  else ElMessage.error(configResult.status === 'rejected' && configResult.reason instanceof Error
+    ? configResult.reason.message
+    : t('ai.knowledgeManager.loadFailed'))
 }
 
 async function runSearch(): Promise<void> {
   const query = searchQuery.value.trim()
   if (!query) return
   searching.value = true
-  searched.value = true
   searchResults.value = []
+  searchFeedback.value = ''
   try {
-    searchResults.value = await searchKnowledge(query, 8)
+    const response = await searchKnowledge(query, 8)
+    searchResults.value = response.results || []
+    if (!searchResults.value.length) {
+      searchFeedback.value = response.index_state === 'ready'
+        ? 'ai.knowledgeManager.searchEmpty'
+        : 'ai.knowledgeManager.searchIndexNotReady'
+    }
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : t('ai.knowledgeManager.searchFailed'))
+    searchFeedback.value = error !== null && typeof error === 'object'
+      && 'status' in error && error.status === 403
+      ? 'ai.knowledgeManager.searchForbidden'
+      : 'ai.knowledgeManager.searchFailed'
   } finally {
     searching.value = false
   }
@@ -322,9 +346,15 @@ async function remove(document: KnowledgeDocument): Promise<void> {
   } catch {
     return
   }
-  await deleteKnowledgeDocument(document.id)
-  ElMessage.success(t('ai.knowledgeManager.deleted'))
-  await load()
+  try {
+    await deleteKnowledgeDocument(document.id)
+    ElMessage.success(t('ai.knowledgeManager.deleted'))
+    await load()
+  } catch (error) {
+    ElMessage.error(error instanceof Error
+      ? error.message
+      : t('ai.knowledgeManager.deleteFailed'))
+  }
 }
 
 async function reindex(): Promise<void> {
@@ -379,6 +409,7 @@ onMounted(load)
 .source-meta span, .source-meta small { display: block; }
 .source-meta span { color: var(--ogs-text-secondary); font: 11px var(--ogs-mono); }
 .source-actions { display: flex; }
+.knowledge-load-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border: 1px solid var(--el-color-danger-light-5); color: var(--el-color-danger); background: var(--el-color-danger-light-9); font-size: 12px; }
 .knowledge-empty { padding: 40px 12px; border-top: 1px solid var(--ogs-border); color: var(--ogs-text-muted); text-align: center; font-size: 12px; }
 .index-panel dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0; border: 1px solid var(--ogs-border); background: var(--ogs-surface); }
 .index-panel dl div { padding: 16px; border-right: 1px solid var(--ogs-border); border-bottom: 1px solid var(--ogs-border); }

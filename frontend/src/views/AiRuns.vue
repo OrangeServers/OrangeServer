@@ -39,22 +39,28 @@
         v-model="searchText"
         class="runs-search"
         clearable
-        :placeholder="t('aiRuns.filter.searchPlaceholder')"
-        :aria-label="t('aiRuns.filter.search')"
+        :placeholder="t(props.alertsOnly ? 'aiRuns.alerts.searchPlaceholder' : 'aiRuns.filter.searchPlaceholder')"
+        :aria-label="t(props.alertsOnly ? 'aiRuns.alerts.search' : 'aiRuns.filter.search')"
       />
       <el-select v-model="statusFilter" class="runs-filter-item" size="default">
-        <el-option :label="`${t('aiRuns.filter.status')}: ${t('aiRuns.filter.all')}`" value="all" />
+        <el-option
+          :label="`${t(props.alertsOnly ? 'aiRuns.alerts.runStatus' : 'aiRuns.filter.status')}: ${t('aiRuns.filter.all')}`"
+          value="all"
+        />
         <el-option
           v-for="status in RUN_STATUSES" :key="status"
-          :label="`${t('aiRuns.filter.status')}: ${t(`aiRuns.status.${status}`)}`"
+          :label="`${t(props.alertsOnly ? 'aiRuns.alerts.runStatus' : 'aiRuns.filter.status')}: ${t(`aiRuns.status.${status}`)}`"
           :value="status"
         />
       </el-select>
       <el-select v-model="outcomeFilter" class="runs-filter-item" size="default">
-        <el-option :label="`${t('aiRuns.filter.outcome')}: ${t('aiRuns.filter.all')}`" value="all" />
+        <el-option
+          :label="`${t(props.alertsOnly ? 'aiRuns.alerts.runOutcome' : 'aiRuns.filter.outcome')}: ${t('aiRuns.filter.all')}`"
+          value="all"
+        />
         <el-option
           v-for="outcome in RUN_OUTCOMES" :key="outcome"
-          :label="`${t('aiRuns.filter.outcome')}: ${t(`aiRuns.outcome.${outcome}`)}`"
+          :label="`${t(props.alertsOnly ? 'aiRuns.alerts.runOutcome' : 'aiRuns.filter.outcome')}: ${t(`aiRuns.outcome.${outcome}`)}`"
           :value="outcome"
         />
       </el-select>
@@ -73,14 +79,82 @@
         <el-button size="small" @click="loadRuns">{{ t('common.action.retry') }}</el-button>
       </el-alert>
       <el-empty
-        v-else-if="!loading && !loadError && scopedRuns.length === 0"
+        v-if="!loading && !loadError && scopedRuns.length === 0"
         :description="t(props.alertsOnly ? 'aiRuns.alerts.empty' : 'aiRuns.empty')"
       />
       <el-empty
         v-else-if="!loading && !loadError && filteredRuns.length === 0"
         :description="t('aiRuns.emptyFiltered')"
       />
-      <div v-else class="runs-groups">
+      <div v-else-if="filteredRuns.length && props.alertsOnly" class="alerts-board" :aria-label="t('aiRuns.alerts.listLabel')">
+        <p class="alerts-data-boundary">{{ t('aiRuns.alerts.dataBoundary') }}</p>
+        <div class="alerts-cards">
+          <div v-for="group in alertGroups" :key="group.key" class="alert-group">
+            <button
+              type="button"
+              class="alert-card"
+              :class="`is-alert-${alertState(group.latest)}`"
+              :aria-label="alertCardLabel(group.latest, group.runs.length)"
+              @click="openRun(group.latest)"
+            >
+              <span class="alert-overview">
+                <span class="alert-signal-line">
+                  <span class="alert-signal-label">{{ t('aiRuns.alerts.currentState') }}</span>
+                  <span class="alert-signal">
+                    <span class="alert-signal-dot" aria-hidden="true" />
+                    {{ alertStateText(group.latest) }}
+                  </span>
+                </span>
+                <span class="alert-service-label">{{ t('aiRuns.alerts.service') }}</span>
+                <strong class="alert-service">{{ alertService(group.latest) }}</strong>
+                <span class="alert-asset">{{ t('aiRuns.row.asset') }} · {{ knownText(group.latest.host_alias) }}</span>
+              </span>
+
+              <span class="alert-run">
+                <span class="alert-run-head">
+                  <span class="alert-fact-label">{{ t('aiRuns.alerts.linkedRun') }}</span>
+                  <span class="alert-run-id">#{{ group.latest.id.slice(0, 8) }}</span>
+                </span>
+                <span class="alert-run-tags">
+                  <el-tag size="small" :type="statusTagType(group.latest.status)" effect="light" round>
+                    {{ t(`aiRuns.status.${group.latest.status}`) }}
+                  </el-tag>
+                  <el-tag size="small" :type="outcomeTagType(group.latest.outcome || '')" effect="plain" round>
+                    {{ group.latest.outcome ? t(`aiRuns.outcome.${group.latest.outcome}`) : t('aiRuns.outcome.none') }}
+                  </el-tag>
+                </span>
+                <span class="alert-run-created">
+                  {{ t('aiRuns.alerts.occurrences', { n: group.runs.length }) }}
+                  <span aria-hidden="true">·</span>
+                  {{ t('aiRuns.alerts.latestNotification') }} ·
+                  <time v-if="alertTimestamp(group.latest)" :datetime="alertTimestamp(group.latest)">
+                    {{ formatTimeAbs(alertTimestamp(group.latest)) || t('aiRuns.alerts.unknown') }}
+                  </time>
+                  <span v-else>{{ t('aiRuns.alerts.unknown') }}</span>
+                </span>
+              </span>
+              <span class="runs-row-arrow" aria-hidden="true">→</span>
+            </button>
+            <details v-if="group.runs.length > 1" class="alert-history">
+              <summary>{{ t('aiRuns.alerts.history', { n: group.runs.length - 1 }) }}</summary>
+              <button
+                v-for="run in group.runs.slice(1)"
+                :key="run.id"
+                type="button"
+                class="alert-history-row"
+                :aria-label="alertCardLabel(run, 1)"
+                @click="openRun(run)"
+              >
+                <time v-if="alertTimestamp(run)" :datetime="alertTimestamp(run)">{{ formatTimeAbs(alertTimestamp(run)) }}</time>
+                <span>{{ alertStateText(run) }}</span>
+                <span>{{ t(`aiRuns.status.${run.status}`) }}<template v-if="run.outcome"> · {{ t(`aiRuns.outcome.${run.outcome}`) }}</template></span>
+                <code>#{{ run.id.slice(0, 8) }}</code>
+              </button>
+            </details>
+          </div>
+        </div>
+      </div>
+      <div v-else-if="filteredRuns.length" class="runs-groups">
         <section v-for="group in runGroups" :key="group.key" class="runs-group">
           <header class="runs-group-head">
             <div class="runs-group-title">
@@ -138,7 +212,7 @@
     <el-dialog
       v-model="dialogVisible"
       :title="t('aiRuns.dialog.title')"
-      width="640px"
+      width="min(640px, calc(100vw - 24px))"
       :close-on-click-modal="false"
       destroy-on-close
     >
@@ -225,9 +299,9 @@ import { useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { Plus, Refresh } from '@element-plus/icons-vue'
 import { t } from '@/i18n'
-import { getHostList, getSysUserList } from '@/api'
+import { getHostList } from '@/api'
 import {
-  createAutonomyRun, getAutonomyStatus, listAutonomyRuns,
+  createAutonomyRun, getAutonomyStatus, listAutonomyRuns, listAutonomySystemUsers,
 } from '@/api/autonomy'
 import { isTerminalRunStatus, AUTONOMY_ACTION_CATEGORIES } from '@/types/autonomy'
 import type {
@@ -295,12 +369,38 @@ const filteredRuns = computed<AutonomyRun[]>(() => scopedRuns.value.filter((run)
   const query = searchText.value.trim().toLocaleLowerCase()
   if (query) {
     const haystack = [run.goal, run.id, run.host_alias, run.system_user_alias]
+      .concat(run.trigger_summary, run.trigger_ref || '')
       .join(' ')
       .toLocaleLowerCase()
     if (!haystack.includes(query)) return false
   }
   return true
 }))
+
+interface AlertGroup {
+  key: string
+  latest: AutonomyRun
+  runs: AutonomyRun[]
+}
+
+const alertGroups = computed<AlertGroup[]>(() => {
+  const groups = new Map<string, AutonomyRun[]>()
+  for (const run of filteredRuns.value) {
+    const service = alertService(run)
+    const key = service === t('aiRuns.alerts.unknown')
+      ? `run:${run.id}`
+      : `${run.host_id}:${service.toLocaleLowerCase()}`
+    const group = groups.get(key) || []
+    group.push(run)
+    groups.set(key, group)
+  }
+  return [...groups.entries()].map(([key, groupedRuns]) => {
+    const ordered = [...groupedRuns].sort((left, right) => (
+      alertTimestampValue(right) - alertTimestampValue(left)
+    ))
+    return { key, latest: ordered[0], runs: ordered }
+  })
+})
 
 const runGroups = computed(() => RUN_GROUPS
   .map(group => ({
@@ -328,6 +428,45 @@ function triggerSource(triggerType: string): string {
   return triggerType || t('aiRuns.trigger.unknown')
 }
 
+type AlertState = 'firing' | 'resolved' | 'unknown'
+
+function alertService(run: AutonomyRun): string {
+  const match = /^(?:firing|resolved):\s+(.+)\s+on asset #\d+$/.exec(run.trigger_summary.trim())
+  return knownText(match?.[1])
+}
+
+function alertState(run: AutonomyRun): AlertState {
+  return run.alert_state === 'firing' || run.alert_state === 'resolved'
+    ? run.alert_state
+    : 'unknown'
+}
+
+function alertStateText(run: AutonomyRun): string {
+  return t(`aiRuns.alerts.signal.${alertState(run)}`)
+}
+
+function knownText(value: string | null | undefined): string {
+  return value?.trim() || t('aiRuns.alerts.unknown')
+}
+
+function alertCardLabel(run: AutonomyRun, occurrences: number): string {
+  return t('aiRuns.alerts.cardLabel', {
+    signal: alertStateText(run),
+    service: alertService(run),
+    status: t(`aiRuns.status.${run.status}`),
+    n: occurrences,
+  })
+}
+
+function alertTimestamp(run: AutonomyRun): string {
+  return run.alert_updated_at || run.created_at || ''
+}
+
+function alertTimestampValue(run: AutonomyRun): number {
+  const value = Date.parse(alertTimestamp(run))
+  return Number.isFinite(value) ? value : 0
+}
+
 function nextStep(status: AutonomyRunStatus): string {
   return t(NEXT_STEP_KEYS[status])
 }
@@ -341,6 +480,7 @@ function statusTagType(status: string): '' | 'success' | 'warning' | 'info' | 'd
 }
 
 function outcomeTagType(outcome: string): '' | 'success' | 'warning' | 'info' | 'danger' {
+  if (!outcome) return 'info'
   if (outcome === 'resolved') return 'success'
   if (outcome === 'not_resolved') return 'danger'
   return 'warning'
@@ -362,7 +502,10 @@ function activityTimestamp(run: AutonomyRun): string {
 }
 
 function openRun(run: AutonomyRun): void {
-  void router.push({ name: 'AiOpsRunDetail', params: { runId: run.id } })
+  void router.push({
+    name: 'AiOpsRunDetail',
+    params: { runId: run.id },
+  })
 }
 
 async function loadRuns(): Promise<void> {
@@ -441,18 +584,18 @@ async function openCreate(): Promise<void> {
   try {
     const [hostRes, userRes] = await Promise.all([
       getHostList(),
-      getSysUserList(),
+      listAutonomySystemUsers(),
     ]) as unknown as [
       { host_list_msg?: Array<{ id: number; alias?: string; host_ip?: string }> },
-      { sys_user_list_msg?: Array<{ id: number; alias?: string; host_user?: string }> },
+      Array<{ id: number; alias: string }>,
     ]
     hostOptions.value = (hostRes.host_list_msg || []).map((host) => ({
       id: Number(host.id),
       label: host.alias ? `${host.alias} · ${host.host_ip || ''}` : String(host.host_ip || host.id),
     }))
-    sysUserOptions.value = (userRes.sys_user_list_msg || []).map((user) => ({
+    sysUserOptions.value = userRes.map((user) => ({
       id: Number(user.id),
-      label: user.alias || String(user.host_user || user.id),
+      label: user.alias || String(user.id),
     }))
     optionsLoaded.value = true
   } catch {
@@ -514,6 +657,169 @@ async function submitCreate(): Promise<void> {
   color: var(--ogs-text-tertiary);
 }
 .runs-panel { min-height: 320px; }
+.alerts-board {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.alerts-data-boundary {
+  margin: 0;
+  padding: 9px 12px;
+  border-left: 3px solid var(--ogs-warning);
+  color: var(--ogs-text-secondary);
+  background: var(--ogs-warning-soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.alerts-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.alert-group { min-width: 0; }
+.alert-card {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(220px, 1.15fr) minmax(300px, 1fr) 16px;
+  align-items: stretch;
+  gap: 16px;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--ogs-border);
+  border-left: 4px solid var(--ogs-text-muted);
+  border-radius: 6px;
+  color: var(--ogs-text);
+  background: var(--ogs-surface);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+}
+.alert-card:hover {
+  border-color: var(--ogs-primary);
+  box-shadow: 0 5px 18px rgba(15, 23, 42, .08);
+  transform: translateY(-1px);
+}
+.alert-card:focus-visible {
+  outline: 2px solid var(--ogs-primary);
+  outline-offset: 2px;
+}
+.alert-card.is-alert-firing { border-left-color: var(--ogs-danger); }
+.alert-card.is-alert-resolved { border-left-color: var(--ogs-success); }
+.alert-overview,
+.alert-run {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  padding: 14px 0;
+}
+.alert-overview { padding-left: 14px; }
+.alert-signal-line,
+.alert-run-head,
+.alert-run-tags {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.alert-signal-label,
+.alert-service-label,
+.alert-fact-label {
+  color: var(--ogs-text-secondary);
+  font: 10px/1.2 var(--ogs-mono);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.alert-signal {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ogs-text-secondary);
+  font: 700 11px/1.2 var(--ogs-mono);
+}
+.alert-signal-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--ogs-text-muted);
+}
+.is-alert-firing .alert-signal { color: var(--ogs-danger); }
+.is-alert-firing .alert-signal-dot { background: var(--ogs-danger); }
+.is-alert-resolved .alert-signal { color: var(--ogs-success); }
+.is-alert-resolved .alert-signal-dot { background: var(--ogs-success); }
+.alert-service {
+  overflow: hidden;
+  font-size: 15px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.alert-asset,
+.alert-run-created {
+  overflow: hidden;
+  color: var(--ogs-text-secondary);
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.is-mono,
+.alert-run-id { font-family: var(--ogs-mono); }
+.alert-run-id {
+  overflow: hidden;
+  color: var(--ogs-text-secondary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.alert-run-tags { flex-wrap: wrap; }
+.alert-run-created time { font-family: var(--ogs-mono); }
+.alert-card > .runs-row-arrow {
+  align-self: center;
+  padding-right: 12px;
+}
+.alert-history {
+  margin: -1px 8px 0;
+  overflow: hidden;
+  border: 1px solid var(--ogs-border);
+  border-top: 0;
+  border-radius: 0 0 5px 5px;
+  background: var(--ogs-bg-elevated);
+}
+.alert-history > summary {
+  padding: 8px 12px;
+  color: var(--ogs-text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+.alert-history > summary:focus-visible {
+  outline: 2px solid var(--ogs-primary);
+  outline-offset: -2px;
+}
+.alert-history-row {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 120px minmax(80px, .7fr) minmax(160px, 1fr) 72px;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 0;
+  border-top: 1px solid var(--ogs-border-subtle);
+  color: var(--ogs-text-secondary);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font-size: 11px;
+}
+.alert-history-row:hover,
+.alert-history-row:focus-visible { background: var(--ogs-bg-sunken); }
+.alert-history-row:focus-visible { outline: 2px solid var(--ogs-primary); outline-offset: -2px; }
+.alert-history-row time,
+.alert-history-row code { font-family: var(--ogs-mono); }
+.alert-history-row code { color: var(--ogs-text-secondary); text-align: right; }
 .runs-groups {
   display: flex;
   flex-direction: column;
@@ -751,6 +1057,11 @@ async function submitCreate(): Promise<void> {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .alert-card {
+    grid-template-columns: minmax(180px, 1fr) minmax(260px, 1fr) 16px;
+    gap: 12px;
+  }
+  .alert-card > .runs-row-arrow { grid-column: 3; }
 }
 @media (max-width: 520px) {
   .runs-filter-item { width: 100%; }
@@ -759,5 +1070,24 @@ async function submitCreate(): Promise<void> {
   .runs-group-hint { max-width: 100%; }
   .runs-row-context { gap: 4px; }
   .runs-row-context > span:last-child { display: none; }
+  .alert-card {
+    grid-template-columns: minmax(0, 1fr) 16px;
+    gap: 0 10px;
+  }
+  .alert-overview { grid-column: 1; grid-row: 1; padding-right: 12px; }
+  .alert-run {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    flex-wrap: wrap;
+    padding: 12px 14px;
+    border-top: 1px solid var(--ogs-border-subtle);
+  }
+  .alert-card > .runs-row-arrow { grid-column: 2; grid-row: 1; }
+  .alert-history { margin-inline: 4px; }
+  .alert-history-row {
+    grid-template-columns: 1fr auto;
+    gap: 4px 10px;
+  }
+  .alert-history-row code { grid-column: 2; grid-row: 1; }
 }
 </style>

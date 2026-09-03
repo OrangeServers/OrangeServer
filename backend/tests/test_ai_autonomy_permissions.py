@@ -11,6 +11,7 @@ from app.core.db.database import (
     t_auth_host_host_group,
     t_auth_host_sys_user,
     t_auth_host_user,
+    t_auth_host_user_group,
     t_group,
     t_host,
     t_sys_user,
@@ -43,6 +44,7 @@ def _permission_fixture():
         t_sys_user.__table__,
         t_auth_host.__table__,
         t_auth_host_user.__table__,
+        t_auth_host_user_group.__table__,
         t_auth_host_host_group.__table__,
         t_auth_host_sys_user.__table__,
     ])
@@ -104,6 +106,65 @@ def test_user_asset_and_credential_grants_must_be_the_same_pair():
         assert platform.validate_asset_sys_user_id_pair(
             [hosts["ops"].id], 7,
         ) is True
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_system_user_listing_applies_direct_group_active_and_soft_delete_rules():
+    engine, session, _hosts, _auth_ops, auth_direct = _permission_fixture()
+    try:
+        user = session.query(t_acc_user).filter_by(name="alice").one()
+        user.group = "operators"
+        session.add_all([
+            t_sys_user(
+                id=8, alias="group-reader", host_user="group",
+                agreement="ssh",
+            ),
+            t_sys_user(
+                id=9, alias="hidden", host_user="hidden", agreement="ssh",
+            ),
+            t_sys_user(
+                id=10, alias="retired", host_user="retired",
+                agreement="ssh", is_deleted=True,
+            ),
+        ])
+        group_auth = t_auth_host(name="operators-grant")
+        session.add(group_auth)
+        session.flush()
+        session.add_all([
+            t_auth_host_user_group(
+                auth_id=group_auth.id, group_name="operators",
+            ),
+            t_auth_host_sys_user(
+                auth_id=group_auth.id, sys_user_alias="group-reader",
+            ),
+            t_auth_host_sys_user(
+                auth_id=group_auth.id, sys_user_alias="retired",
+            ),
+        ])
+        session.commit()
+
+        user_rows = PlatformQueryService(
+            "alice", "user", session=session,
+        ).list_authorized_system_users().rows
+        assert [row["alias"] for row in user_rows] == [
+            "group-reader", "readonly",
+        ]
+
+        admin_rows = PlatformQueryService(
+            "admin", "admin", session=session,
+        ).list_authorized_system_users().rows
+        assert [row["alias"] for row in admin_rows] == [
+            "group-reader", "hidden", "readonly",
+        ]
+
+        group_auth.is_deleted = True
+        auth_direct.is_deleted = True
+        session.commit()
+        assert PlatformQueryService(
+            "alice", "user", session=session,
+        ).list_authorized_system_users().rows == []
     finally:
         session.close()
         engine.dispose()

@@ -61,9 +61,50 @@ def _iso(value):
 def _conversation_summary(row):
     return {
         **row,
+        "autonomy_mode": str(row.get("autonomy_mode") or "ask"),
+        "autonomy_profile": row.get("autonomy_profile"),
         "created_at": _iso(row.get("created_at")),
         "updated_at": _iso(row.get("updated_at")),
     }
+
+
+def _conversation_autonomy_permission(payload):
+    from app.ai.autonomy.repository import (
+        AutonomyValidationError,
+        parse_custom_profile,
+    )
+    from app.ai.autonomy.state import (
+        AutonomyStateError,
+        RunMode,
+        normalize_run_mode,
+    )
+
+    if "autonomy_mode" not in payload:
+        raw_mode = "ask"
+    else:
+        raw_value = payload.get("autonomy_mode")
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            raise AutonomyValidationError(
+                "autonomy_mode must be ask, ai_review, auto, or custom"
+            )
+        raw_mode = raw_value.strip()
+    try:
+        mode = normalize_run_mode(raw_mode)
+    except AutonomyStateError as exc:
+        raise AutonomyValidationError(str(exc)) from exc
+    allowed = {RunMode.ASK, RunMode.AI_REVIEW, RunMode.AUTO, RunMode.CUSTOM}
+    if mode not in allowed or mode.value != raw_mode:
+        raise AutonomyValidationError("unsupported conversation autonomy mode")
+    profile_payload = payload.get("autonomy_profile")
+    if mode == RunMode.CUSTOM:
+        profile = parse_custom_profile(profile_payload)
+    else:
+        if profile_payload is not None:
+            raise AutonomyValidationError(
+                "autonomy profile is only valid with mode=custom"
+            )
+        profile = None
+    return mode.value, profile
 
 
 def _project_tool_events(events):
@@ -103,7 +144,7 @@ def _project_autonomy_drafts(events):
     for event in events or []:
         if event.get("type") != "autonomy.draft_created":
             continue
-        drafts.append({
+        draft = {
             "id": str(event.get("id") or ""),
             "run_id": str(event.get("run_id") or ""),
             "goal": str(event.get("goal") or ""),
@@ -111,7 +152,14 @@ def _project_autonomy_drafts(events):
             "mode": str(event.get("mode") or ""),
             "host_alias": str(event.get("host_alias") or ""),
             "created_at": _iso(event.get("created_at")),
-        })
+        }
+        if isinstance(event.get("action_categories"), list):
+            draft["action_categories"] = [
+                str(category)
+                for category in event["action_categories"]
+                if category
+            ]
+        drafts.append(draft)
     return drafts
 
 
@@ -383,22 +431,56 @@ def conversations():
 
 
 def create_conversation():
+    from app.ai.autonomy.repository import AutonomyValidationError
+
     _holder, owner, _role = _identity()
     payload = _payload()
     providers = ProviderConfigService()
     try:
         row = providers.configured_row(str(payload.get("provider_code") or "") or None)
         context_mode = providers.context_mode(row, payload.get("context_mode"))
+        autonomy_mode, autonomy_profile = _conversation_autonomy_permission(payload)
         conversation = _store().create_conversation(
             owner,
             row.provider_code,
             row.model,
             context_mode=context_mode,
+            autonomy_mode=autonomy_mode,
+            autonomy_profile=autonomy_profile,
         )
         conversation = _conversation_summary(conversation)
         return _ok(conversation=conversation, data=conversation)
-    except ProviderConfigError as exc:
+    except (ProviderConfigError, AutonomyValidationError, ValueError) as exc:
         return _error(str(exc))
+
+
+def update_conversation(conversation_id: str):
+    from app.ai.autonomy.repository import AutonomyValidationError
+
+    _holder, owner, _role = _identity()
+    payload = _payload()
+    store = _store()
+    lock_token = None
+    try:
+        if "autonomy_mode" not in payload:
+            raise AutonomyValidationError("autonomy_mode is required")
+        autonomy_mode, autonomy_profile = _conversation_autonomy_permission(payload)
+        lock_token = store.acquire_run_lock(owner, conversation_id, ttl=30)
+        conversation = store.get_conversation(owner, conversation_id)
+        conversation["autonomy_mode"] = autonomy_mode
+        conversation["autonomy_profile"] = autonomy_profile
+        conversation = store.save_conversation(owner, conversation)
+        conversation = _conversation_summary(conversation)
+        return _ok(conversation=conversation, data=conversation)
+    except AutonomyValidationError as exc:
+        return _error(str(exc))
+    except AgentStoreNotFound as exc:
+        return _error(str(exc), 404)
+    except AgentStoreConflict as exc:
+        return _error(str(exc), 409)
+    finally:
+        if lock_token:
+            store.release_run_lock(owner, conversation_id, lock_token)
 
 
 def conversation_detail(conversation_id: str):
@@ -455,6 +537,8 @@ def conversation_detail(conversation_id: str):
             "provider_code": conversation.get("provider_code"),
             "model": conversation.get("model"),
             "context_mode": conversation.get("context_mode"),
+            "autonomy_mode": str(conversation.get("autonomy_mode") or "ask"),
+            "autonomy_profile": conversation.get("autonomy_profile"),
             "created_at": _iso(conversation.get("created_at")),
             "updated_at": _iso(conversation.get("updated_at")),
             "messages": display_messages,

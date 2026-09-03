@@ -29,6 +29,10 @@ def register_autonomy_routes(app: Any) -> None:
         "/ai/ops/status", "ai_ops_status",
         _secure(views.ops_status, *run_users), methods=["GET"],
     )
+    app.add_url_rule(
+        "/ai/autonomy/system-users", "ai_autonomy_system_users",
+        _secure(views.system_user_options, *run_users), methods=["GET"],
+    )
     # Machine-to-machine endpoint: its own constant-time Bearer check replaces
     # session auth and CSRF; never wrap it with the browser security chain.
     app.add_url_rule(

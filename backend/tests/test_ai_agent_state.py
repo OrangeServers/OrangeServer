@@ -44,6 +44,17 @@ class FakeRedis:
             self.ttls[key] = ttl
         return exists
 
+    def eval(self, script, numkeys, key, *args):
+        assert numkeys == 1
+        if self.get(key) != args[0]:
+            return 0
+        command = script.lower()
+        if "expire" in command:
+            return int(self.expire(key, int(args[1])))
+        if "del" in command:
+            return self.delete(key)
+        raise AssertionError("unsupported FakeRedis script")
+
     def zadd(self, key, mapping):
         self.zsets.setdefault(key, {}).update(mapping)
         return len(mapping)
@@ -121,6 +132,33 @@ def test_conversation_context_mode_defaults_to_standard_and_persists_deep_mode()
     assert listed[deep["id"]]["context_mode"] == DEEP_CONTEXT_MODE
 
 
+def test_conversation_autonomy_permission_defaults_to_ask_and_persists_custom():
+    from app.ai.storage import AgentStore
+
+    store = AgentStore(FakeRedis())
+    standard = store.create_conversation("alice", "minimax", "demo")
+    custom = store.create_conversation(
+        "alice",
+        "minimax",
+        "demo",
+        autonomy_mode="custom",
+        autonomy_profile={"action_categories": ["file_patch", "systemd"]},
+    )
+
+    assert standard["autonomy_mode"] == "ask"
+    assert standard["autonomy_profile"] is None
+    restored = store.get_conversation("alice", custom["id"])
+    assert restored["autonomy_mode"] == "custom"
+    assert restored["autonomy_profile"] == {
+        "action_categories": ["file_patch", "systemd"],
+    }
+    listed = {row["id"]: row for row in store.list_conversations("alice")}
+    assert listed[custom["id"]]["autonomy_mode"] == "custom"
+    assert listed[custom["id"]]["autonomy_profile"] == {
+        "action_categories": ["file_patch", "systemd"],
+    }
+
+
 def test_deleting_conversation_invalidates_result_sets():
     from app.ai.storage import AgentStore, AgentStoreNotFound
 
@@ -170,6 +208,29 @@ def test_conversation_run_lock_blocks_parallel_runs_and_releases_by_token():
 
     store.release_run_lock("alice", conversation["id"], token)
     assert store.acquire_run_lock("alice", conversation["id"])
+
+
+def test_conversation_run_lock_refreshes_and_never_deletes_a_successor():
+    from app.ai.storage import AgentStore, AgentStoreConflict
+
+    redis = FakeRedis()
+    store = AgentStore(redis)
+    conversation = store.create_conversation("alice", "minimax", "demo")
+    key = store._run_lock_key("alice", conversation["id"])
+    old_token = store.acquire_run_lock("alice", conversation["id"], ttl=30)
+
+    store.refresh_run_lock("alice", conversation["id"], old_token, ttl=90)
+    assert redis.ttls[key] == 90
+
+    redis.values[key] = "successor-token"
+    try:
+        store.refresh_run_lock("alice", conversation["id"], old_token)
+    except AgentStoreConflict:
+        pass
+    else:
+        raise AssertionError("a stale owner must not renew its successor's lock")
+    store.release_run_lock("alice", conversation["id"], old_token)
+    assert redis.get(key) == "successor-token"
 
 
 def test_context_compression_keeps_last_four_rounds_and_structured_state():

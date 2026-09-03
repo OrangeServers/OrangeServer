@@ -179,6 +179,24 @@ def test_alert_trigger_roundtrip_and_unique_idempotency(repo_env):
         "admin", "alertmanager", "a" * 64,
     )["id"] == run["id"]
 
+    repo.record_evidence(
+        "admin", run["id"],
+        kind="alert_observation",
+        summary="Alertmanager firing: nginx",
+        event_type="alert_firing",
+    )
+    listed = repo.list_runs("admin")[0]
+    assert listed["alert_state"] == "firing"
+    assert listed["alert_updated_at"] is not None
+
+    repo.record_evidence(
+        "admin", run["id"],
+        kind="alert_observation",
+        summary="Alertmanager reported resolved",
+        event_type="alert_resolved",
+    )
+    assert repo.list_runs("admin")[0]["alert_state"] == "resolved"
+
     row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
     row.status = "completed"
     repo_env["session"].commit()
@@ -192,6 +210,40 @@ def test_alert_trigger_roundtrip_and_unique_idempotency(repo_env):
             trigger_type="alertmanager",
             trigger_ref="a" * 64,
         )
+
+
+def test_list_runs_keeps_old_active_run_ahead_of_recent_history(repo_env):
+    repo = repo_env["repo"]
+    session = repo_env["session"]
+    for index in range(51):
+        run = repo.create_run(
+            "admin", "admin",
+            goal=f"closed run {index}",
+            host_id=repo_env["host_id"],
+            system_user_id=19,
+            mode="ask",
+        )
+        row = session.get(t_ai_autonomous_run, run["id"])
+        row.status = "completed"
+        row.completed_at = datetime.datetime(2026, 8, 30, 0, index)
+        session.commit()
+
+    active = repo.create_run(
+        "admin", "admin",
+        goal="old active run",
+        host_id=repo_env["host_id"],
+        system_user_id=19,
+        mode="ask",
+    )
+    active_row = session.get(t_ai_autonomous_run, active["id"])
+    active_row.created_at = datetime.datetime(2025, 1, 1)
+    session.commit()
+
+    listed = repo.list_runs("admin")
+
+    assert len(listed) == 50
+    assert listed[0]["id"] == active["id"]
+    assert listed[0]["status"] == "draft"
 
 
 def test_external_evidence_appends_timeline_event(repo_env):
@@ -816,6 +868,32 @@ def test_run_is_owner_scoped(repo_env):
         repo_env["repo"].get_run("someone-else", run["id"])
     with pytest.raises(AutonomyNotFound):
         repo_env["repo"].start_run("someone-else", "admin", run["id"])
+
+
+def test_snapshot_exposes_bounded_pre_step_failure_reason(repo_env):
+    repo = repo_env["repo"]
+    run = repo_env["create_started_run"]()
+    row = repo_env["session"].get(t_ai_autonomous_run, run["id"])
+    row.status = "failed"
+    repo.append_event(row, "planner_failed", {
+        "note": (
+            "provider failed; Authorization: Bearer top-secret "
+            "password=orange -----BEGIN PRIVATE KEY-----abc"
+            "-----END PRIVATE KEY-----"
+        ),
+    })
+    repo_env["session"].commit()
+
+    snapshot = repo.snapshot("admin", run["id"])
+
+    assert snapshot["steps"] == []
+    reason = snapshot["failure_reason"]
+    assert "top-secret" not in reason
+    assert "orange" not in reason
+    assert "abc" not in reason
+    assert "Authorization: Bearer [REDACTED]" in reason
+    assert "password=[REDACTED]" in reason
+    assert "[REDACTED PRIVATE KEY]" in reason
 
 
 # ---------------------------------------------------------------------------
