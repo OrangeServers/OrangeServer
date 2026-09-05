@@ -181,6 +181,88 @@ def test_release_bundle_contains_all_compose_runtime_inputs():
     assert "install -m 0755" in builder
 
 
+def _shell_path(path: Path) -> str:
+    # MSYS tar reads a leading drive letter as a remote host, so paths handed to
+    # bash must be POSIX-style. cygpath is absent on Linux, hence the fallback.
+    cygpath = shutil.which("cygpath")
+    if cygpath is None:
+        return path.as_posix()
+    result = subprocess.run(
+        [cygpath, "-u", str(path)], capture_output=True, text=True, check=False,
+    )
+    return result.stdout.strip() or path.as_posix()
+
+
+def test_release_bundle_builder_stages_every_runtime_input(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required to execute the bundle builder")
+    if shutil.which("tar") is None:
+        pytest.skip("tar is required to inspect the built bundle")
+    output_dir = tmp_path / "release-assets"
+    result = subprocess.run(
+        [
+            "bash",
+            _shell_path(OPS / "build-deploy-bundle.sh"),
+            "--version",
+            "v1.2.3",
+            "--output-dir",
+            _shell_path(output_dir),
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+    archive = output_dir / "orangeserver-deploy-v1.2.3.tar.gz"
+    assert archive.is_file()
+    assert (output_dir / "bootstrap-compose.sh").is_file()
+    assert (output_dir / "bootstrap-compose-cn.sh").is_file()
+
+    listing = subprocess.run(
+        ["bash", "-c", 'tar -tzf "$1"', "tar", _shell_path(archive)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert listing.returncode == 0, listing.stderr
+    entries = set(listing.stdout.splitlines())
+    for expected in (
+        "orangeserver/.env.example",
+        "orangeserver/CHANGELOG.md",
+        "orangeserver/Makefile",
+        "orangeserver/backend/.env.example",
+        "orangeserver/backend/mysqldir/orange.sql",
+        "orangeserver/deploy/docker-compose.yml",
+        "orangeserver/deploy/docker-compose.host.yml",
+        "orangeserver/docs/operations/UPGRADE.md",
+        "orangeserver/ops/bootstrap-compose.sh",
+        "orangeserver/ops/bootstrap-compose-cn.sh",
+        "orangeserver/ops/preflight-compose.sh",
+    ):
+        assert expected in entries, f"release bundle is missing {expected}"
+
+    # M2 dropped the nginx frontend container and bakes the SPA into the backend
+    # image, so neither may creep back into the bundle.
+    assert not any(entry.startswith("orangeserver/deploy/nginx/") for entry in entries)
+    assert not any(entry.startswith("orangeserver/frontend/") for entry in entries)
+
+    digest = output_dir / "orangeserver-deploy-v1.2.3.tar.gz.sha256"
+    assert digest.is_file()
+    verified = subprocess.run(
+        [
+            "bash", "-c",
+            'cd "$(dirname "$1")" && sha256sum -c "$(basename "$1")"',
+            "sha256sum", _shell_path(digest),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert verified.returncode == 0, verified.stderr or verified.stdout
+
+
 def test_docker_daemon_example_contains_only_supported_documented_keys():
     config = json.loads(
         (DEPLOY / "daemon.json.example").read_text(encoding="utf-8")
