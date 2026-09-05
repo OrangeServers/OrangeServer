@@ -51,15 +51,21 @@
           <div v-if="!documents.length && !catalogError" class="knowledge-empty">{{ $t('ai.knowledgeManager.empty') }}</div>
           <div v-if="documents.length" class="source-list">
             <article v-for="document in documents" :key="document.id" class="source-row">
-              <div class="source-primary">
+              <component
+                :is="isAdmin ? 'button' : 'div'"
+                class="source-primary"
+                :type="isAdmin ? 'button' : undefined"
+                :aria-label="isAdmin ? $t('ai.knowledgeManager.openDocument', { title: document.title }) : undefined"
+                @click="openDocument(document)"
+              >
                 <span>{{ $t(`ai.knowledgeManager.${document.source_type}`) }}</span>
                 <strong>{{ document.title }}</strong>
                 <small>{{ document.scope }} · v{{ document.version }}</small>
-              </div>
+              </component>
               <div class="source-meta"><span>{{ document.chunk_count }}</span><small>{{ $t('ai.knowledgeManager.chunks') }}</small></div>
               <div class="source-meta"><span>{{ document.indexed ? indexStateLabel('ready') : indexStateLabel('stale') }}</span><small>{{ formatTime(document.updated_at) }}</small></div>
               <div v-if="isAdmin" class="source-actions">
-                <el-button v-if="document.source_type === 'runbook'" text type="primary" @click="openEdit(document)">
+                <el-button v-if="document.source_type === 'runbook'" text type="primary" @click="openDocument(document)">
                   {{ $t('ai.knowledgeManager.edit') }}
                 </el-button>
                 <el-button text type="danger" @click="remove(document)">{{ $t('ai.knowledgeManager.delete') }}</el-button>
@@ -131,7 +137,7 @@
     </el-drawer>
 
     <el-dialog v-model="dialogOpen" append-to-body :title="dialogTitle" width="min(720px, 94vw)" destroy-on-close>
-      <el-form v-if="isAdmin" :model="documentForm" label-position="top">
+      <el-form v-if="isAdmin" :model="documentForm" label-position="top" :disabled="documentReadOnly">
         <div v-if="!editingId" class="document-upload">
           <input
             ref="fileInput"
@@ -155,8 +161,8 @@
         <el-form-item :label="$t('ai.knowledgeManager.content')"><el-input v-model="documentForm.content" type="textarea" :rows="14" maxlength="1048576" /></el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="dialogOpen = false">{{ $t('ai.knowledgeManager.cancel') }}</el-button>
-        <el-button type="primary" :loading="savingDocument" :disabled="previewing" @click="saveDocument">{{ $t('ai.knowledgeManager.save') }}</el-button>
+        <el-button @click="dialogOpen = false">{{ $t(documentReadOnly ? 'ai.knowledgeManager.close' : 'ai.knowledgeManager.cancel') }}</el-button>
+        <el-button v-if="!documentReadOnly" type="primary" :loading="savingDocument" :disabled="previewing" @click="saveDocument">{{ $t('ai.knowledgeManager.save') }}</el-button>
       </template>
     </el-dialog>
   </section>
@@ -213,6 +219,7 @@ const searchQuery = ref('')
 const searchFeedback = ref('')
 const configDrawer = ref(false)
 const dialogOpen = ref(false)
+const documentReadOnly = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
 const previewName = ref('')
 let previewRequestId = 0
@@ -232,7 +239,9 @@ const embeddingLabel = computed(() => {
   return config.value.provider_type === 'local' ? 'bge-small-zh' : (config.value.model || 'OpenAI compatible')
 })
 const keyPlaceholder = computed(() => config.value?.api_key_configured ? t('ai.knowledgeManager.keySaved') : '')
-const dialogTitle = computed(() => t(editingId.value ? 'ai.knowledgeManager.dialogEdit' : 'ai.knowledgeManager.dialogAdd'))
+const dialogTitle = computed(() => t(documentReadOnly.value
+  ? 'ai.knowledgeManager.dialogView'
+  : (editingId.value ? 'ai.knowledgeManager.dialogEdit' : 'ai.knowledgeManager.dialogAdd')))
 
 function indexStateLabel(state: string): string {
   const known = ['empty', 'ready', 'stale', 'rebuilding', 'error', 'unknown']
@@ -331,6 +340,7 @@ function openCreate(): void {
   previewRequestId += 1
   previewing.value = false
   editingId.value = ''
+  documentReadOnly.value = false
   Object.assign(documentForm, { title: '', scope: 'global', content: '' })
   previewName.value = ''
   dialogOpen.value = true
@@ -359,7 +369,7 @@ async function previewUpload(event: Event): Promise<void> {
   }
 }
 
-async function openEdit(document: KnowledgeDocument): Promise<void> {
+async function openDocument(document: KnowledgeDocument): Promise<void> {
   if (!isAdmin.value) return
   previewRequestId += 1
   previewing.value = false
@@ -368,6 +378,7 @@ async function openEdit(document: KnowledgeDocument): Promise<void> {
   try {
     const detail = await getKnowledgeDocument(document.id)
     editingId.value = detail.id
+    documentReadOnly.value = detail.source_type !== 'runbook'
     Object.assign(documentForm, { title: detail.title, scope: detail.scope, content: detail.content || '' })
     dialogOpen.value = true
   } catch (error) {
@@ -378,7 +389,7 @@ async function openEdit(document: KnowledgeDocument): Promise<void> {
 }
 
 async function saveDocument(): Promise<void> {
-  if (!isAdmin.value) return
+  if (!isAdmin.value || documentReadOnly.value) return
   savingDocument.value = true
   try {
     if (editingId.value) await updateKnowledgeDocument(editingId.value, documentForm)
@@ -460,7 +471,10 @@ onMounted(load)
 .read-only { color: var(--ogs-text-muted); font: 10px var(--ogs-mono); }
 .source-list { border-top: 1px solid var(--ogs-border); }
 .source-row { min-width: 0; display: grid; grid-template-columns: minmax(220px, 1fr) 100px 190px auto; align-items: center; gap: 18px; padding: 15px 4px; border-bottom: 1px solid var(--ogs-border); }
-.source-primary { min-width: 0; }
+.source-primary { min-width: 0; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; }
+button.source-primary { cursor: pointer; }
+button.source-primary:hover strong { color: var(--ogs-primary); }
+button.source-primary:focus-visible { outline: 2px solid var(--ogs-primary); outline-offset: 4px; }
 .source-primary > span { color: var(--ogs-primary); font: 700 9px var(--ogs-mono); letter-spacing: .08em; text-transform: uppercase; }
 .source-primary strong, .source-primary small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .source-primary strong { margin-top: 4px; color: var(--ogs-text); font-size: 13px; }

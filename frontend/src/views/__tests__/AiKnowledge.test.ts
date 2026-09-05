@@ -125,6 +125,26 @@ describe('AiKnowledge', () => {
     app.unmount()
   })
 
+  it('opens the document content when an administrator clicks a knowledge source', async () => {
+    const document = {
+      id: 'doc-1', title: 'Disk runbook', source_type: 'runbook', source_ref: null,
+      scope: 'global', content_sha256: 'abc', version: 1, approved: true,
+      indexed: true, chunk_count: 2, created_by: 'admin', created_at: null,
+      updated_at: null,
+    }
+    mocks.listDocuments.mockResolvedValue([document])
+    mocks.getDocument.mockResolvedValue({ ...document, content: '# Disk\n\nCheck usage.' })
+
+    const { app, root } = await mountKnowledge()
+    root.querySelector<HTMLElement>('.source-primary')?.click()
+    await vi.waitFor(() => {
+      expect(mocks.getDocument).toHaveBeenCalledWith('doc-1')
+      expect(Array.from(root.querySelectorAll('input'))
+        .some(input => input.value.includes('Check usage.'))).toBe(true)
+    })
+    app.unmount()
+  })
+
   it('loads an uploaded preview into the existing review form without saving it', async () => {
     const { app, root } = await mountKnowledge()
     Array.from(root.querySelectorAll('button'))
