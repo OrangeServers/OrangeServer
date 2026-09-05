@@ -67,6 +67,7 @@ done
 bundle_root="${STAGE}/orangeserver"
 mkdir -p \
     "${bundle_root}/backend/mysqldir" \
+    "${bundle_root}/deploy" \
     "${bundle_root}/docs/operations" \
     "${bundle_root}/ops"
 
