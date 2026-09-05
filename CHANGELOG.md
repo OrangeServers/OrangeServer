@@ -88,6 +88,9 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The release bundle now includes `ops/healthcheck.sh`, which the packaged
   Makefile's `health` target requires, and `make health` probes the port from
   `OGS_HTTP_PORT` instead of advertising the fixed development port 28000.
+  The probe also accepts the documented first-boot `status: setup` response as
+  healthy; it previously required `status: ok`, so `make health` reported a
+  healthy, not-yet-configured installation as failed.
   DEPLOY.md points container troubleshooting at the `app` service now that
   the bundled topology has no `backend` service.
 

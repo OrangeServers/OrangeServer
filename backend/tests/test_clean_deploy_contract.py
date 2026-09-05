@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -876,6 +877,60 @@ def test_release_bundle_builder_ships_the_healthcheck_script():
     assert required, "build-deploy-bundle.sh must declare its required inputs"
     assert '"ops/healthcheck.sh"' in required.group(1)
     assert 'cp "${ROOT}/ops/healthcheck.sh" "${bundle_root}/ops/"' in source
+
+
+def _run_healthcheck(tmp_path, body: str, code: str):
+    """Execute the real ops/healthcheck.sh against a stub curl on PATH."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    stub = fake_bin / "curl"
+    stub.write_text(
+        "#!/bin/bash\n"
+        "out=/tmp/ogs_health.json\n"
+        'while [ "$#" -gt 0 ]; do\n'
+        '  case "$1" in\n'
+        '    -o) out="$2"; shift 2 ;;\n'
+        "    *) shift ;;\n"
+        "  esac\n"
+        "done\n"
+        'printf "%s" "$OGS_FAKE_BODY" > "$out"\n'
+        'printf "%s" "$OGS_FAKE_CODE"\n',
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{_shell_path(fake_bin)}{os.pathsep}{env['PATH']}"
+    env["OGS_FAKE_BODY"] = body
+    env["OGS_FAKE_CODE"] = code
+    return subprocess.run(
+        ["bash", _shell_path(OPS / "healthcheck.sh")],
+        capture_output=True, text=True, check=False, env=env,
+        # text=True would decode with the locale codec (GBK on a Chinese Windows
+        # host), and the probe emits UTF-8 Chinese; the reader thread then dies
+        # and stdout silently comes back as None.
+        encoding="utf-8", errors="replace",
+    )
+
+
+@pytest.mark.parametrize(
+    "body,code,expect_rc,expect_text",
+    [
+        ('{"status": "ok", "service": "orange-server-backend"}', "200", 0, "status=ok"),
+        ('{"status":"ok"}', "200", 0, "status=ok"),
+        # First-boot wizard: DEPLOY.md documents this as HTTP 200 and healthy.
+        ('{"setup_required":true,"status":"setup"}', "200", 0, "status=setup"),
+        ('{"status":"degraded"}', "200", 1, "[FAIL]"),
+        ("", "000", 1, "[FAIL]"),
+    ],
+)
+def test_healthcheck_accepts_both_documented_healthy_states(
+    tmp_path, body, code, expect_rc, expect_text
+):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required to execute the health probe")
+    result = _run_healthcheck(tmp_path, body, code)
+    assert result.returncode == expect_rc, result.stdout + result.stderr
+    assert expect_text in result.stdout
 
 
 def _builtin_system_seed(schema: str) -> tuple[str, int]:
