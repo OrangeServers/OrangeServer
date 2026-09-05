@@ -408,7 +408,7 @@ CREATE TABLE `t_acc_user` (
 LOCK TABLES `t_acc_user` WRITE;
 /*!40000 ALTER TABLE `t_acc_user` DISABLE KEYS */;
 INSERT INTO `t_acc_user` (`id`,`alias`,`name`,`group`,`password`,`password_version`,`usrole`,`mail`,`remarks`) VALUES (1,'管理员','admin','admin','YWRtaW4=',1,'admin','admin@orange.com','超级管理员');
-INSERT INTO `t_acc_user` (`id`,`alias`,`name`,`group`,`password`,`password_version`,`usrole`,`mail`,`remarks`) VALUES (99,'system','system','admin','J1FTX19fX19fX18=',1,'member','system@orange.local','[REV45-H7/R2-4] 内置系统账号, 作为 cron.job_owner FK 默认目标; 不可删除');
+INSERT INTO `t_acc_user` (`id`,`alias`,`name`,`group`,`password`,`password_version`,`usrole`,`mail`,`remarks`) VALUES (99,'system','system','admin','$2b$12$GrcI53JVdPLfQ/POoL9QBeuSC9lr2DgQ6MWaBHbGZWYSYRrcNiQ5K',2,'member','system@orange.local','[REV45-H7/R2-4] 内置系统账号, 作为 cron.job_owner FK 默认目标; 不可删除');
 /*!40000 ALTER TABLE `t_acc_user` ENABLE KEYS */;
 UNLOCK TABLES;
 

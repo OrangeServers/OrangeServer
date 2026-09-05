@@ -73,7 +73,7 @@ def main() -> int:
             t_settings,
         )
         from app.tools.auto_update import sync_user_permissions
-        from app.tools.basesec import hash_pwd
+        from app.tools.basesec import UNUSABLE_PASSWORD_HASH, hash_pwd
         from app.mail.config import save_configuration
         step('import', True, '业务模块加载成功')
     except Exception as exc:
@@ -101,7 +101,8 @@ def main() -> int:
             if not t_acc_user.query.filter_by(name='system').first():
                 db.session.add(t_acc_user(
                     id=99, alias='system', name='system',
-                    password=hash_pwd('!disabled-system-account!'),
+                    password=UNUSABLE_PASSWORD_HASH,
+                    password_version=2,
                     usrole='member', mail='system@orange.local',
                     group='admin', remarks='内置系统账号, 不可删除',
                 ))
@@ -118,9 +119,8 @@ def main() -> int:
                         previous_username = legacy.name
                         legacy.usrole = 'user'
                         legacy.is_deleted = True
-                        legacy.password = hash_pwd(
-                            '!disabled-legacy-admin-account!'
-                        )
+                        legacy.password = UNUSABLE_PASSWORD_HASH
+                        legacy.password_version = 2
                     existing.password = hashed
                     existing.usrole = 'admin'
                     existing.group = 'admin'

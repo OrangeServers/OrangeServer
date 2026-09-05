@@ -2,7 +2,13 @@ import hashlib, secrets, string, time, hashlib, os
 from flask import request, jsonify, make_response
 # REV38-M6: 统一 API 响应格式, 替换散落 jsonify({'code': ...})
 from app.tools.apierr import api_error, api_response, ApiCode
-from app.tools.basesec import hash_pwd, verify_pwd, needs_rehash, dummy_verify_pwd
+from app.tools.basesec import (
+    PWD_VERSION_BCRYPT_1,
+    dummy_verify_pwd,
+    hash_pwd,
+    needs_rehash,
+    verify_pwd,
+)
 from app.local.Captcha import verify_captcha
 from app.tools.SqlListTool import ListTool
 from app.tools.sendmail import _validate_email, InvalidEmailError
@@ -296,6 +302,9 @@ class UserLogin2(CheckUser, LoginToolsLog):
                 if is_legacy or needs_rehash(user_info.password):
                     try:
                         user_info.password = hash_pwd(self.password)
+                        # REV45-H9: 版本号必须跟着存储格式一起改, 否则
+                        # rev47_h9 的"还有多少账号是 base64"审计会永久虚高
+                        user_info.password_version = PWD_VERSION_BCRYPT_1
                         db.session.commit()
                     except Exception:
                         db.session.rollback()
@@ -577,6 +586,7 @@ class AccUserUpdate(AccUserAdd):
             }
             if self.password:
                 update_kwargs['password'] = hash_pwd(self.password)
+                update_kwargs['password_version'] = PWD_VERSION_BCRYPT_1
             up_user = t_acc_user.query.filter_by(id=self.id).first()
             # REV41-H2: 改名校验 — 新 name 被他人占用时拒绝, id 不存在也直接拒绝
             rename_err = _check_rename_conflict(
@@ -639,6 +649,7 @@ class AccUserResetPwd(CzToolsLog):
             if user:
                 password_en = hash_pwd(self.new_password)
                 user.password = password_en
+                user.password_version = PWD_VERSION_BCRYPT_1
                 db.session.commit()
                 self.host_log(self.cz_name, '用户操作', '重置用户密码', self.name, '成功')
                 return jsonify({'code': 0})
@@ -756,6 +767,7 @@ class ForgotPwdReset:
 
             password_en = hash_pwd(self.new_password)
             user.password = password_en
+            user.password_version = PWD_VERSION_BCRYPT_1
             db.session.commit()
             return jsonify({'code': 0})
         except Exception:

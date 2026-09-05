@@ -72,6 +72,24 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   instead of calling an administrator-only credential-management endpoint.
   Conversation profile changes and Agent turns share the existing run lock so
   neither can overwrite the other's Redis conversation state.
+- The built-in `system` account no longer ships a password that can sign in.
+  The baseline seed and its migration stored a placeholder that the login
+  compatibility path decoded and matched, and the first-boot wizard only
+  creates that row when it is absent and never runs again after a successful
+  apply, so existing installations keep the old value until
+  `rev62_system_account_unusable.sql` runs. Placeholder accounts now store a
+  bcrypt digest whose plaintext was never recorded, and the account keeps its
+  full verification cost so it stays indistinguishable from a real one.
+- Signing in now records the bcrypt password version whenever it transparently
+  upgrades a legacy stored password, as do administrator password resets,
+  self-service resets, and user edits that set a password. The
+  `password_version` audit count previously kept reporting upgraded accounts
+  as legacy base64 forever.
+- The release bundle now includes `ops/healthcheck.sh`, which the packaged
+  Makefile's `health` target requires, and `make health` probes the port from
+  `OGS_HTTP_PORT` instead of advertising the fixed development port 28000.
+  DEPLOY.md points container troubleshooting at the `app` service now that
+  the bundled topology has no `backend` service.
 
 ## [1.1.1] - 2026-08-19
 

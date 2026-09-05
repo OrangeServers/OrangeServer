@@ -12,13 +12,16 @@
 --   4) 给 t_cron.job_owner 加 FK 约束 + 索引
 
 -- 1) 插入内置 system 用户 (若不存在)
---   password = base64('__________') 当作不可登录占位
+--   password = 不可登录哨兵: 一次性随机明文的 bcrypt 摘要 (明文从未落盘, 不可恢复)
+--     不用 hash('!disabled-xxx!') 或 base64 占位串, 因为那两种明文都入仓公开,
+--     verify_pwd 会直接匹配成功 -> "禁用"退化成"人人皆知的口令"
+--     与 app/tools/basesec.py 的 UNUSABLE_PASSWORD_HASH 及 orange.sql 保持一致
 --   usrole=member, mail=系统内部地址, 不会被前端看到
 INSERT IGNORE INTO `t_acc_user`
   (`id`, `alias`, `name`, `group`, `password`, `usrole`, `mail`, `remarks`)
 VALUES
   (99, 'system', 'system', 'admin',
-   'J1FTX19fX19fX18=',
+   '$2b$12$GrcI53JVdPLfQ/POoL9QBeuSC9lr2DgQ6MWaBHbGZWYSYRrcNiQ5K',
    'member',
    'system@orange.local',
    '[REV45-H7/R2-4] 内置系统账号, 作为 cron.job_owner FK 默认目标; 不可删除');

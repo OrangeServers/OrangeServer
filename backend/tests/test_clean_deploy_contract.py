@@ -240,6 +240,7 @@ def test_release_bundle_builder_stages_every_runtime_input(tmp_path):
         "orangeserver/ops/bootstrap-compose.sh",
         "orangeserver/ops/bootstrap-compose-cn.sh",
         "orangeserver/ops/preflight-compose.sh",
+        "orangeserver/ops/healthcheck.sh",
     ):
         assert expected in entries, f"release bundle is missing {expected}"
 
@@ -855,3 +856,101 @@ def test_dev_env_is_generated_and_not_committed():
     assert "umask 077" in init_script
     assert "OGS_AI_AUTONOMY_ENABLED=false" in init_script
     assert "OGS_AI_AUTONOMY_REDIS_PASSWORD=$(random_hex 24)" in init_script
+
+
+def test_health_target_probes_the_configured_http_port():
+    makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    target = makefile.split("\nhealth:", 1)[1].split("\n\n", 1)[0]
+    assert "OGS_HTTP_PORT" in target
+    assert "healthcheck.sh" in target
+    assert "OGS_PORT=" in target
+    # 28000 is the physical-machine dev default only; advertising it as the probe
+    # URL is what made `make health` report an unreachable endpoint on a Compose
+    # deployment that publishes OGS_HTTP_PORT instead.
+    assert "http://127.0.0.1:28000" not in target
+
+
+def test_release_bundle_builder_ships_the_healthcheck_script():
+    source = (OPS / "build-deploy-bundle.sh").read_text(encoding="utf-8")
+    required = re.search(r"required=\((.*?)\n\)", source, re.DOTALL)
+    assert required, "build-deploy-bundle.sh must declare its required inputs"
+    assert '"ops/healthcheck.sh"' in required.group(1)
+    assert 'cp "${ROOT}/ops/healthcheck.sh" "${bundle_root}/ops/"' in source
+
+
+def _builtin_system_seed(schema: str) -> tuple[str, int]:
+    match = re.search(
+        r"INSERT INTO `t_acc_user`[^;]*?'system','system','admin','([^']*)',(\d+),",
+        schema,
+    )
+    assert match, "orange.sql must seed the built-in system account"
+    return match.group(1), int(match.group(2))
+
+
+def test_seeded_builtin_system_account_is_not_loginable():
+    """MySQL runs orange.sql at volume init, *before* the setup wizard, and the
+    wizard only creates `system` when the row is absent — so this INSERT decides
+    what a fresh bundled deployment can log in with."""
+    from app.tools.basesec import UNUSABLE_PASSWORD_HASH, verify_pwd
+
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+    stored, version = _builtin_system_seed(schema)
+    assert stored == UNUSABLE_PASSWORD_HASH
+    assert version == 2, "bcrypt seed must not report the legacy base64 version"
+    assert stored.startswith("$2b$") and len(stored) == 60
+
+    for candidate in ("admin", "system", UNUSABLE_PASSWORD_HASH):
+        assert verify_pwd(candidate, stored) == (False, False)
+
+
+def test_no_seeding_site_hashes_a_committed_placeholder_literal():
+    """hash_pwd('!disabled-...!') reads like a lockout, but the plaintext is in
+    the repository, so it turns "disabled" into a publicly known password."""
+    from app.tools.basesec import UNUSABLE_PASSWORD_HASH
+
+    bootstrap = (BACKEND / "setup" / "bootstrap_db.py").read_text(encoding="utf-8")
+    assert "!disabled-" not in bootstrap
+    assert "UNUSABLE_PASSWORD_HASH" in bootstrap
+
+    for name in ("rev47_h7_cron_owner_fk.sql", "rev62_system_account_unusable.sql"):
+        migration = (BACKEND / "mysqldir" / name).read_text(encoding="utf-8")
+        assert UNUSABLE_PASSWORD_HASH in migration, (
+            f"{name} must use the same sentinel as basesec.UNUSABLE_PASSWORD_HASH"
+        )
+
+    # rev62 repairs deployments whose wizard already ran, so it must be safe to
+    # re-apply and must not touch any account other than the built-in one.
+    remediation = (
+        BACKEND / "mysqldir" / "rev62_system_account_unusable.sql"
+    ).read_text(encoding="utf-8")
+    assert "WHERE `name` = 'system'" in remediation
+    assert f"AND `password` <> '{UNUSABLE_PASSWORD_HASH}'" in remediation
+
+
+def test_in_place_bcrypt_writes_keep_password_version_in_sync():
+    """basesec documents that whoever rehashes must bump password_version, and
+    rev47_h9 ships an audit query that counts remaining base64 accounts by
+    reading that column."""
+    source = (BACKEND / "app" / "users" / "user.py").read_text(encoding="utf-8")
+
+    login = re.search(
+        r"def\s+login_dl\s*\(\s*self\s*\)([\s\S]*?)(?=\n    def\s|\Z)", source,
+    )
+    assert login, "user.py must define login_dl"
+    rehash = re.search(
+        r"user_info\.password = hash_pwd\(self\.password\)([\s\S]*?)"
+        r"db\.session\.commit\(\)",
+        login.group(1),
+    )
+    assert rehash, "login_dl must transparently rehash legacy passwords"
+    assert "password_version" in rehash.group(1)
+
+    for anchor in (
+        "user.password = password_en",
+        "update_kwargs['password'] = hash_pwd(self.password)",
+    ):
+        for match in re.finditer(re.escape(anchor), source):
+            window = source[match.end(): match.end() + 160]
+            assert "password_version" in window, (
+                f"{anchor} rewrites the stored format without updating the version"
+            )
