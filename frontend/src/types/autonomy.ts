@@ -239,6 +239,13 @@ export interface KnowledgeDocumentPayload {
   content: string
 }
 
+export interface KnowledgeDocumentPreview {
+  title: string
+  content: string
+  detected_type: 'markdown' | 'text' | 'pdf' | 'docx'
+  warnings: string[]
+}
+
 export interface KnowledgeSearchResult {
   citation_id: string
   document_id: string

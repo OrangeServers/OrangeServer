@@ -49,3 +49,7 @@ python-dotenv>=1.0
 
 # --- LLM Provider (OpenAI-compatible APIs) -------------------------------
 openai>=2.46,<3
+
+# --- Reviewed knowledge document conversion (M2) -------------------------
+markitdown[pdf,docx]>=0.1.7,<0.2
+redisvl>=0.25,<0.26

@@ -11,8 +11,8 @@ from app.ai.knowledge import (
     CHUNK_SIZE,
     KnowledgeService,
     KnowledgeValidationError,
+    _HybridKnowledgeStore,
     _chunks,
-    _missing_index_error,
 )
 from app.core.db.database import (
     db,
@@ -30,7 +30,7 @@ class FakeStoreFactory:
         self.hits = []
         self.reset_calls = 0
         self.on_batch = None
-        self.search_namespaces = []
+        self.search_calls = []
 
     @contextmanager
     def __call__(self, _row, *, reset=False):
@@ -39,20 +39,19 @@ class FakeStoreFactory:
             self.operations.clear()
         yield self
 
-    def batch(self, operations):
-        self.operations.extend(operations)
+    def load(self, records):
+        self.operations.extend(records)
         if self.on_batch is not None:
             callback, self.on_batch = self.on_batch, None
             callback()
-        return [None] * len(operations)
+        return [None] * len(records)
 
-    def search(self, namespace, *, query, limit):
+    def search(self, query, *, scopes, limit):
         assert query
-        self.search_namespaces.append(namespace)
-        scope = namespace[-1]
+        self.search_calls.append((query, scopes, limit))
         return [
             hit for hit in self.hits
-            if (hit.value or {}).get('scope') == scope
+            if (hit.get('value') or {}).get('scope') in scopes
         ][:limit]
 
 
@@ -81,13 +80,55 @@ def test_markdown_splitter_is_bounded_and_overlapping():
     assert chunks[0]['text'][-CHUNK_OVERLAP:] == chunks[1]['text'][:CHUNK_OVERLAP]
 
 
-@pytest.mark.parametrize(('message', 'expected'), [
-    ('Unknown Index name', True),
-    ('SEARCH_INDEX_NOT_FOUND Index not found: vectors', True),
-    ('authentication required', False),
-])
-def test_missing_index_error_supports_redis_versions(message, expected):
-    assert _missing_index_error(RuntimeError(message)) is expected
+def test_hybrid_store_fuses_redisvl_text_and_vector_rankings(monkeypatch):
+    from app.ai import knowledge
+
+    class Index:
+        queries = []
+
+        def query(self, query):
+            self.queries.append(query)
+            if 'KNN 32' in str(query):
+                return [
+                    {'document_id': 'doc-2', 'text': 'semantic'},
+                    {'document_id': 'doc-1', 'text': 'exact'},
+                ]
+            return [{'document_id': 'doc-1', 'text': 'exact'}]
+
+    index = Index()
+    monkeypatch.setattr(
+        knowledge, '_embed', lambda _row, texts: [[0.1, 0.2]] * len(texts),
+    )
+    store = _HybridKnowledgeStore(SimpleNamespace(dimension=2), index)
+
+    hits = store.search('disk full', scopes=('global', 'host:7'), limit=8)
+
+    query_texts = [str(query) for query in index.queries]
+    assert len(query_texts) == 2
+    assert any('@text:(disk | full)' in query for query in query_texts)
+    assert all('@scope:{global}' in query and r'@scope:{host\:7}' in query for query in query_texts)
+    assert any('KNN 32' in query for query in query_texts)
+    assert [hit['value']['document_id'] for hit in hits] == ['doc-1', 'doc-2']
+
+
+def test_hybrid_store_serializes_vectors_for_hash_storage(monkeypatch):
+    from app.ai import knowledge
+
+    class Index:
+        records = None
+
+        def load(self, records, **_kwargs):
+            self.records = records
+
+    index = Index()
+    monkeypatch.setattr(knowledge, '_embed', lambda _row, _texts: [[0.1, 0.2]])
+
+    _HybridKnowledgeStore(SimpleNamespace(dimension=2), index).load([
+        {'id': 'doc-1', 'text': 'disk full'},
+    ])
+
+    assert isinstance(index.records[0]['embedding'], bytes)
+    assert len(index.records[0]['embedding']) == 2 * 4
 
 
 def test_document_lifecycle_reindex_and_search_filter(knowledge_env):
@@ -114,16 +155,16 @@ def test_document_lifecycle_reindex_and_search_filter(knowledge_env):
     assert indexed['indexed_chunks'] == len(store.operations) == 1
     assert store.reset_calls == 1
 
-    value = dict(store.operations[0].value)
-    store.hits = [SimpleNamespace(value=value, score=0.91)]
+    value = dict(store.operations[0])
+    store.hits = [{'value': value, 'score': 0.91}]
     result = service.search('disk full', limit=99)
     assert result[0]['citation_id'] == 'K1'
     assert result[0]['version'] == 2
     assert result[0]['scope'] == 'global'
-    assert result[0]['match_reason'] == 'semantic similarity'
+    assert result[0]['match_reason'] == 'hybrid BM25 + semantic'
 
     value['version'] = 1
-    store.hits = [SimpleNamespace(value=value, score=0.99)]
+    store.hits = [{'value': value, 'score': 0.99}]
     assert service.search('stale version') == []
 
     service.delete_document(document['id'])
@@ -227,16 +268,15 @@ def test_search_enforces_global_and_current_host_scopes(knowledge_env):
         'content': 'host seven only',
     })
     service.reindex()
-    store.hits = [SimpleNamespace(
-        value=dict(store.operations[0].value), score=0.9,
-    )]
+    store.hits = [{
+        'value': dict(store.operations[0]), 'score': 0.9,
+    }]
 
     assert service.search('host issue') == []
     assert service.search('host issue', scopes=('global', 'host:8')) == []
     result = service.search('host issue', scopes=('global', 'host:7'))
     assert result[0]['document_id'] == document['id']
-    assert ('ogs', 'knowledge', 'global') in store.search_namespaces
-    assert ('ogs', 'knowledge', 'host:7') in store.search_namespaces
+    assert store.search_calls[-1][1] == ('global', 'host:7')
 
 
 def test_list_documents_filters_metadata_by_requested_scopes(knowledge_env):
@@ -270,10 +310,10 @@ def test_previous_index_layout_is_stale_until_rebuilt(knowledge_env):
     row.index_state = 'ready'
     session.commit()
 
-    store.search_namespaces.clear()
+    store.search_calls.clear()
     assert service.index_state() == 'stale'
     assert service.search('restart cron') == []
-    assert store.search_namespaces == []
+    assert store.search_calls == []
 
     rebuilt = service.reindex()
     assert rebuilt['index_state'] == 'ready'

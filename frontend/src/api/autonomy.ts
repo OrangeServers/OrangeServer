@@ -5,7 +5,7 @@
 //   且 Last-Event-ID 是浏览器禁止手动设置的请求头，续传统一走 after_seq 参数
 //   （后端两者同语义，Last-Event-ID 优先）。
 // =============================================================================
-import { aiJsonRequest, parseEventBlock } from '@/utils/aiStream'
+import { aiFormRequest, aiJsonRequest, parseEventBlock } from '@/utils/aiStream'
 import { t } from '@/i18n'
 import type {
   AIOpsStatus,
@@ -21,6 +21,7 @@ import type {
   AutonomySnapshot,
   KnowledgeDocument,
   KnowledgeDocumentPayload,
+  KnowledgeDocumentPreview,
   KnowledgeEmbeddingConfig,
   KnowledgeSearchResponse,
 } from '@/types/autonomy'
@@ -81,6 +82,14 @@ export function getKnowledgeDocument(documentId: string): Promise<KnowledgeDocum
 export function createKnowledgeDocument(payload: KnowledgeDocumentPayload): Promise<KnowledgeDocument> {
   return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeDocument>>(
     `${KNOWLEDGE_BASE}/documents`, { method: 'POST', body: { ...payload } },
+  ))
+}
+
+export function previewKnowledgeDocument(file: File): Promise<KnowledgeDocumentPreview> {
+  const body = new FormData()
+  body.append('file', file)
+  return envelopeData(aiFormRequest<AutonomyEnvelope<KnowledgeDocumentPreview>>(
+    `${KNOWLEDGE_BASE}/documents/preview`, body,
   ))
 }
 

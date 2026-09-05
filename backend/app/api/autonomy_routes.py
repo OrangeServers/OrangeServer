@@ -98,6 +98,10 @@ def register_autonomy_routes(app: Any) -> None:
         _secure(views.knowledge_documents, *admins), methods=["POST"],
     )
     app.add_url_rule(
+        "/ai/knowledge/documents/preview", "ai_knowledge_document_preview",
+        _secure(views.knowledge_document_preview, *admins), methods=["POST"],
+    )
+    app.add_url_rule(
         "/ai/knowledge/search", "ai_knowledge_search",
         _secure(views.knowledge_search, *run_users), methods=["POST"],
     )

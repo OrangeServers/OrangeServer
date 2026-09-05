@@ -5,6 +5,7 @@
 HTTP 状态码的映射、知识目录与搜索边界，以及功能禁用时不影响既有
 AI 聊天/诊断/批量审批路由。
 """
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
@@ -189,6 +190,7 @@ def test_routes_are_registered_with_expected_verbs():
     ]
     assert {"GET", "PATCH"}.issubset(rules["/ai/knowledge/config"])
     assert {"GET", "POST"}.issubset(rules["/ai/knowledge/documents"])
+    assert "POST" in rules["/ai/knowledge/documents/preview"]
     assert "POST" in rules["/ai/knowledge/search"]
     assert {"GET", "PATCH", "DELETE"}.issubset(rules[
         "/ai/knowledge/documents/<string:document_id>"
@@ -221,7 +223,79 @@ def test_route_role_gates_split_owner_lifecycle_from_admin_controls(monkeypatch)
     assert observed["knowledge_documents"] == [
         ("admin", "user"), ("admin",),
     ]
+    assert observed["knowledge_document_preview"] == [("admin",)]
     assert observed["knowledge_search"] == [("admin", "user")]
+
+
+def test_admin_previews_markdown_without_creating_document(api):
+    client, _state = api
+
+    response = client.post(
+        "/ai/knowledge/documents/preview",
+        data={"file": (BytesIO("# 磁盘扩容\n\n先检查使用率。".encode()), "disk.md")},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["data"] == {
+        "title": "disk",
+        "content": "# 磁盘扩容\n\n先检查使用率。",
+        "detected_type": "markdown",
+        "warnings": [],
+    }
+
+
+@pytest.mark.parametrize(('filename', 'content', 'message'), [
+    ('runbook.exe', b'nope', 'file type'),
+    ('empty.pdf', b'', 'file is empty'),
+    ('runbook.txt', b'\xff', 'UTF-8'),
+])
+def test_document_preview_rejects_unsupported_or_unreadable_uploads(
+    api, filename, content, message,
+):
+    client, _state = api
+
+    response = client.post(
+        "/ai/knowledge/documents/preview",
+        data={"file": (BytesIO(content), filename)},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert message in response.get_json()["msg"]
+
+
+def test_document_preview_rejects_large_and_image_only_pdf(api, monkeypatch):
+    from app.ai import knowledge_ingestion
+
+    client, _state = api
+    too_large = client.post(
+        "/ai/knowledge/documents/preview",
+        data={"file": (
+            BytesIO(b'x' * (knowledge_ingestion.MAX_UPLOAD_BYTES + 1)),
+            "large.txt",
+        )},
+        content_type="multipart/form-data",
+    )
+    assert too_large.status_code == 400
+    assert "10 MiB" in too_large.get_json()["msg"]
+
+    grossly_large = client.post(
+        "/ai/knowledge/documents/preview",
+        data={"file": (BytesIO(b'x' * (11 * 1024 * 1024)), "large.txt")},
+        content_type="multipart/form-data",
+    )
+    assert grossly_large.status_code == 400
+    assert "10 MiB" in grossly_large.get_json()["msg"]
+
+    monkeypatch.setattr(knowledge_ingestion, "_convert_binary", lambda *_: "")
+    image_only = client.post(
+        "/ai/knowledge/documents/preview",
+        data={"file": (BytesIO(b'%PDF-fake'), "scan.pdf")},
+        content_type="multipart/form-data",
+    )
+    assert image_only.status_code == 400
+    assert "OCR is not enabled" in image_only.get_json()["msg"]
 
 
 def test_system_user_options_return_only_authorized_public_metadata(
@@ -395,6 +469,7 @@ def test_user_cannot_use_knowledge_management_endpoints(api):
     targets = [
         ("get", "/ai/knowledge/config", None),
         ("post", "/ai/knowledge/documents", {}),
+        ("post", "/ai/knowledge/documents/preview", {}),
         ("get", "/ai/knowledge/documents/doc-1", None),
         ("patch", "/ai/knowledge/documents/doc-1", {}),
         ("delete", "/ai/knowledge/documents/doc-1", None),

@@ -172,10 +172,15 @@ MySQL 保存文档正文和版本，Redis DB0 中的 chunk/vector 是可删除�
 | GET/PATCH | `/ai/knowledge/config` | admin | 读取或更新本地/远程 embedding 配置；模型或维度变化将索引标记为 `stale` |
 | GET | `/ai/knowledge/documents` | admin/user | 列出获授权范围的来源元数据，不返回正文 |
 | POST | `/ai/knowledge/documents` | admin | 新增管理员审核的 Markdown Runbook |
+| POST | `/ai/knowledge/documents/preview` | admin | 接收一个 multipart `file`，把 Markdown/TXT/PDF/DOCX 转为待审阅 Markdown；不保存原文件或文档 |
 | GET/PATCH/DELETE | `/ai/knowledge/documents/{id}` | admin | 读取正文、更新版本或删除文档 |
 | POST | `/ai/knowledge/search` | admin/user | 在服务端验证的 `global` 与获授权 `host:*` 范围检索；查询最多 512 字符，最多返回 8 条 |
 | POST | `/ai/knowledge/reindex` | admin | 向现有 Celery Worker 提交重建任务，返回 `202`；最多生成 20,000 个 Redis 向量分片 |
 | POST | `/ai/autonomous-runs/{run_id}/knowledge` | admin | 将当前管理员拥有、已解决且独立验证通过的 Run 沉淀为审核知识 |
+
+上传文件最大 10 MiB，转换后的 Markdown 仍受单文档 1 MiB 限制。图片型 PDF 不启用
+OCR，无法提取文字时接口会明确报错。管理员审阅预览后，仍通过文档新增接口保存正文；
+服务端不持久化上传的原始二进制。
 
 固定边界为：单文档 1 MiB、分片 400 字符并重叠 60、检索最多 8 条、注入模型上下文
 最多 16 KiB。只允许 `runbook` 和 `verified_run` 来源。列表接口不返回正文；读取或编辑
@@ -186,6 +191,11 @@ MySQL 保存文档正文和版本，Redis DB0 中的 chunk/vector 是可删除�
 检索响应固定包含 `results`、`count` 和本次请求实际使用的 `index_state`。客户端必须用同一
 响应中的状态区分“索引未就绪”和“索引就绪但没有匹配”，不能用此前缓存的状态把失败显示成
 零结果。
+
+检索由 RedisVL 在统一 Redis 索引内分别执行 BM25 与 embedding 向量检索，两路候选窗口
+均固定为 32，再用确定性的 reciprocal rank fusion 合并并按上述范围、版本和总量边界返回
+引用。它不是模型重排，也不会调用聊天模型；
+只有离线质量样本证明融合不足时才考虑增加 CrossEncoder。
 
 文档范围只接受 `global` 或 `host:<资产 ID>`。聊天检索默认使用 `global`；工具参数提供
 当前用户有权访问的 `host_id` 或精确 `host_alias` 时，也使用对应资产范围。Autonomy

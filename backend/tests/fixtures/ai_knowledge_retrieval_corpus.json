@@ -1,0 +1,68 @@
+{
+  "documents": [
+    {
+      "id": "oracle-listener",
+      "title": "Oracle listener recovery",
+      "text": "ORA-12541 TNS:no listener indicates that the database listener is unavailable. Verify lsnrctl status before restarting it.",
+      "vector": [0.0, 1.0, 0.0, 0.0]
+    },
+    {
+      "id": "nginx-upstream",
+      "title": "Nginx upstream saturation",
+      "text": "When reverse proxy requests intermittently fail, inspect upstream connection capacity, error logs, and backend health before changing limits.",
+      "vector": [1.0, 0.0, 0.0, 0.0]
+    },
+    {
+      "id": "cron-service",
+      "title": "Cron service unavailable",
+      "text": "If scheduled jobs stop running, inspect the cron service state and journal, then verify a new scheduled execution.",
+      "vector": [0.0, 0.0, 1.0, 0.0]
+    },
+    {
+      "id": "disk-pressure",
+      "title": "Filesystem pressure",
+      "text": "ENOSPC means the filesystem or inode table is full. Identify the largest safe cleanup candidates and verify free space after remediation.",
+      "vector": [0.0, 0.0, 0.0, 1.0]
+    },
+    {
+      "id": "host-seven-only",
+      "title": "Host seven private procedure",
+      "text": "HOST7-ONLY identifies the private recovery procedure for host seven.",
+      "scope": "host:7",
+      "vector": [0.5, 0.5, 0.5, 0.5]
+    }
+  ],
+  "queries": [
+    {
+      "text": "ORA-12541",
+      "expected": "oracle-listener",
+      "kind": "exact_identifier",
+      "vector": [0.5, 0.5, 0.5, 0.5]
+    },
+    {
+      "text": "网站请求偶发失败，怀疑后端连接容量耗尽",
+      "expected": "nginx-upstream",
+      "kind": "semantic_paraphrase",
+      "vector": [1.0, 0.0, 0.0, 0.0]
+    },
+    {
+      "text": "ENOSPC",
+      "expected": "disk-pressure",
+      "kind": "exact_identifier",
+      "vector": [0.5, 0.5, 0.5, 0.5]
+    },
+    {
+      "text": "计划任务都不再执行，需要检查调度服务",
+      "expected": "cron-service",
+      "kind": "semantic_paraphrase",
+      "vector": [0.0, 0.0, 1.0, 0.0]
+    },
+    {
+      "text": "HOST7-ONLY",
+      "expected": "host-seven-only",
+      "kind": "scope_filter",
+      "scopes": ["global", "host:7"],
+      "vector": [0.5, 0.5, 0.5, 0.5]
+    }
+  ]
+}

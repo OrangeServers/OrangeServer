@@ -64,3 +64,5 @@ langgraph-checkpoint-redis==0.5.1
 langchain-text-splitters==1.1.2
 # Local ONNX embeddings; the model is baked into the image separately.
 fastembed==0.8.0
+markitdown[pdf,docx]==0.1.7
+redisvl==0.25.0
