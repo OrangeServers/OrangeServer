@@ -3,9 +3,9 @@
 OrangeServer 的 AI 运维能力优先复用现有资产、凭据、SSH、审批和审计体系。
 下列成熟项目用于校验设计方向，不是运行时依赖，也不会被直接嵌入服务。
 
-> 本文同时讨论当前实现和未来方向。已发布能力包括固定只读诊断、人工审批动作，
-> 以及 M1 受控自治；监控、Docker 和 Kubernetes Adapter 仍属于
-> [AI 运维路线图](../ai/ROADMAP.md)中的规划能力。
+> 本文同时讨论当前实现和未来方向。已实现能力包括固定只读 SSH 诊断、人工审批动作、
+> M1 受控自治，以及管理员显式映射后的 Prometheus、Grafana、Loki、Zabbix 动态只读
+> 调查；Docker 和 Kubernetes Adapter 仍属于[AI 运维路线图](../ai/ROADMAP.md)中的规划能力。
 
 ## 参考项目
 
@@ -13,8 +13,14 @@ OrangeServer 的 AI 运维能力优先复用现有资产、凭据、SSH、审批
 
 [HolmesGPT](https://github.com/HolmesGPT/holmesgpt) 将诊断数据源组织为受控
 toolset，并支持 Runbook 驱动的调查流程。OrangeServer 借鉴其“工具分层、按需取证、
-先调查后处置”的思路，但首版只实现现有 SSH 通道上的内部 Adapter，不引入 sidecar
-或公开插件系统。
+先调查后处置”以及“返回实际查询、时间范围和可纠错底层错误”的思路。监控工具分成能力
+发现与来源原生查询，现有 Agent 可以根据前一次证据继续调用下一工具。OrangeServer 使用
+现有 Agent 与官方只读协议，不嵌入 HolmesGPT、sidecar 或第二套 Agent 循环。
+
+[Grafana MCP](https://grafana.com/docs/grafana/latest/developer-resources/mcp/reference/mcp-tools-table/)
+将 Dashboard 搜索、Panel 查询、Prometheus 指标/标签发现、PromQL 与 Loki 查询拆成独立
+工具。OrangeServer 复用这套边界和 Grafana `/api/ds/query` 原生契约，但不把其 Go 二进制
+加入默认镜像。所有协议请求继续经过项目已有的 DNS 固定、SSRF 防护、响应限制和审计层。
 
 ### K8sGPT
 
@@ -25,9 +31,9 @@ toolset，并支持 Runbook 驱动的调查流程。OrangeServer 借鉴其“工
 ### OpenTelemetry
 
 [OpenTelemetry Semantic Conventions](https://opentelemetry.io/docs/specs/semconv/)
-提供跨日志、事件、指标和资源的一致命名方式。当前诊断事件采用 OrangeServer 自身的
-稳定契约；未来接入 Prometheus、Loki 或其他 Adapter 时，优先映射到兼容的资源与事件
-字段，而不是为每个数据源发明新的语义。
+提供跨日志、事件、指标和资源的一致命名方式。当前诊断事件和监控观测采用
+OrangeServer 自身的稳定契约；新增 Adapter 时优先映射到兼容的资源与事件字段，
+而不是为每个数据源发明新的语义。
 
 ### LangGraph 与 Celery
 

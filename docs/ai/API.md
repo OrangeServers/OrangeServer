@@ -295,11 +295,42 @@ SSE 事件使用 MySQL 内的 Run 级单调 `sequence`。客户端断线后应�
 状态和同 Run Evidence ID 引用；所有文本和列表均有服务端上限并经过凭据脱敏。rev59
 以前已结束的历史 Run 没有这些字段时，`conclusion` 为 `null`。
 
-### M1 持久化数据结构
+### 监控数据源与资产映射
+
+管理员通过以下接口配置只读监控来源，并将 OrangeServer 资产与外部身份显式绑定：
+
+| 方法与路径 | 权限 | 用途 |
+|---|---|---|
+| `GET\|POST /ai/admin/monitoring-sources` | admin | 列出或新增 Prometheus、Grafana、Loki、Zabbix 来源 |
+| `PUT\|DELETE /ai/admin/monitoring-sources/{id}` | admin | 更新或删除来源；Token 留空表示保留原值 |
+| `POST /ai/admin/monitoring-sources/{id}/test` | admin | 验证服务与 Token 的只读访问能力 |
+| `GET /ai/admin/monitoring-sources/{id}/discover?host_id={id}` | admin | 返回与资产名称/IP 匹配的候选外部身份 |
+| `GET /ai/admin/monitoring-mappings?host_id={id}` | admin | 查看已确认映射 |
+| `PUT /ai/admin/monitoring-sources/{sourceId}/hosts/{hostId}` | admin | 确认一个来源的资产映射 |
+| `GET /ai/monitoring/sources?host_id={id}` | admin/user | 查看当前用户对该资产可用的来源元数据 |
+
+Token 只以 Fernet 密文保存，所有读取接口仅返回 `token_configured`。Grafana 映射保存
+Data Source UID、底层类型和身份标签；接口不会返回 Grafana 数据源 URL 或安全字段。
+聊天先用 `discover_monitoring` 枚举已授权资产的指标、日志标签、Grafana 面板和 Zabbix
+监控项，再按需要反复调用 `query_prometheus`、`query_loki`、`query_grafana_panel` 与
+`query_zabbix_history`。模型只提交来源 ID 和结构化查询参数；服务端重新验证资产映射，
+自动加入资产标签，并固定 URL、Header、Zabbix method、时间窗、步长、超时和返回上限。
+Prometheus 查询由指标、时序函数和聚合字段生成，Loki 查询只允许在映射日志流中进行
+文本或正则过滤；Grafana 只执行管理员映射 Dashboard 中已有的 Panel 查询。
+
+发现结果保存为 `monitoring_catalog`，每次查询保存为 `monitoring_observation`。查询入口
+最多返回 100 条日志、100 个序列和 1000 个时序值；在该边界内，实际查询、标签、时间戳、
+完整日志行、时序点、Panel Frame 或 Zabbix Item 会同时提供给模型和结果检查器。仅凭据、
+授权头、Cookie、私钥和控制字符会被脱敏，不能把原始证据压缩成只有 min/max/latest。
+`POST /ai/chat` 可携带 `monitoring_source_types` 数组；服务端仅接受唯一的
+`prometheus`、`grafana`、`loki`、`zabbix` 值，并覆盖模型在本轮工具调用中的来源选择。
+单次发现最多检查 100 个已确认映射；超限会明确拒绝，不会静默截断来源。
+
+### M1/M2 持久化数据结构
 
 全新安装由 `backend/mysqldir/orange.sql` 一次创建；已有实例按
 [统一升级流程](../operations/UPGRADE.md) 依次执行 rev53、rev54、rev55、rev56、rev57、
-rev58、rev59、rev60。表是业务事实源，Redis 8 保存 LangGraph checkpoint、Celery broker 和可重建
+rev58、rev59、rev60、rev61。表是业务事实源，Redis 8 保存 LangGraph checkpoint、Celery broker 和可重建
 知识向量。
 
 | 表/字段 | 用途 | 关键约束 |
@@ -312,6 +343,8 @@ rev58、rev59、rev60。表是业务事实源，Redis 8 保存 LangGraph checkpo
 | `t_ai_autonomous_evidence` | 观察索引 | 只保存有界摘要和同 Run Artifact ID 列表；`trusted` 恒为 `0`，不是结论凭据 |
 | `t_ai_embedding_config` | embedding 与索引状态 | 单例配置；远程 API Key 为 Fernet 密文，模型 fingerprint 绑定索引版本 |
 | `t_ai_knowledge_document` | 已审核知识正文 | MySQL 保存正文、来源、版本、范围和 hash；Redis 不作为文档事实源 |
+| `t_ai_monitoring_source` | 只读监控来源 | 地址、类型、TLS 策略和加密 Token；配置接口不回显 Token |
+| `t_ai_monitoring_host_mapping` | 外部资产身份 | `(source_id, host_id)` 唯一；只保存管理员确认的标签、Grafana UID 或 Zabbix hostid |
 
 凭据、完整 Prompt、完整远端输出和可复用的授权不会写入 Graph State、Event payload
 或 Evidence 摘要。所有读取接口都会重新检查当前管理员和 Run 所有权；跨 Run 的

@@ -74,9 +74,15 @@
 
           <!-- AI 运维 -->
           <div v-show="!collapsed && (isAdmin || isUser)" class="sidebar-section">{{ $t('menu.group.intelligence') }}</div>
-          <el-menu-item index="/ai-ops" v-if="isAdmin || isUser" @click="$router.push('/ai-ops')">
-            <el-icon><Cpu /></el-icon><span>{{ $t('menu.aiAgent') }}</span>
-          </el-menu-item>
+          <el-sub-menu index="ai-ops" v-if="isAdmin || isUser">
+            <template #title>
+              <el-icon><Cpu /></el-icon><span>{{ $t('menu.aiAgent') }}</span>
+            </template>
+            <el-menu-item index="/ai-ops" @click="$router.push('/ai-ops')">{{ $t('menu.aiWorkbench') }}</el-menu-item>
+            <el-menu-item index="/ai-ops/tasks" @click="$router.push('/ai-ops/tasks')">{{ $t('menu.aiRuns') }}</el-menu-item>
+            <el-menu-item index="/ai-ops/alerts" @click="$router.push('/ai-ops/alerts')">{{ $t('menu.aiAlerts') }}</el-menu-item>
+            <el-menu-item v-if="isAdmin" index="/ai-ops/sources" @click="$router.push('/ai-ops/sources')">{{ $t('menu.aiMonitoringSources') }}</el-menu-item>
+          </el-sub-menu>
           <el-menu-item index="/ai-knowledge" v-if="isAdmin || isUser" @click="$router.push('/ai-knowledge')">
             <el-icon><Collection /></el-icon><span>{{ $t('menu.aiKnowledge') }}</span>
           </el-menu-item>
@@ -227,7 +233,8 @@ const sidebarWidth = computed<string>(() => (
     : collapsed.value ? '68px' : '232px'
 ))
 const menuActive = computed<string>(() => {
-  if (route.path.startsWith('/ai-ops') || route.path === '/ai-agent' || route.path.startsWith('/ai-runs')) return '/ai-ops'
+  if (route.path.startsWith('/ai-ops/tasks/') || route.path.startsWith('/ai-runs')) return '/ai-ops/tasks'
+  if (route.path === '/ai-agent') return '/ai-ops'
   return route.path
 })
 

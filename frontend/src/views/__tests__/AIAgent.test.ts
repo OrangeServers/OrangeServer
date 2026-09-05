@@ -266,6 +266,60 @@ describe('AIAgent composer', () => {
     app.unmount()
   })
 
+  it('sends the operator selected monitoring source types', async () => {
+    mockEmptyConversationList()
+    const { app, root } = mountAgent()
+    await flush()
+
+    root.querySelector<HTMLButtonElement>('.prompt-card')?.click()
+    root.querySelector<HTMLInputElement>('[data-monitoring-source="grafana"]')?.click()
+    await flush()
+    root.querySelector<HTMLInputElement>('[data-monitoring-source="zabbix"]')?.click()
+    await flush()
+    root.querySelector<HTMLButtonElement>('.send-button')?.click()
+    await flush()
+
+    expect(mocks.postAiStream).toHaveBeenCalledWith('/ai/chat', expect.objectContaining({
+      monitoring_source_types: ['prometheus', 'loki'],
+    }), expect.anything())
+    app.unmount()
+  })
+
+  it('opens the result set attached to each completed tool event', async () => {
+    mocks.aiJsonRequest.mockImplementation((url: string) => {
+      if (url === '/ai/providers') return Promise.resolve({ providers: [{
+        provider_code: 'deepseek', model: 'deepseek-chat', available: true,
+        enabled: true, api_key_configured: true,
+      }] })
+      if (url === '/ai/conversations') return Promise.resolve({ conversations: [{
+        id: 'conversation-1', title: 'monitoring', provider_code: 'deepseek',
+      }] })
+      if (url === '/ai/conversations/conversation-1') return Promise.resolve({ conversation: {
+        id: 'conversation-1', title: 'monitoring', provider_code: 'deepseek',
+        tool_events: [{
+          id: 'tool-1', tool: 'query_prometheus', status: 'success',
+          result_scope: { result_set_id: 'result-1', total: 1 },
+        }],
+      } })
+      if (url === '/ai/results/result-1?page=1&page_size=20') {
+        return Promise.resolve({ result: {
+          kind: 'monitoring_observation', rows: [], page: 1, total: 1,
+        } })
+      }
+      return Promise.resolve({})
+    })
+
+    const { app, root } = mountAgent()
+    await flush()
+    root.querySelector<HTMLButtonElement>('.tool-result-button')?.click()
+    await flush()
+
+    expect(mocks.aiJsonRequest).toHaveBeenCalledWith(
+      '/ai/results/result-1?page=1&page_size=20',
+    )
+    app.unmount()
+  })
+
   it('saves a profile switch and rolls the visible choice back on failure', async () => {
     let failAuto = false
     mocks.aiJsonRequest.mockImplementation((url: string, options?: { method?: string }) => {

@@ -672,6 +672,7 @@ def test_tool_event_projection_keeps_calls_separate_and_never_downgrades():
             "type": "tool.completed",
             "tool": "search_assets",
             "status": "success",
+            "result_scope": {"result_set_id": "result-1", "total": 2},
             "created_at": "2026-07-24T13:00:00+00:00",
         },
         {
@@ -696,6 +697,10 @@ def test_tool_event_projection_keeps_calls_separate_and_never_downgrades():
         "2026-07-24T13:00:00+00:00",
         "2026-07-24T13:00:01+00:00",
     ]
+    assert projected[0]["result_scope"] == {
+        "result_set_id": "result-1",
+        "total": 2,
+    }
 
 
 # =============================================================================

@@ -4,11 +4,29 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
+from app.ai.monitoring import MonitoringValidationError
 from app.ai.storage import AgentStore
 
 
 MAX_QUERY_ROWS = 200
 MAX_PREVIEW_ROWS = 10
+
+
+def _monitoring_model_preview(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Expose bounded redacted evidence so the model can actually investigate."""
+    preview = []
+    for row in rows:
+        safe = {key: value for key, value in row.items() if key != "observations"}
+        observations = row.get("observations")
+        if isinstance(observations, list):
+            safe["observations"] = []
+            for observation in observations:
+                if not isinstance(observation, dict):
+                    continue
+                item = dict(observation)
+                safe["observations"].append(item)
+        preview.append(safe)
+    return preview
 
 
 class ToolError(RuntimeError):
@@ -166,7 +184,92 @@ TOOL_DEFINITIONS = {
         },
         required=["query"],
     ),
+    "discover_monitoring": _tool(
+        "discover_monitoring",
+        "发现资产已映射的监控源，以及可查询的指标、日志标签、Grafana 面板和 "
+        "Zabbix 监控项。先调用本工具，再根据返回的 source_id 和候选项选择查询工具。",
+        {
+            "host_id": {"type": "integer", "minimum": 1},
+            "source_types": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["prometheus", "grafana", "loki", "zabbix"],
+                },
+                "maxItems": 4,
+                "uniqueItems": True,
+            },
+            "search": {"type": "string", "minLength": 1, "maxLength": 128},
+        },
+        required=["host_id"],
+    ),
+    "query_prometheus": _tool(
+        "query_prometheus",
+        "对已授权资产的一个 Prometheus 指标执行有界范围查询。服务端自动加入资产标签；"
+        "可按需要多次调用不同指标、函数和聚合，不得用作变更或修复验证。",
+        {
+            "host_id": {"type": "integer", "minimum": 1},
+            "source_id": {"type": "integer", "minimum": 1},
+            "metric": {"type": "string", "pattern": "^[A-Za-z_:][A-Za-z0-9_:]{0,254}$"},
+            "calculation": {"type": "string", "enum": [
+                "raw", "rate", "irate", "increase", "delta",
+                "avg_over_time", "min_over_time", "max_over_time", "sum_over_time",
+            ]},
+            "range_minutes": {"type": "integer", "enum": [1, 5, 15, 60]},
+            "aggregation": {"type": "string", "enum": [
+                "none", "sum", "avg", "min", "max", "count",
+            ]},
+            "group_by": {"type": "array", "items": {
+                "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            }, "maxItems": 4, "uniqueItems": True},
+            "lookback_minutes": {"type": "integer", "enum": [15, 60, 360, 1440]},
+            "step_seconds": {"type": "integer", "enum": [15, 30, 60, 300]},
+        },
+        required=["host_id", "source_id", "metric"],
+    ),
+    "query_loki": _tool(
+        "query_loki",
+        "在已授权资产的 Loki 日志流内查询文本或正则；服务端固定资产选择器、时间窗和行数。",
+        {
+            "host_id": {"type": "integer", "minimum": 1},
+            "source_id": {"type": "integer", "minimum": 1},
+            "contains": {"type": "string", "minLength": 1, "maxLength": 256},
+            "regex": {"type": "boolean"},
+            "lookback_minutes": {"type": "integer", "enum": [15, 60, 360, 1440]},
+            "limit": {"type": "integer", "enum": [20, 50, 100]},
+        },
+        required=["host_id", "source_id", "contains"],
+    ),
+    "query_grafana_panel": _tool(
+        "query_grafana_panel",
+        "执行已映射 Grafana Dashboard 中指定面板保存的查询，复用面板变量和数据源。",
+        {
+            "host_id": {"type": "integer", "minimum": 1},
+            "source_id": {"type": "integer", "minimum": 1},
+            "panel_id": {"type": "integer", "minimum": 1},
+            "lookback_minutes": {"type": "integer", "enum": [15, 60, 360, 1440]},
+        },
+        required=["host_id", "source_id", "panel_id"],
+    ),
+    "query_zabbix_history": _tool(
+        "query_zabbix_history",
+        "查询已授权资产指定 Zabbix 监控项的历史值；item_id 必须来自 discover_monitoring。",
+        {
+            "host_id": {"type": "integer", "minimum": 1},
+            "source_id": {"type": "integer", "minimum": 1},
+            "item_ids": {"type": "array", "items": {
+                "type": "string", "pattern": "^[0-9]{1,20}$",
+            }, "minItems": 1, "maxItems": 16, "uniqueItems": True},
+            "lookback_minutes": {"type": "integer", "enum": [15, 60, 360, 1440]},
+        },
+        required=["host_id", "source_id", "item_ids"],
+    ),
 }
+
+MONITORING_TOOLS = frozenset({
+    "discover_monitoring", "query_prometheus", "query_loki",
+    "query_grafana_panel", "query_zabbix_history",
+})
 
 
 ADMIN_ONLY_TOOLS = frozenset({
@@ -189,6 +292,10 @@ class ToolRegistry:
         diagnostic_executor: Optional[
             Callable[[Dict[str, Any]], Dict[str, Any]]
         ] = None,
+        monitoring_executor: Optional[
+            Callable[[str, Dict[str, Any]], Dict[str, Any]]
+        ] = None,
+        monitoring_source_types: Optional[tuple[str, ...]] = None,
     ):
         self.store = store
         self.platform = platform
@@ -219,6 +326,8 @@ class ToolRegistry:
         self.autonomy_profile = profile
         self.command_checker = command_checker or self._default_command_checker
         self.diagnostic_executor = diagnostic_executor
+        self.monitoring_executor = monitoring_executor
+        self.monitoring_source_types = monitoring_source_types
 
     @staticmethod
     def _default_command_checker(command: str) -> Optional[str]:
@@ -245,10 +354,13 @@ class ToolRegistry:
         if name == "search_knowledge":
             return self._search_knowledge(arguments)
 
-        method = getattr(self.platform, name, None)
-        if method is None:
-            raise ToolNotAllowed(f"tool is not implemented: {name}")
-        data = method(arguments)
+        if name in MONITORING_TOOLS:
+            data = self._monitoring(name, arguments)
+        else:
+            method = getattr(self.platform, name, None)
+            if method is None:
+                raise ToolNotAllowed(f"tool is not implemented: {name}")
+            data = method(arguments)
         if not isinstance(data, ToolData):
             raise ToolError(f"tool returned invalid data: {name}")
         result_set = self.store.create_result_set(
@@ -264,13 +376,81 @@ class ToolRegistry:
         conversation.setdefault("state", {})["last_result_set_id"] = result_set["id"]
         conversation["state"]["last_result_kind"] = data.kind
         self.store.save_conversation(self.owner, conversation)
+        preview = data.rows[:MAX_PREVIEW_ROWS]
+        if data.kind in {"monitoring_observation", "monitoring_catalog"}:
+            preview = _monitoring_model_preview(data.rows)
         return {
             "result_set_id": result_set["id"],
             "kind": data.kind,
             "summary": data.summary,
-            "preview": data.rows[:MAX_PREVIEW_ROWS],
+            "preview": preview,
             "truncated": len(data.rows) > MAX_PREVIEW_ROWS,
         }
+
+    def _monitoring(self, name: str, arguments: Dict[str, Any]) -> ToolData:
+        if self.monitoring_executor is None:
+            raise ToolNotAllowed("monitoring analysis is unavailable")
+        try:
+            host_id = int(arguments.get("host_id"))
+        except (TypeError, ValueError):
+            raise ToolValidationError("host_id must be an integer") from None
+        if host_id <= 0 or not self.platform.validate_asset_ids([host_id]):
+            raise ToolValidationError("host_id is not authorized")
+        normalized = {**arguments, "host_id": host_id}
+        if name == "discover_monitoring":
+            source_types = (
+                list(self.monitoring_source_types)
+                if self.monitoring_source_types is not None
+                else arguments.get("source_types")
+            )
+            if source_types is not None and (
+                not isinstance(source_types, list)
+                or not 1 <= len(source_types) <= 4
+                or any(value not in {"prometheus", "grafana", "loki", "zabbix"}
+                       for value in source_types)
+                or len(set(source_types)) != len(source_types)
+            ):
+                raise ToolValidationError(
+                    "source_types must contain unique supported types"
+                )
+            if source_types is not None:
+                normalized["source_types"] = source_types
+        else:
+            expected_source_type = {
+                "query_prometheus": "prometheus",
+                "query_loki": "loki",
+                "query_grafana_panel": "grafana",
+                "query_zabbix_history": "zabbix",
+            }[name]
+            if (
+                self.monitoring_source_types is not None
+                and expected_source_type not in self.monitoring_source_types
+            ):
+                raise ToolNotAllowed("monitoring source is disabled for this request")
+            normalized.setdefault("lookback_minutes", 60)
+            if name == "query_loki":
+                normalized.setdefault("limit", 100)
+        try:
+            result = self.monitoring_executor(name, normalized)
+        except ToolError:
+            raise
+        except MonitoringValidationError as exc:
+            raise ToolValidationError(str(exc)) from exc
+        except Exception as exc:
+            raise ToolError("monitoring analysis failed") from exc
+        if not isinstance(result, dict):
+            raise ToolError("monitoring executor returned invalid data")
+        rows = result.get("rows")
+        summary = result.get("summary")
+        if not isinstance(rows, list) or not isinstance(summary, dict):
+            raise ToolError("monitoring executor returned invalid data")
+        return ToolData(
+            kind=str(result.get("kind") or "monitoring_observation"),
+            rows=rows[:MAX_QUERY_ROWS],
+            resource_ids=[host_id],
+            summary=summary,
+            filters=normalized,
+        )
 
     def _search_knowledge(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         from app.ai.knowledge import KnowledgeError, KnowledgeService

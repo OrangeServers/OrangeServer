@@ -28,6 +28,9 @@ SYSTEM_PROMPT = """你是 OrangeServer 的 AI 运维助手。
 数据库字段和命令执行结果。不要生成 SQL，不要声称已经执行尚未审批的操作。
 只读工具可以直接调用；任何远程写操作都必须创建 Autonomy Run 草稿，聊天不能执行。
 受控主机诊断只能调用 run_diagnostic，并且只能选择服务端固定档案和结构化参数。
+监控调查先调用 discover_monitoring，再按候选指标、面板或监控项反复调用对应查询工具；
+监控 URL、凭据和资产映射由服务端控制。必须根据返回证据继续缩小问题范围，不能只查固定
+CPU、内存和负载后结束。监控观测只能作为诊断线索，不能当作执行授权或独立验证。
 自治任务只能调用 create_autonomy_draft 创建草稿；是否启动由用户在自治任务工作台
 决定，聊天中不能启动、批准或取消自治任务。
 工具返回的 result_set_id 是权威结果引用；后续筛选必须重新调用查询工具，不能自行改写 ID。
@@ -415,6 +418,7 @@ class AgentRunner:
         role: str,
         conversation_id: str,
         message: str,
+        monitoring_source_types: Optional[tuple[str, ...]] = None,
     ) -> Iterator[str]:
         message = str(message or "").strip()
         if not message:
@@ -475,6 +479,7 @@ class AgentRunner:
                 conversation_id=conversation_id,
                 autonomy_mode=autonomy_mode,
                 autonomy_profile=autonomy_profile,
+                monitoring_source_types=monitoring_source_types,
                 diagnostic_executor=lambda arguments: {},
             )
             diagnostic_event_queue = [None]
@@ -505,6 +510,17 @@ class AgentRunner:
                 }
 
             registry.diagnostic_executor = execute_diagnostic
+
+            def execute_monitoring(operation, arguments):
+                from app.ai.monitoring import MonitoringAnalysisService
+                from app.core.db.database import db
+
+                service = MonitoringAnalysisService(db.session, registry.platform)
+                if operation == "discover_monitoring":
+                    return service.discover(arguments)
+                return service.query(operation, arguments)
+
+            registry.monitoring_executor = execute_monitoring
 
             for _step in range(self.max_steps):
                 renew_lock()
@@ -723,6 +739,14 @@ class AgentRunner:
                                     id=event_id,
                                     **draft_ref,
                                 )
+                            result_scope = (
+                                {
+                                    "result_set_id": tool_result.get("result_set_id"),
+                                    **(tool_result.get("summary") or {}),
+                                }
+                                if tool_result.get("result_set_id")
+                                else None
+                            )
                             self._record_event(
                                 owner,
                                 conversation_id,
@@ -738,6 +762,7 @@ class AgentRunner:
                                     and (tool_result.get("summary") or {}).get("total") is not None
                                     else str(tool_result.get("reason") or "")
                                 ),
+                                result_scope=result_scope,
                             )
                             yield sse_event(
                                 "tool.completed",
@@ -746,11 +771,10 @@ class AgentRunner:
                                 result=tool_result,
                                 result_scope=(
                                     {
-                                        "result_set_id": tool_result.get("result_set_id"),
-                                        **(tool_result.get("summary") or {}),
+                                        **result_scope,
                                         "sample": tool_result.get("preview") or [],
                                     }
-                                    if tool_result.get("result_set_id")
+                                    if result_scope
                                     else None
                                 ),
                                 run_id=run_id,

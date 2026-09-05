@@ -1,19 +1,5 @@
 <template>
   <section class="aiops-shell">
-    <nav class="aiops-tabs" :aria-label="t('ai.ops.navigation')">
-      <button
-        v-for="tab in tabs"
-        :key="tab.name"
-        type="button"
-        :class="{ active: activeTab === tab.name }"
-        @click="router.push({ name: tab.route })"
-      >
-        {{ t(tab.label) }}
-        <span v-if="tab.count" class="aiops-tab-count">{{ tab.count }}</span>
-      </button>
-      <span class="aiops-runtime">{{ runtimeText }}</span>
-    </nav>
-
     <div
       class="aiops-body"
       :class="{ 'has-rail': showRail, 'rail-collapsed': showRail && railCollapsed }"
@@ -109,11 +95,11 @@
 import { computed, defineComponent, h, onBeforeUnmount, onMounted, ref, type PropType } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Expand, Fold, List, Refresh } from '@element-plus/icons-vue'
-import { getAIOpsStatus, listAutonomyRuns } from '@/api/autonomy'
+import { listAutonomyRuns } from '@/api/autonomy'
 import { t } from '@/i18n'
 import { formatTimeRel } from '@/utils/datetime'
 import { summarizeAutonomyGoal } from '@/utils/autonomyPresentation'
-import type { AIOpsStatus, AutonomyRun } from '@/types/autonomy'
+import type { AutonomyRun } from '@/types/autonomy'
 
 interface RunGroup {
   key: string
@@ -123,39 +109,17 @@ interface RunGroup {
 const route = useRoute()
 const router = useRouter()
 const runs = ref<AutonomyRun[]>([])
-const status = ref<AIOpsStatus | null>(null)
 const loading = ref(false)
 const railError = ref('')
 const railDrawer = ref(false)
 const railCollapsed = ref(false)
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 
-const activeTab = computed<'workbench' | 'tasks' | 'alerts'>(() => {
-  if (route.name === 'AiOpsAlerts') return 'alerts'
-  if (['AiOpsTasks', 'AiOpsRunDetail'].includes(String(route.name || ''))) return 'tasks'
-  return 'workbench'
-})
 const showRail = computed(() => route.name === 'AiOpsWorkbench')
 const currentRunId = computed(() => String(route.params.runId || ''))
-const activeRuns = computed(() => runs.value.filter(run => !['completed', 'failed', 'cancelled', 'expired'].includes(run.status)))
-const alertRuns = computed(() => activeRuns.value.filter(run => run.trigger_type === 'alertmanager'))
 const railAttentionCount = computed(() => (
   runs.value.filter(run => ['needs_attention', 'failed'].includes(run.status)).length
 ))
-const tabs = computed(() => [
-  { name: 'workbench' as const, route: 'AiOpsWorkbench', label: 'ai.ops.tabs.workbench', count: 0 },
-  { name: 'tasks' as const, route: 'AiOpsTasks', label: 'ai.ops.tabs.tasks', count: activeRuns.value.length },
-  { name: 'alerts' as const, route: 'AiOpsAlerts', label: 'ai.ops.tabs.alerts', count: alertRuns.value.length },
-])
-const runtimeText = computed(() => {
-  const current = status.value
-  if (!current) return t('ai.ops.runtimeUnknown')
-  return t('ai.ops.runtime', {
-    n: current.autonomy_concurrency,
-    state: t(`ai.ops.knowledge.${current.knowledge_index_state || 'unknown'}`),
-  })
-})
-
 const runGroups = computed<RunGroup[]>(() => {
   const definitions: Array<[string, string[]]> = [
     ['waiting', ['draft', 'waiting_approval']],
@@ -233,17 +197,12 @@ function railTitle(run: AutonomyRun): string {
 async function load(): Promise<void> {
   loading.value = true
   try {
-    const [nextRuns, nextStatus] = await Promise.allSettled([
-      listAutonomyRuns(),
-      getAIOpsStatus(),
-    ])
-    if (nextRuns.status === 'fulfilled') {
-      runs.value = nextRuns.value
+    try {
+      runs.value = await listAutonomyRuns()
       railError.value = ''
-    } else {
+    } catch {
       railError.value = t('ai.ops.rail.loadFailed')
     }
-    if (nextStatus.status === 'fulfilled') status.value = nextStatus.value
   } finally {
     loading.value = false
   }
@@ -269,61 +228,9 @@ onBeforeUnmount(() => {
   height: 100%;
   min-height: 0;
   display: grid;
-  grid-template-rows: 50px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   color: var(--ogs-text);
   background: var(--ogs-bg);
-}
-.aiops-tabs {
-  min-width: 0;
-  display: flex;
-  align-items: stretch;
-  padding: 0 18px;
-  border-bottom: 1px solid var(--ogs-border);
-  background: var(--ogs-surface);
-}
-.aiops-tabs > button {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 0 14px;
-  border: 0;
-  color: var(--ogs-text-secondary);
-  background: transparent;
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 600;
-}
-.aiops-tabs > button::after {
-  position: absolute;
-  right: 14px;
-  bottom: -1px;
-  left: 14px;
-  height: 2px;
-  content: '';
-  background: transparent;
-}
-.aiops-tabs > button:hover,
-.aiops-tabs > button.active { color: var(--ogs-text); }
-.aiops-tabs > button.active::after { background: var(--ogs-primary); }
-.aiops-tab-count {
-  min-width: 17px;
-  padding: 1px 5px;
-  border-radius: 9px;
-  color: var(--ogs-primary);
-  background: var(--ogs-primary-soft);
-  font: 10px/1.5 var(--ogs-mono);
-  text-align: center;
-}
-.aiops-runtime {
-  min-width: 0;
-  margin-left: auto;
-  align-self: center;
-  overflow: hidden;
-  color: var(--ogs-text-muted);
-  font: 10px/1 var(--ogs-mono);
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .aiops-body {
   min-width: 0;
@@ -511,13 +418,6 @@ onBeforeUnmount(() => {
     background: var(--ogs-surface);
   }
   .aiops-view.is-workbench { display: grid; grid-template-rows: 44px minmax(0, 1fr); }
-}
-
-@media (max-width: 520px) {
-  .aiops-tabs { padding: 0 4px; }
-  .aiops-tabs > button { flex: 1; justify-content: center; padding-inline: 6px; }
-  .aiops-tabs > button::after { right: 8px; left: 8px; }
-  .aiops-runtime { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

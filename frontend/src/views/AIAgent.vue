@@ -158,6 +158,14 @@
                       <summary>{{ $t('ai.tool.technicalDetails') }}</summary>
                       <code>{{ item.value.tool }}</code>
                     </details>
+                    <button
+                      v-if="item.value.result_scope?.result_set_id"
+                      type="button"
+                      class="tool-result-button"
+                      @click="openResultDetails(item.value.result_scope)"
+                    >
+                      {{ $t('ai.tool.viewEvidence') }}
+                    </button>
                   </div>
                   <p v-if="item.value.summary">
                     {{ item.value.status === 'error' ? readableToolSummary(item.value.summary) : item.value.summary }}
@@ -238,6 +246,26 @@
                   </el-dropdown-menu>
                 </template>
               </el-dropdown>
+              <details class="monitoring-source-picker" :class="{ 'is-disabled': sending }">
+                <summary :aria-label="$t('ai.composer.monitoringSources')">
+                  <el-icon><Monitor /></el-icon>
+                  <span>{{ monitoringSourceSummary }}</span>
+                  <el-icon><ArrowDown /></el-icon>
+                </summary>
+                <div class="monitoring-source-options">
+                  <strong>{{ $t('ai.composer.monitoringSources') }}</strong>
+                  <label v-for="source in MONITORING_SOURCE_TYPES" :key="source">
+                    <input
+                      v-model="selectedMonitoringSourceTypes"
+                      type="checkbox"
+                      :value="source"
+                      :data-monitoring-source="source"
+                      :disabled="sending || (selectedMonitoringSourceTypes.length === 1 && selectedMonitoringSourceTypes.includes(source))"
+                    >
+                    <span>{{ $t(`ai.composer.monitoringSource.${source}`) }}</span>
+                  </label>
+                </div>
+              </details>
               <div class="composer-actions">
                 <div class="composer-controls">
                   <el-select
@@ -413,7 +441,31 @@
         <span>{{ $t('ai.drawer.resultSummary', { n: resultTotal }) }}</span>
         <el-tag size="small" effect="plain">{{ resultKind || 'result' }}</el-tag>
       </div>
-      <el-table v-loading="resultLoading" :data="resultRows" stripe height="calc(100vh - 210px)">
+      <div v-if="['monitoring_observation', 'monitoring_catalog'].includes(resultKind)" v-loading="resultLoading" class="monitoring-result-list">
+        <article v-for="(row, index) in resultRows" :key="String(row.source_id || index)" class="monitoring-result-source">
+          <header>
+            <div>
+              <strong>{{ row.source_name || row.source_type || $t('ai.drawer.monitoring.source') }}</strong>
+              <small>{{ row.source_type }} · {{ monitoringSourceMeta(row) }}</small>
+            </div>
+            <el-tag size="small" :type="monitoringStatusType(row.status)" effect="plain">
+              {{ $t(`ai.drawer.monitoring.${monitoringStatusKey(row.status)}`) }}
+            </el-tag>
+          </header>
+          <p v-if="row.error" class="monitoring-result-error">{{ row.error }}</p>
+          <div v-for="(observation, observationIndex) in monitoringEntries(row)" :key="`${String(observation.template)}-${observationIndex}`" class="monitoring-observation">
+            <div>
+              <strong>{{ monitoringTemplateLabel(observation.template) }}</strong>
+              <span>{{ monitoringObservationSummary(observation) }}</span>
+            </div>
+            <details v-if="monitoringObservationDetails(observation)">
+              <summary>{{ $t('ai.drawer.monitoring.details') }}</summary>
+              <pre>{{ monitoringObservationDetails(observation) }}</pre>
+            </details>
+          </div>
+        </article>
+      </div>
+      <el-table v-else v-loading="resultLoading" :data="resultRows" stripe height="calc(100vh - 210px)">
         <el-table-column
           v-for="column in resultColumns"
           :key="column"
@@ -583,6 +635,8 @@ const PROVIDER_NAMES: Record<string, string> = {
 }
 
 const AUTONOMY_MODES = ['ask', 'ai_review', 'auto', 'custom'] as const
+const MONITORING_SOURCE_TYPES = ['prometheus', 'grafana', 'loki', 'zabbix'] as const
+type MonitoringSourceType = typeof MONITORING_SOURCE_TYPES[number]
 
 const examplePrompts = computed<Array<{ title: string; text: string; icon: Component }>>(() => [
   { title: t('ai.prompts.inspectTitle'), text: t('ai.prompts.inspectText'), icon: Monitor },
@@ -598,6 +652,7 @@ const selectedProvider = ref('')
 const selectedContextMode = ref<AiContextMode>(AI_CONTEXT_MODE_STANDARD)
 const selectedAutonomyMode = ref<AiConversationAutonomyMode>('ask')
 const selectedAutonomyCategories = ref<AutonomyActionCategory[]>([])
+const selectedMonitoringSourceTypes = ref<MonitoringSourceType[]>([...MONITORING_SOURCE_TYPES])
 const conversations = ref<AiConversation[]>([])
 const currentConversationId = ref('')
 const messages = ref<AiChatMessage[]>([])
@@ -623,6 +678,7 @@ const resultPage = ref(1)
 const resultPageSize = 20
 const resultTotal = ref(0)
 const resultKind = ref('')
+const activeResultSetId = ref('')
 const evidenceDrawer = ref(false)
 const evidenceLoading = ref(false)
 const diagnosticEvidence = ref<AiDiagnosticEvidence[]>([])
@@ -666,6 +722,11 @@ const canChat = computed(() =>
 const hasStreamingMessage = computed(() => messages.value.some(message => message.streaming))
 /** 思考态：请求中或流式回复中 → 橘子旋转动画 */
 const isThinking = computed(() => sending.value || hasStreamingMessage.value)
+const monitoringSourceSummary = computed(() => (
+  selectedMonitoringSourceTypes.value.length === MONITORING_SOURCE_TYPES.length
+    ? t('ai.composer.monitoringAll')
+    : t('ai.composer.monitoringSelected', { n: selectedMonitoringSourceTypes.value.length })
+))
 const currentConversation = computed(() =>
   conversations.value.find(conversation => conversation.id === currentConversationId.value),
 )
@@ -707,6 +768,80 @@ const userInitial = computed(() =>
 const resultColumns = computed(() =>
   Object.keys(resultRows.value[0] || {}).filter(key => !['id', 'host_id'].includes(key)).slice(0, 7),
 )
+
+function monitoringObservations(row: Record<string, unknown>): Array<Record<string, unknown>> {
+  return Array.isArray(row.observations)
+    ? row.observations.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>>
+    : []
+}
+
+function monitoringEntries(row: Record<string, unknown>): Array<Record<string, unknown>> {
+  const observations = monitoringObservations(row)
+  if (observations.length) return observations
+  const entries: Array<Record<string, unknown>> = []
+  const append = (template: string, value: unknown) => {
+    if (!Array.isArray(value) || !value.length) return
+    entries.push({ template, count: value.length, items: value })
+  }
+  append('available_metrics', row.metrics)
+  append('grafana_panels', row.panels)
+  append('zabbix_items', row.items)
+  append('active_problems', row.problems)
+  if (row.labels && typeof row.labels === 'object') {
+    const items = Object.entries(row.labels as Record<string, unknown>)
+      .map(([label, values]) => ({ label, values }))
+    if (items.length) entries.push({ template: 'available_labels', count: items.length, items })
+  }
+  return entries
+}
+
+function monitoringSourceMeta(row: Record<string, unknown>): string {
+  return row.lookback_minutes
+    ? t('ai.drawer.monitoring.lookback', { n: row.lookback_minutes })
+    : t('ai.drawer.monitoring.discovered')
+}
+
+function monitoringStatusKey(status: unknown): 'ok' | 'noData' | 'failed' {
+  if (status === 'ok') return 'ok'
+  if (status === 'no_data') return 'noData'
+  return 'failed'
+}
+
+function monitoringStatusType(status: unknown): 'success' | 'info' | 'danger' {
+  if (status === 'ok') return 'success'
+  if (status === 'no_data') return 'info'
+  return 'danger'
+}
+
+function monitoringTemplateLabel(template: unknown): string {
+  const key = String(template || 'observation')
+  const known = new Set([
+    'availability', 'load1', 'memory_available_ratio', 'filesystem_available_ratio',
+    'recent_logs', 'active_problems', 'latest_items', 'recent_history',
+    'available_metrics', 'available_labels', 'grafana_panels', 'zabbix_items',
+    'prometheus_query', 'loki_query', 'dashboard_panel', 'zabbix_history',
+  ])
+  return known.has(key) ? t(`ai.drawer.monitoring.templates.${key}`) : key
+}
+
+function monitoringObservationSummary(observation: Record<string, unknown>): string {
+  const count = Number(
+    observation.sample_count ?? observation.line_count ?? observation.count ?? 0,
+  )
+  const latest = observation.latest
+  return latest == null
+    ? t('ai.drawer.monitoring.count', { n: count })
+    : t('ai.drawer.monitoring.latest', { n: count, value: String(latest) })
+}
+
+function monitoringObservationDetails(observation: Record<string, unknown>): string {
+  const details = Object.fromEntries(
+    ['query', 'series', 'frames', 'lines', 'items']
+      .filter(key => observation[key] != null)
+      .map(key => [key, observation[key]]),
+  )
+  return Object.keys(details).length ? JSON.stringify(details, null, 2) : ''
+}
 
 function ContextView(): ReturnType<typeof h> {
   const scope = resultScope.value
@@ -1544,6 +1679,7 @@ async function sendMessage(): Promise<void> {
       conversation_id: conversationId,
       provider_code: selectedProvider.value,
       message: content,
+      monitoring_source_types: selectedMonitoringSourceTypes.value,
     }, {
       signal: activeController.signal,
       onEvent: handleSseEvent,
@@ -1666,10 +1802,12 @@ function upsertToolEvent(data: Record<string, unknown>, status: AiToolEvent['sta
   const eventId = String(data.tool_call_id || data.id || tool)
   const existing = toolEvents.value.find(item => item.id === eventId)
   const summary = summarizeToolData(data)
+  const scope = parseResultScope(data)
   if (existing) {
     if (existing.status !== 'running' && status === 'running') return
     existing.status = status
     existing.summary = summary || existing.summary
+    existing.result_scope = scope || existing.result_scope
     return
   }
   toolEvents.value.push({
@@ -1678,6 +1816,7 @@ function upsertToolEvent(data: Record<string, unknown>, status: AiToolEvent['sta
     label: toolLabel(tool),
     status,
     summary,
+    result_scope: scope || undefined,
     created_at: nowIso(),
   })
 }
@@ -1780,18 +1919,23 @@ const TOOL_LABEL_KEYS: Record<string, string> = {
   start_diagnostic: 'ai.tool.labels.runReadonlyDiagnostic',
   create_autonomy_draft: 'ai.tool.labels.createAutonomyDraft',
   search_knowledge: 'ai.tool.labels.searchKnowledge',
+  discover_monitoring: 'ai.tool.labels.discoverMonitoring',
+  query_prometheus: 'ai.tool.labels.queryPrometheus',
+  query_loki: 'ai.tool.labels.queryLoki',
+  query_grafana_panel: 'ai.tool.labels.queryGrafanaPanel',
+  query_zabbix_history: 'ai.tool.labels.queryZabbixHistory',
 }
 
 function toolLabel(tool: string): string {
   return t(TOOL_LABEL_KEYS[tool] || 'ai.tool.labels.default')
 }
 
-function updateResultScope(data: Record<string, unknown>): void {
+function parseResultScope(data: Record<string, unknown>): AiResultScope | null {
   const raw = (data.result_scope || data.scope || data.result) as Record<string, unknown> | undefined
-  if (!raw || typeof raw !== 'object') return
+  if (!raw || typeof raw !== 'object') return null
   const total = Number(raw.total ?? raw.target_count ?? raw.count)
-  if (!Number.isFinite(total)) return
-  resultScope.value = {
+  if (!Number.isFinite(total)) return null
+  return {
     result_set_id: String(raw.result_set_id || ''),
     title: typeof raw.title === 'string' ? raw.title : undefined,
     total,
@@ -1800,6 +1944,10 @@ function updateResultScope(data: Record<string, unknown>): void {
     groups: Array.isArray(raw.groups) ? raw.groups.map(String) : undefined,
     sample: Array.isArray(raw.sample) ? raw.sample as Array<Record<string, unknown>> : undefined,
   }
+}
+
+function updateResultScope(data: Record<string, unknown>): void {
+  resultScope.value = parseResultScope(data) || resultScope.value
 }
 
 async function refreshConversationList(): Promise<void> {
@@ -1864,15 +2012,16 @@ function diagnosticSeverityTagType(
   return 'info'
 }
 
-async function openResultDetails(): Promise<void> {
-  if (!resultScope.value?.result_set_id) return
+async function openResultDetails(scope: AiResultScope | null = resultScope.value): Promise<void> {
+  if (!scope?.result_set_id) return
+  activeResultSetId.value = scope.result_set_id
   resultPage.value = 1
   resultDrawer.value = true
   await loadResultPage(1)
 }
 
 async function loadResultPage(page: number): Promise<void> {
-  const resultSetId = resultScope.value?.result_set_id
+  const resultSetId = activeResultSetId.value
   if (!resultSetId) return
   resultLoading.value = true
   try {
@@ -2576,6 +2725,15 @@ onBeforeUnmount(() => {
   border-radius: 4px;
   background: var(--ogs-bg-elevated);
 }
+.tool-result-button {
+  padding: 0;
+  color: var(--ogs-primary);
+  border: 0;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+.tool-result-button:hover { text-decoration: underline; }
 .tool-error-details {
   margin-top: 6px;
   color: var(--ogs-text-tertiary);
@@ -2666,6 +2824,23 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   gap: 10px;
 }
+.monitoring-source-picker { position: relative; flex: 0 0 auto; }
+.monitoring-source-picker summary {
+  display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 0 10px;
+  color: var(--ogs-text-secondary); border: 1px solid var(--ogs-border); border-radius: 7px;
+  font-size: 11px; cursor: pointer; list-style: none;
+}
+.monitoring-source-picker summary::-webkit-details-marker { display: none; }
+.monitoring-source-picker[open] summary { color: var(--ogs-primary); border-color: var(--ogs-primary); }
+.monitoring-source-picker.is-disabled { pointer-events: none; opacity: .55; }
+.monitoring-source-options {
+  position: absolute; z-index: 12; bottom: calc(100% + 8px); left: 0; width: 190px; padding: 10px;
+  border: 1px solid var(--ogs-border); border-radius: 8px; background: var(--ogs-surface);
+  box-shadow: var(--el-box-shadow-light);
+}
+.monitoring-source-options strong { display: block; margin: 0 4px 7px; color: var(--ogs-text); font-size: 11px; }
+.monitoring-source-options label { display: flex; align-items: center; gap: 8px; padding: 6px 4px; color: var(--ogs-text-secondary); font-size: 11px; cursor: pointer; }
+.monitoring-source-options input { accent-color: var(--ogs-primary); }
 .composer-actions {
   min-width: 0;
   display: flex;
@@ -2914,6 +3089,29 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 .result-pagination { padding-top: 14px; display: flex; justify-content: flex-end; }
+.monitoring-result-list { display: flex; flex-direction: column; gap: 10px; }
+.monitoring-result-source { border: 1px solid var(--ogs-border); background: var(--ogs-surface); }
+.monitoring-result-source > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--ogs-border-subtle);
+}
+.monitoring-result-source header strong,
+.monitoring-result-source header small { display: block; }
+.monitoring-result-source header strong { color: var(--ogs-text); font-size: 13px; }
+.monitoring-result-source header small { margin-top: 4px; color: var(--ogs-text-muted); font-size: 10px; }
+.monitoring-result-error { margin: 0; padding: 11px 14px; color: var(--el-color-danger); font-size: 11px; }
+.monitoring-observation { padding: 11px 14px; border-bottom: 1px solid var(--ogs-border-subtle); }
+.monitoring-observation:last-child { border-bottom: 0; }
+.monitoring-observation > div { display: flex; justify-content: space-between; gap: 12px; }
+.monitoring-observation strong { color: var(--ogs-text); font-size: 12px; }
+.monitoring-observation span { color: var(--ogs-text-secondary); font: 10px var(--ogs-mono); }
+.monitoring-observation details { margin-top: 8px; color: var(--ogs-text-muted); font-size: 10px; }
+.monitoring-observation summary { cursor: pointer; color: var(--ogs-primary); }
+.monitoring-observation pre { max-height: 280px; margin: 8px 0 0; padding: 10px; overflow: auto; color: var(--ogs-text-secondary); background: var(--ogs-bg-sunken); font: 10px/1.55 var(--ogs-mono); white-space: pre-wrap; }
 .evidence-content { min-height: 260px; }
 .evidence-report {
   margin-bottom: 14px;
@@ -3014,6 +3212,9 @@ onBeforeUnmount(() => {
   .composer-shell { padding: 11px 12px 13px; }
   .composer { padding-inline: 6px; }
   .composer-toolbar { gap: 5px; }
+  .monitoring-source-picker summary { width: 32px; padding: 0; justify-content: center; }
+  .monitoring-source-picker summary span,
+  .monitoring-source-picker summary .el-icon:last-child { display: none; }
   .composer-actions, .composer-controls { gap: 4px; }
   .autonomy-mode-trigger { min-width: 86px; max-width: 94px; padding-inline: 6px !important; }
   .autonomy-mode-trigger .el-icon:first-child { display: none; }
