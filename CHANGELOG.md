@@ -93,6 +93,14 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   healthy, not-yet-configured installation as failed.
   DEPLOY.md points container troubleshooting at the `app` service now that
   the bundled topology has no `backend` service.
+- A fresh installation no longer reports the Autonomy Worker as unhealthy while
+  the first-boot wizard is still pending. The container health probe imported
+  the readiness module, whose module-level configuration import fail-fasts on
+  the secret keys the wizard has not generated yet, so Docker marked a
+  correctly waiting worker unhealthy once its start period elapsed and
+  `docker compose up --wait` could not succeed. The probe now applies the same
+  three-state setup judgement as the worker entrypoint, and still gates on real
+  checkpoint and worker readiness once the deployment is configured.
 
 ## [1.1.1] - 2026-08-19
 

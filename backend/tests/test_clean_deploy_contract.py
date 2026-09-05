@@ -821,19 +821,24 @@ def test_autonomy_dev_overlay_uses_dedicated_redis8_and_worker():
     assert "app.ai.autonomy.celery_entry:celery_app" in overlay
     assert "--concurrency=1" not in overlay
     assert "OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}" in overlay
-    health_probe = (
-        "from app.ai.autonomy.readiness import checkpoint_readiness, "
-        "worker_readiness; raise SystemExit(0 if checkpoint_readiness() "
-        "and worker_readiness() else 1)"
-    )
+    # The probe must go through the setup-aware entry point: readiness imports
+    # app.core.config at module level, which fail-fasts while the first-boot
+    # wizard is still pending and would mark a correctly-waiting worker
+    # unhealthy on every fresh install.
+    health_probe = "app.ai.autonomy.healthcheck"
     assert health_probe in overlay
     assert "inspect ping" not in overlay
-    assert health_probe in (
-        REPO_ROOT / "deploy" / "docker-compose.yml"
+    for compose_name in ("docker-compose.yml", "docker-compose.s2-smoke.yml"):
+        assert health_probe in (
+            REPO_ROOT / "deploy" / compose_name
+        ).read_text(encoding="utf-8")
+
+    probe_module = (
+        BACKEND / "app" / "ai" / "autonomy" / "healthcheck.py"
     ).read_text(encoding="utf-8")
-    assert health_probe in (
-        REPO_ROOT / "deploy" / "docker-compose.s2-smoke.yml"
-    ).read_text(encoding="utf-8")
+    assert "resolve_mode()" in probe_module
+    assert "checkpoint_readiness()" in probe_module
+    assert "worker_readiness()" in probe_module
     assert "../backend:/app" in overlay
     assert overlay.count("condition: service_healthy") == 4
     assert "docker-compose.dev-autonomy.yml" in makefile
@@ -931,6 +936,34 @@ def test_healthcheck_accepts_both_documented_healthy_states(
     result = _run_healthcheck(tmp_path, body, code)
     assert result.returncode == expect_rc, result.stdout + result.stderr
     assert expect_text in result.stdout
+
+
+def test_worker_probe_treats_pending_setup_as_healthy_waiting(monkeypatch):
+    """A fresh install has no secret keys yet, so readiness cannot even be
+    imported; a worker that is correctly waiting must not be marked unhealthy."""
+    import setup.state as state
+    from app.ai.autonomy import healthcheck as probe
+
+    for mode in ("setup", "maintenance"):
+        monkeypatch.setattr(state, "resolve_mode", lambda m=mode: m)
+        assert probe.main() == 0, f"mode={mode} should count as healthy waiting"
+
+
+def test_worker_probe_still_gates_on_readiness_once_configured(monkeypatch):
+    import setup.state as state
+    from app.ai.autonomy import healthcheck as probe, readiness
+
+    monkeypatch.setattr(state, "resolve_mode", lambda: "normal")
+    monkeypatch.setattr(readiness, "checkpoint_readiness", lambda **kw: True)
+    monkeypatch.setattr(readiness, "worker_readiness", lambda **kw: True)
+    assert probe.main() == 0
+
+    monkeypatch.setattr(readiness, "worker_readiness", lambda **kw: False)
+    assert probe.main() == 1
+
+    monkeypatch.setattr(readiness, "worker_readiness", lambda **kw: True)
+    monkeypatch.setattr(readiness, "checkpoint_readiness", lambda **kw: False)
+    assert probe.main() == 1
 
 
 def _builtin_system_seed(schema: str) -> tuple[str, int]:

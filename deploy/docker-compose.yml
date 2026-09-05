@@ -101,11 +101,13 @@ services:
         condition: service_healthy
         required: false
     healthcheck:
+      # readiness 在模块级 import app.core.config，首次部署向导完成前密钥缺失会
+      # fail-fast，把正在等待配置的 Worker 标成 unhealthy；探针走 setup 感知入口。
       test:
         - CMD
         - python
-        - -c
-        - from app.ai.autonomy.readiness import checkpoint_readiness, worker_readiness; raise SystemExit(0 if checkpoint_readiness() and worker_readiness() else 1)
+        - -m
+        - app.ai.autonomy.healthcheck
       interval: 10s
       timeout: 5s
       retries: 20
