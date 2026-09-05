@@ -7,6 +7,12 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- AI chat can now dynamically discover and query explicitly mapped Prometheus,
+  Grafana, Loki, and Zabbix data through bounded read-only tools. The existing
+  Agent can iteratively select metrics, log filters, saved panels, and Zabbix
+  items; all bounded evidence reaches the model while credentials remain redacted.
+  Administrators can test sources and confirm asset identities without adding a
+  second Agent runtime or monitoring container.
 - The AI Ops landing page now leads with pending alerts, active runs, recent
   conclusions, Worker capacity, and knowledge-index status. An optional
   Bearer-authenticated Alertmanager webhook creates idempotent `ask` runs and
@@ -20,7 +26,8 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - AI operations now uses a Codex-style workbench with grouped task and alert
-  views, a collapsible recent-task rail, an in-place evidence and raw-output
+  views, vertical subnavigation, a dedicated administrator monitoring-source
+  screen, a collapsible recent-task rail, an in-place evidence and raw-output
   inspector, on-demand run context, compact mobile actions, legacy-route
   redirects, and a separate first-level knowledge destination. Task rows now
   lead with a readable target and next action; alert groups show Alertmanager's

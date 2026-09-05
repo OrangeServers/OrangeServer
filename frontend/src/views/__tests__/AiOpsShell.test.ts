@@ -11,7 +11,6 @@ const mocks = vi.hoisted(() => ({
     fullPath: '/ai-ops',
   },
   listRuns: vi.fn(),
-  getStatus: vi.fn(),
 }))
 
 vi.mock('vue-router', () => ({
@@ -20,7 +19,6 @@ vi.mock('vue-router', () => ({
 }))
 vi.mock('@/api/autonomy', () => ({
   listAutonomyRuns: mocks.listRuns,
-  getAIOpsStatus: mocks.getStatus,
 }))
 vi.mock('@/i18n', () => ({ t: (key: string) => key }))
 vi.mock('@/utils/datetime', () => ({ formatTimeRel: () => 'now' }))
@@ -48,10 +46,6 @@ describe('AiOpsShell', () => {
       completed_at: '2026-08-30T00:01:00Z', trigger_type: 'manual',
       outcome: null,
     }])
-    mocks.getStatus.mockResolvedValue({
-      autonomy_concurrency: 2,
-      knowledge_index_state: 'ready',
-    })
   })
 
   it('owns Run details under the task tab without the workbench rail', async () => {
@@ -70,8 +64,7 @@ describe('AiOpsShell', () => {
     await Promise.resolve()
     await nextTick()
 
-    expect(root.querySelector('.aiops-tabs button.active')?.textContent)
-      .toContain('ai.ops.tabs.tasks')
+    expect(root.querySelector('.aiops-tabs')).toBeNull()
     expect(root.querySelector('.aiops-run-rail')).toBeNull()
     app.unmount()
   })

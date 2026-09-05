@@ -11,6 +11,7 @@ describe('AI Ops routes', () => {
     expect(byPath('/ai-ops/tasks')?.name).toBe('AiOpsTasks')
     expect(byPath('/ai-ops/tasks/:runId')?.name).toBe('AiOpsRunDetail')
     expect(byPath('/ai-ops/alerts')?.name).toBe('AiOpsAlerts')
+    expect(byPath('/ai-ops/sources')?.name).toBe('AiOpsSources')
     expect(byPath('/ai-knowledge')?.name).toBe('AiKnowledge')
     expect(byPath('/ai-agent')?.redirect).toEqual({ name: 'AiOpsWorkbench' })
     expect(byPath('/ai-runs')?.redirect).toEqual({ name: 'AiOpsTasks' })

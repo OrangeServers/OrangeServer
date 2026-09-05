@@ -43,6 +43,38 @@ def register_ai_routes(app: Any) -> None:
         _secure(views.clear_provider_key, "admin"), methods=["POST"],
     )
     app.add_url_rule(
+        "/ai/admin/monitoring-sources", "ai_admin_monitoring_sources",
+        _secure(views.admin_monitoring_sources, "admin"), methods=["GET", "POST"],
+    )
+    app.add_url_rule(
+        "/ai/admin/monitoring-sources/<int:source_id>",
+        "ai_admin_monitoring_source",
+        _secure(views.admin_monitoring_source, "admin"), methods=["PUT", "DELETE"],
+    )
+    app.add_url_rule(
+        "/ai/admin/monitoring-sources/<int:source_id>/test",
+        "ai_admin_test_monitoring_source",
+        _secure(views.admin_test_monitoring_source, "admin"), methods=["POST"],
+    )
+    app.add_url_rule(
+        "/ai/admin/monitoring-sources/<int:source_id>/discover",
+        "ai_admin_discover_monitoring_source",
+        _secure(views.admin_discover_monitoring_source, "admin"), methods=["GET"],
+    )
+    app.add_url_rule(
+        "/ai/admin/monitoring-mappings", "ai_admin_monitoring_mappings",
+        _secure(views.admin_monitoring_mappings, "admin"), methods=["GET"],
+    )
+    app.add_url_rule(
+        "/ai/admin/monitoring-sources/<int:source_id>/hosts/<int:host_id>",
+        "ai_admin_save_monitoring_mapping",
+        _secure(views.admin_save_monitoring_mapping, "admin"), methods=["PUT"],
+    )
+    app.add_url_rule(
+        "/ai/monitoring/sources", "ai_monitoring_sources_for_host",
+        _secure(views.monitoring_sources_for_host, *all_users), methods=["GET"],
+    )
+    app.add_url_rule(
         "/ai/conversations", "ai_conversations",
         _secure(views.conversations, *all_users), methods=["GET"],
     )

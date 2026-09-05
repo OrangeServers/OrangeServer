@@ -59,13 +59,15 @@ Alertmanager → Prometheus/SSH → Autonomy Run 闭环；S2 增加只索引审�
 当前 Unreleased 已完成 S0、S1 和 S2 实现：单条 Alertmanager 告警入口、固定
 Prometheus 可用性观察、Run 触发契约、运维状态聚合，以及只索引审核 Runbook 与
 独立验证 Run 的本地/远程 embedding 知识库。AI 运维入口已统一为 Agent 工作台、
-分组任务和告警视图，知识库保持独立一级入口。测试机真实告警、并行 Run、知识复用与
+分组任务和告警视图，知识库保持独立一级入口。当前聊天可发现已确认资产映射的
+Prometheus、Grafana、Loki 与 Zabbix 能力，并动态查询指标、日志、Panel 与监控项历史；
+没有引入 HolmesGPT 运行时、第二套 Agent 或额外容器。测试机真实告警、并行 Run、知识复用与
 从零四容器纵向验收仍由 Issue #25 跟踪，未完成前不视为 M2 发布门通过。
 
-- Prometheus 和 Loki 请求必须经过服务端查询代理；模型不能提供任意 URL、Header、
-  tenant 或无限制 PromQL/LogQL。
-- 服务端限制时间范围、步长、返回量、并发、超时和可用标签，并在进入模型前聚合、
-  脱敏和外置大结果。
+- Prometheus 和 Loki 请求必须经过服务端查询代理；模型不能提供任意 URL、Header、tenant
+  或跳出已确认资产标签。PromQL 由指标、函数和聚合参数生成，LogQL 只开放映射流内过滤。
+- 服务端限制时间范围、步长、返回量、并发和超时。边界内的查询、标签、日志和时序点完整
+  进入模型；只脱敏秘密，不用聚合摘要替换根因分析所需的原始证据。
 - Alertmanager 首版只触发 `ask` 调查 Run；远程修复仍走原有审批与验证，创建 silence
   或修改告警配置不在本阶段范围内。
 - 事故工作台以症状、假设、Evidence、动作、验证和结论时间线为权威事实，聊天只是入口。

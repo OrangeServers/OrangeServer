@@ -61,6 +61,8 @@ def _registry(
     allowed_ids=None,
     autonomy_mode="ask",
     autonomy_profile=None,
+    monitoring_executor=None,
+    monitoring_source_types=None,
 ):
     from app.ai.storage import AgentStore
     from app.ai.tools import ToolRegistry
@@ -76,6 +78,8 @@ def _registry(
         autonomy_mode=autonomy_mode,
         autonomy_profile=autonomy_profile,
         command_checker=lambda command: None,
+        monitoring_executor=monitoring_executor,
+        monitoring_source_types=monitoring_source_types,
     )
     return store, conversation, registry
 
@@ -98,6 +102,141 @@ def test_admin_receives_account_and_audit_tools():
     assert "search_accounts" in names
     assert "search_audit_logs" in names
     assert "search_knowledge" in names
+
+
+def test_monitoring_tools_revalidate_asset_and_support_iterative_investigation():
+    calls = []
+    bounded_lines = [f"log-{index}" for index in range(100)]
+
+    def execute(operation, arguments):
+        calls.append((operation, arguments))
+        if operation == "discover_monitoring":
+            return {
+                "kind": "monitoring_catalog",
+                "rows": [{
+                    "source_id": 7,
+                    "source_type": "prometheus",
+                    "metrics": ["http_requests_total", "process_cpu_seconds_total"],
+                }],
+                "summary": {"source_count": 1, "metric_count": 2},
+            }
+        return {
+            "kind": "monitoring_observation",
+            "rows": [{
+                "source": "loki",
+                "status": "ok",
+                "observations": [{
+                    "template": "loki_query",
+                    "line_count": len(bounded_lines),
+                    "lines": bounded_lines,
+                }],
+            }],
+            "summary": {"source_count": 1, "partial": False},
+        }
+
+    _, _, registry = _registry(
+        role="user", allowed_ids=[2], monitoring_executor=execute,
+    )
+    names = {item["function"]["name"] for item in registry.definitions()}
+    assert {
+        "discover_monitoring", "query_prometheus", "query_loki",
+        "query_grafana_panel", "query_zabbix_history",
+    }.issubset(names)
+
+    catalog = registry.execute("discover_monitoring", {
+        "host_id": 2,
+        "source_types": ["prometheus", "loki"],
+        "search": "cpu",
+    })
+    result = registry.execute("query_loki", {
+        "host_id": 2,
+        "source_id": 8,
+        "contains": "timeout",
+        "lookback_minutes": 60,
+    })
+
+    assert calls == [
+        ("discover_monitoring", {
+            "host_id": 2, "source_types": ["prometheus", "loki"],
+            "search": "cpu",
+        }),
+        ("query_loki", {
+            "host_id": 2, "source_id": 8, "contains": "timeout",
+            "lookback_minutes": 60, "limit": 100,
+        }),
+    ]
+    assert catalog["kind"] == "monitoring_catalog"
+    assert result["kind"] == "monitoring_observation"
+    assert result["summary"] == {"source_count": 1, "partial": False}
+    assert result["preview"][0]["observations"][0]["lines"] == bounded_lines
+
+
+def test_monitoring_tool_uses_operator_selected_sources_not_model_choice():
+    calls = []
+
+    def execute(operation, arguments):
+        calls.append((operation, arguments))
+        return {
+            "rows": [],
+            "summary": {"title": "monitoring_observation", "total": 0},
+        }
+
+    _, _, registry = _registry(
+        role="user",
+        allowed_ids=[2],
+        monitoring_executor=execute,
+        monitoring_source_types=("prometheus", "loki"),
+    )
+    registry.execute("discover_monitoring", {
+        "host_id": 2,
+        "source_types": ["zabbix"],
+    })
+
+    assert calls == [("discover_monitoring", {
+        "host_id": 2,
+        "source_types": ["prometheus", "loki"],
+    })]
+def test_monitoring_tool_rejects_unauthorized_asset_before_query():
+    _, _, registry = _registry(
+        role="user",
+        allowed_ids=[2],
+        monitoring_executor=lambda _arguments: (_ for _ in ()).throw(
+            AssertionError("monitoring query must not run")
+        ),
+    )
+
+    from app.ai.tools import ToolValidationError
+
+    try:
+        registry.execute("discover_monitoring", {
+            "host_id": 3,
+        })
+    except ToolValidationError as exc:
+        assert "not authorized" in str(exc).lower()
+    else:
+        raise AssertionError("unauthorized asset was accepted")
+
+
+def test_monitoring_tool_preserves_safe_validation_error():
+    from app.ai.monitoring import MonitoringValidationError
+    from app.ai.tools import ToolValidationError
+
+    _, _, registry = _registry(
+        role="user",
+        allowed_ids=[2],
+        monitoring_executor=lambda _operation, _arguments: (_ for _ in ()).throw(
+            MonitoringValidationError(
+                "asset has no enabled confirmed monitoring mapping"
+            )
+        ),
+    )
+
+    try:
+        registry.execute("discover_monitoring", {"host_id": 2})
+    except ToolValidationError as exc:
+        assert str(exc) == "asset has no enabled confirmed monitoring mapping"
+    else:
+        raise AssertionError("safe monitoring validation error was hidden")
 
 
 def test_user_knowledge_tool_returns_bounded_references(monkeypatch):

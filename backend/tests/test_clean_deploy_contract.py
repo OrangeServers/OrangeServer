@@ -622,6 +622,32 @@ def test_rev60_backfills_all_active_admins_into_all_permissions():
     assert "all_auth.`name` = '所有权限'" in migration
 
 
+def test_rev61_monitoring_tables_match_fresh_schema_and_orm():
+    from app.core.db.database import db
+
+    migration = (
+        BACKEND / "mysqldir" / "rev61_ai_monitoring.sql"
+    ).read_text(encoding="utf-8")
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+
+    def columns(source, table):
+        match = re.search(
+            r"CREATE TABLE(?: IF NOT EXISTS)? `" + table
+            + r"` \((.*?)\)\s*ENGINE=",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        assert match, table
+        return set(re.findall(r"^\s*`([^`]+)`\s+", match.group(1), re.MULTILINE))
+
+    tables = ("t_ai_monitoring_source", "t_ai_monitoring_host_mapping")
+    for table in tables:
+        assert columns(migration, table) == columns(schema, table)
+        assert columns(schema, table) == set(db.metadata.tables[table].columns.keys())
+    assert migration.count("CREATE TABLE IF NOT EXISTS") == 2
+    assert "ON DELETE CASCADE" in migration
+
+
 def test_dockerfile_pins_and_verifies_local_embedding_model():
     dockerfile = (BACKEND / "Dockerfile").read_text(encoding="utf-8")
     requirements = (BACKEND / "requirements.txt").read_text(encoding="utf-8")

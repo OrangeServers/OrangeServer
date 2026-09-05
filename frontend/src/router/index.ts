@@ -101,6 +101,12 @@ const routes: RouteRecordRaw[] = [
             props: { alertsOnly: true },
             meta: { titleKey: 'aiRuns.alerts.title' },
           },
+          {
+            path: 'sources',
+            name: 'AiOpsSources',
+            component: () => import('@/views/Settings.vue'),
+            meta: { titleKey: 'menu.aiMonitoringSources' },
+          },
         ],
       },
       { path: 'ai-agent', redirect: { name: 'AiOpsWorkbench' } },
@@ -133,7 +139,7 @@ const router: Router = createRouter({
 })
 
 // 需要 admin 角色的路由
-const adminRoutes: readonly string[] = ['/authority', '/settings', '/user-list', '/user-group', '/sys-user', '/batch-script']
+const adminRoutes: readonly string[] = ['/authority', '/settings', '/user-list', '/user-group', '/sys-user', '/batch-script', '/ai-ops/sources']
 // 需要 admin 或 audit 角色的路由
 const auditRoutes: readonly string[] = ['/log-login', '/log-exec', '/log-op']
 // 需要 admin 或 user 角色的运维路由
