@@ -469,6 +469,46 @@ class t_ai_provider(db.Model, TimestampMixin):
     extra_body_json = db.Column(db.Text, nullable=True)
 
 
+class t_ai_monitoring_source(db.Model, TimestampMixin):
+    """Admin-owned endpoint for a read-only monitoring integration."""
+
+    __tablename__ = 't_ai_monitoring_source'
+    id = db.Column(db.INTEGER, primary_key=True, autoincrement=True)
+    name = db.Column(db.String(64), nullable=False, unique=True)
+    source_type = db.Column(db.String(16), nullable=False, index=True)
+    base_url = db.Column(db.String(255), nullable=False)
+    token_ciphertext = db.Column(db.String(2048), nullable=True)
+    verify_tls = db.Column(
+        db.BOOLEAN, nullable=False, default=True, server_default='1',
+    )
+    enabled = db.Column(
+        db.BOOLEAN, nullable=False, default=True, server_default='1', index=True,
+    )
+    created_by = db.Column(db.String(24), nullable=False)
+
+
+class t_ai_monitoring_host_mapping(db.Model, TimestampMixin):
+    """Explicitly confirmed monitoring identity for one OrangeServer host."""
+
+    __tablename__ = 't_ai_monitoring_host_mapping'
+    __table_args__ = (
+        db.UniqueConstraint(
+            'source_id', 'host_id', name='uq_ai_monitoring_source_host',
+        ),
+    )
+    id = db.Column(db.INTEGER, primary_key=True, autoincrement=True)
+    source_id = db.Column(
+        db.INTEGER,
+        db.ForeignKey('t_ai_monitoring_source.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    host_id = db.Column(
+        db.INTEGER, nullable=False, index=True,
+    )
+    external_ref_json = db.Column(db.Text, nullable=False)
+    confirmed_by = db.Column(db.String(24), nullable=False)
+
 class t_ai_diagnostic_run(db.Model, TimestampMixin):
     """Durable authoritative snapshot for a controlled diagnostic run."""
 

@@ -234,6 +234,114 @@ def _diagnostic_service():
     return DiagnosticService(agent_store=_store())
 
 
+def _monitoring_config():
+    from app.ai.monitoring import MonitoringConfigService
+
+    return MonitoringConfigService()
+
+
+def admin_monitoring_sources():
+    from app.ai.monitoring import MonitoringValidationError
+
+    _holder, owner, _role = _identity()
+    try:
+        service = _monitoring_config()
+        if request.method == "POST":
+            row = service.create_source(owner, _payload())
+            return _ok(source=row, data=row)
+        rows = service.list_sources()
+        return _ok(sources=rows, data=rows)
+    except MonitoringValidationError as exc:
+        db.session.rollback()
+        return _error(str(exc))
+
+
+def admin_monitoring_source(source_id: int):
+    from app.ai.monitoring import MonitoringValidationError
+
+    try:
+        service = _monitoring_config()
+        if request.method == "DELETE":
+            service.delete_source(source_id)
+            return _ok(deleted=True, data={"deleted": True})
+        row = service.update_source(source_id, _payload())
+        return _ok(source=row, data=row)
+    except MonitoringValidationError as exc:
+        db.session.rollback()
+        status = 404 if "not found" in str(exc) else 400
+        return _error(str(exc), status)
+
+
+def admin_test_monitoring_source(source_id: int):
+    from app.ai.monitoring import MonitoringError, MonitoringValidationError
+
+    try:
+        result = _monitoring_config().test_source(source_id)
+        return _ok(result=result, data=result)
+    except MonitoringValidationError as exc:
+        return _error(str(exc), 404)
+    except MonitoringError as exc:
+        return _error(str(exc), 502)
+
+
+def admin_discover_monitoring_source(source_id: int):
+    from app.ai.monitoring import MonitoringError, MonitoringValidationError
+
+    try:
+        host_id = int(request.args.get("host_id"))
+        rows = _monitoring_config().discover(source_id, host_id)
+        return _ok(candidates=rows, data=rows)
+    except (TypeError, ValueError):
+        return _error("host_id must be an integer")
+    except MonitoringValidationError as exc:
+        return _error(str(exc), 404)
+    except MonitoringError as exc:
+        return _error(str(exc), 502)
+
+
+def admin_monitoring_mappings():
+    try:
+        host_id = request.args.get("host_id")
+        rows = _monitoring_config().list_mappings(
+            int(host_id) if host_id is not None else None,
+        )
+        return _ok(mappings=rows, data=rows)
+    except (TypeError, ValueError):
+        return _error("host_id must be an integer")
+
+
+def admin_save_monitoring_mapping(source_id: int, host_id: int):
+    from app.ai.monitoring import MonitoringValidationError
+    from app.ai.tools import PlatformQueryService
+
+    _holder, owner, role = _identity()
+    try:
+        if not PlatformQueryService(owner, role).validate_asset_ids([host_id]):
+            return _error("host_id is not authorized", 404)
+        payload = _payload()
+        row = _monitoring_config().save_mapping(
+            owner, source_id, host_id, payload.get("external_ref"),
+        )
+        return _ok(mapping=row, data=row)
+    except MonitoringValidationError as exc:
+        db.session.rollback()
+        return _error(str(exc))
+
+
+def monitoring_sources_for_host():
+    from app.ai.tools import PlatformQueryService
+
+    _holder, owner, role = _identity()
+    try:
+        host_id = int(request.args.get("host_id"))
+    except (TypeError, ValueError):
+        return _error("host_id must be an integer")
+    if host_id <= 0 or not PlatformQueryService(owner, role).validate_asset_ids([host_id]):
+        return _error("host_id is not authorized", 404)
+    rows = _monitoring_config().sources_for_host(host_id)
+    return _ok(sources=rows, data=rows)
+
+
 def diagnostic_profiles():
     from app.ai.diagnostic_profiles import list_profiles
 
@@ -601,6 +709,18 @@ def chat():
     payload = _payload()
     conversation_id = str(payload.get("conversation_id") or "").strip()
     message = str(payload.get("message") or "").strip()
+    source_types = payload.get("monitoring_source_types")
+    if source_types is not None:
+        allowed = {"prometheus", "grafana", "loki", "zabbix"}
+        if (
+            not isinstance(source_types, list)
+            or not 1 <= len(source_types) <= len(allowed)
+            or len(set(source_types)) != len(source_types)
+            or any(not isinstance(item, str) or item not in allowed
+                   for item in source_types)
+        ):
+            return _error("monitoring_source_types must contain unique supported types")
+        source_types = tuple(source_types)
     app = current_app._get_current_object()
     generator = AgentRunner(
         store=_store(),
@@ -610,6 +730,7 @@ def chat():
         role=role,
         conversation_id=conversation_id,
         message=message,
+        monitoring_source_types=source_types,
     )
     return Response(
         stream_with_context(generator),

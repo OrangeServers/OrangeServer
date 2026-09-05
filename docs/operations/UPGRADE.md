@@ -184,6 +184,9 @@ mysql -h <mysql-host> -u <mysql-user> -p <database> \
 
 mysql -h <mysql-host> -u <mysql-user> -p <database> \
   < backend/mysqldir/rev60_admin_all_permissions.sql
+
+mysql -h <mysql-host> -u <mysql-user> -p <database> \
+  < backend/mysqldir/rev61_ai_monitoring.sql
 ```
 
 顺序不可颠倒：rev49 修改 rev48 创建的 `t_ai_provider`，rev50 增加受控诊断的
@@ -196,6 +199,7 @@ zh-CN，存量行为不变），rev52 增加由管理界面维护的 SMTP 配置
 摘要（M2/S1），rev58 增加 embedding 单例配置和已审核知识文档表（M2/S2），
 rev59 为 Run 增加结构化结论详情（M2），rev60 幂等回填存量管理员到现有
 “所有权限”规则，避免自定义管理员名仍沿用旧 `admin` 权限关系；
+rev61 增加只读监控数据源与显式资产身份映射表，监控 Token 只保存 Fernet 密文；
 Redis 向量是可重建数据，不需要数据库 chunk 表。标准 bundled 栈会启动统一 Redis 8
 与 Worker，自治能力默认可用。
 embedding 模型、维度或向量索引布局变化时，知识库会自动显示“索引待更新”；管理员
@@ -253,6 +257,8 @@ SHOW COLUMNS FROM t_ai_autonomous_run LIKE 'conclusion_json';
 SHOW TABLES LIKE 't_ai_autonomous_evidence';
 SHOW TABLES LIKE 't_ai_embedding_config';
 SHOW TABLES LIKE 't_ai_knowledge_document';
+SHOW TABLES LIKE 't_ai_monitoring_source';
+SHOW TABLES LIKE 't_ai_monitoring_host_mapping';
 
 SELECT
     provider_code,
@@ -289,6 +295,7 @@ HAVING COUNT(binding.id) = 0;
   `t_ai_autonomous_evidence` 存在；Evidence 的 `trusted` 默认值为 `0`；
 - `t_ai_embedding_config` 只有默认本地模型配置，且
   `t_ai_knowledge_document` 已创建；
+- `t_ai_monitoring_source` 与 `t_ai_monitoring_host_mapping` 已创建；
 - `admin_without_all_permissions` 查询返回空结果；
 - 查询结果中不应出现明文 API Key。
 
@@ -336,6 +343,8 @@ make docker-health
 8. 新建 256K 会话，执行一次只读资产查询；
 9. 对测试资产运行一个固定只读诊断，检查进度、证据引用和报告；
 10. 创建批量命令计划，检查预览后取消，不在升级冒烟中执行破坏性命令。
+11. 在“系统设置 → AI 模型服务”新增一个测试监控来源，测试连接并为测试资产确认映射；
+12. 在 AI 运维对话查询该资产最近监控数据，确认返回来源证据且没有触发远程写操作。
 
 ## 6. 回滚
 
@@ -343,7 +352,7 @@ make docker-health
 
 - 应用启动失败但 schema 向后兼容时，可先恢复上一镜像。
 - 如果旧应用不能识别新 schema，停止写入后恢复升级前 MySQL 备份。
-- rev48/rev49/rev50/rev53/rev54/rev55/rev56/rev57/rev58/rev59/rev60 不提供自动 down migration；
+- rev48/rev49/rev50/rev53/rev54/rev55/rev56/rev57/rev58/rev59/rev60/rev61 不提供自动 down migration；
   不要在生产手工删除列或表。rev58 的 Redis 向量可从 MySQL 文档重建。
 - 恢复数据库前先保留失败现场的日志和当前数据库快照。
 - Release bundle 安装可停止前后端，将当前安装目录移回

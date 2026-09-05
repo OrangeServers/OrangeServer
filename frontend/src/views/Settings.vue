@@ -1,14 +1,17 @@
 <template>
-  <div>
+  <div :class="{ 'monitoring-only': monitoringOnly }">
     <div class="page-header">
       <div>
-        <span class="page-eyebrow">{{ $t('settings.eyebrow') }}</span>
-        <h2>{{ $t('settings.title') }}</h2>
-        <p class="page-subtitle">{{ $t('settings.subtitle') }}</p>
+        <span class="page-eyebrow">{{ monitoringOnly ? $t('settings.ai.monitoring.eyebrow') : $t('settings.eyebrow') }}</span>
+        <h2>{{ monitoringOnly ? $t('settings.ai.monitoring.title') : $t('settings.title') }}</h2>
+        <p class="page-subtitle">{{ monitoringOnly ? $t('settings.ai.monitoring.subtitle') : $t('settings.subtitle') }}</p>
       </div>
       <div class="page-actions">
-        <el-button @click="reloadActiveTab" :loading="loading || providerLoading" plain>
+        <el-button @click="reloadActiveTab" :loading="loading || providerLoading || monitoringLoading" plain>
           <el-icon><Refresh /></el-icon><span>{{ $t('settings.reload') }}</span>
+        </el-button>
+        <el-button v-if="monitoringOnly" type="primary" @click="openMonitoringSourceDialog()">
+          <el-icon><Plus /></el-icon>{{ $t('settings.ai.monitoring.add') }}
         </el-button>
       </div>
     </div>
@@ -422,7 +425,7 @@
     </div>
       </el-tab-pane>
 
-      <el-tab-pane :label="$t('settings.tabs.ai')" name="ai">
+      <el-tab-pane :label="monitoringOnly ? $t('settings.ai.monitoring.title') : $t('settings.tabs.ai')" name="ai">
     <!-- AI 模型服务 -->
     <div class="section-card">
       <div class="section-card-head">
@@ -641,6 +644,142 @@
             <span>{{ $t('settings.ai.emptySelect') }}</span>
           </div>
         </div>
+
+        <section v-if="monitoringOnly" class="monitoring-management" aria-labelledby="monitoring-management-title">
+          <div class="monitoring-management-head">
+            <div>
+              <span class="monitoring-eyebrow">{{ $t('settings.ai.monitoring.eyebrow') }}</span>
+              <h3 id="monitoring-management-title">{{ $t('settings.ai.monitoring.title') }}</h3>
+              <p>{{ $t('settings.ai.monitoring.subtitle') }}</p>
+            </div>
+            <div class="monitoring-management-actions">
+              <el-button plain :loading="monitoringLoading" @click="loadMonitoringData">
+                <el-icon><Refresh /></el-icon>{{ $t('settings.ai.monitoring.refresh') }}
+              </el-button>
+              <el-button type="primary" @click="openMonitoringSourceDialog()">
+                <el-icon><Plus /></el-icon>{{ $t('settings.ai.monitoring.add') }}
+              </el-button>
+            </div>
+          </div>
+          <div class="monitoring-intro">
+            <el-icon><InfoFilled /></el-icon>
+            <span>{{ $t('settings.ai.monitoring.intro') }}</span>
+          </div>
+          <div v-if="monitoringError" class="monitoring-error" role="alert">
+            <el-icon><WarningFilled /></el-icon>
+            <span>{{ monitoringError }}</span>
+            <el-button text type="danger" @click="loadMonitoringData">{{ $t('settings.ai.monitoring.refresh') }}</el-button>
+          </div>
+
+          <div class="monitoring-layout">
+            <section class="monitoring-panel" aria-labelledby="monitoring-source-list-title">
+              <div class="monitoring-panel-head">
+                <div>
+                  <strong id="monitoring-source-list-title">{{ $t('settings.ai.monitoring.sourceList') }}</strong>
+                  <span>{{ $t('settings.ai.monitoring.sourceCount', { n: monitoringSources.length }) }}</span>
+                </div>
+                <span class="monitoring-panel-code">{{ $t('settings.ai.monitoring.readOnly') }}</span>
+              </div>
+              <div v-if="!monitoringSources.length && !monitoringLoading" class="monitoring-empty">
+                <el-icon><Connection /></el-icon>
+                <strong>{{ $t('settings.ai.monitoring.empty') }}</strong>
+                <span>{{ $t('settings.ai.monitoring.emptyHint') }}</span>
+              </div>
+              <div v-else class="monitoring-source-list">
+                <article v-for="source in monitoringSources" :key="source.id" class="monitoring-source-row">
+                  <span class="monitoring-source-mark"><img :src="monitoringSourceIcons[source.source_type]" alt="" /></span>
+                  <div class="monitoring-source-copy">
+                    <div class="monitoring-source-title">
+                      <strong>{{ source.name }}</strong>
+                      <el-tag size="small" effect="plain">{{ monitoringSourceLabel(source.source_type) }}</el-tag>
+                    </div>
+                    <code class="monitoring-source-url">{{ source.base_url }}</code>
+                    <div class="monitoring-source-meta">
+                      <span :class="source.token_configured ? 'is-configured' : 'is-muted'">
+                        <el-icon><Lock /></el-icon>
+                        {{ source.token_configured ? $t('settings.ai.monitoring.tokenConfigured') : $t('settings.ai.monitoring.tokenMissing') }}
+                      </span>
+                      <span>{{ source.verify_tls ? $t('settings.ai.monitoring.tls') : $t('settings.ai.monitoring.tlsOff') }}</span>
+                    </div>
+                  </div>
+                  <div class="monitoring-source-actions">
+                    <el-button text :loading="monitoringTestingId === source.id" @click="testMonitoringConnection(source)">
+                      <el-icon><Connection /></el-icon>{{ $t('settings.ai.monitoring.actions.test') }}
+                    </el-button>
+                    <el-switch
+                      :model-value="source.enabled"
+                      :aria-label="source.enabled ? $t('settings.ai.monitoring.actions.disable') : $t('settings.ai.monitoring.actions.enable')"
+                      :loading="monitoringSavingId === source.id"
+                      @change="toggleMonitoringSource(source, Boolean($event))"
+                    />
+                    <el-button text @click="openMonitoringSourceDialog(source)">
+                      <el-icon><EditPen /></el-icon>{{ $t('settings.ai.monitoring.actions.edit') }}
+                    </el-button>
+                    <el-button text type="danger" @click="removeMonitoringSource(source)">
+                      <el-icon><Delete /></el-icon>{{ $t('settings.ai.monitoring.actions.delete') }}
+                    </el-button>
+                  </div>
+                </article>
+              </div>
+            </section>
+
+            <section class="monitoring-panel monitoring-mapping-panel" aria-labelledby="monitoring-mapping-title">
+              <div class="monitoring-panel-head">
+                <div>
+                  <strong id="monitoring-mapping-title">{{ $t('settings.ai.monitoring.mappingTitle') }}</strong>
+                  <span>{{ $t('settings.ai.monitoring.mappingSubtitle') }}</span>
+                </div>
+                <el-icon class="monitoring-panel-icon"><Monitor /></el-icon>
+              </div>
+              <p class="monitoring-mapping-hint">
+                <el-icon><InfoFilled /></el-icon>{{ $t('settings.ai.monitoring.mappingHint') }}
+              </p>
+              <el-select
+                v-model="selectedMonitoringHostId"
+                class="monitoring-asset-select"
+                filterable
+                clearable
+                :placeholder="$t('settings.ai.monitoring.assetPlaceholder')"
+                :no-data-text="$t('settings.ai.monitoring.assetEmpty')"
+                @change="onMonitoringHostChange"
+              >
+                <el-option
+                  v-for="host in monitoringHosts"
+                  :key="host.id"
+                  :label="`${host.alias} · ${host.host_ip}`"
+                  :value="host.id"
+                />
+              </el-select>
+              <div v-if="selectedMonitoringHostId" class="monitoring-mapping-list" v-loading="monitoringMappingsLoading">
+                <article v-for="source in monitoringSources" :key="`mapping-${source.id}`" class="monitoring-mapping-row">
+                  <div class="monitoring-mapping-source">
+                    <span class="monitoring-source-mark compact"><img :src="monitoringSourceIcons[source.source_type]" alt="" /></span>
+                    <div>
+                      <strong>{{ source.name }}</strong>
+                      <span>{{ monitoringSourceLabel(source.source_type) }}</span>
+                    </div>
+                  </div>
+                  <div class="monitoring-mapping-state">
+                    <el-tag v-if="mappingForSource(source.id)" size="small" type="success" effect="plain">{{ $t('settings.ai.monitoring.mappingConfigured') }}</el-tag>
+                    <el-tag v-else size="small" type="info" effect="plain">{{ $t('settings.ai.monitoring.mappingMissing') }}</el-tag>
+                    <span v-if="mappingForSource(source.id)" class="monitoring-mapping-summary">{{ mappingSummary(mappingForSource(source.id)!) }}</span>
+                  </div>
+                  <el-button size="small" plain @click="openMonitoringMappingDialog(source)">
+                    {{ mappingForSource(source.id) ? $t('settings.ai.monitoring.editMapping') : $t('settings.ai.monitoring.confirmMapping') }}
+                  </el-button>
+                </article>
+                <div v-if="!monitoringSources.length && !monitoringMappingsLoading" class="monitoring-mapping-empty">
+                  <span>{{ $t('settings.ai.monitoring.mappingEmpty') }}</span>
+                  <small>{{ $t('settings.ai.monitoring.mappingEmptyHint') }}</small>
+                </div>
+              </div>
+              <div v-else class="monitoring-mapping-placeholder">
+                <el-icon><Monitor /></el-icon>
+                <span>{{ $t('settings.ai.monitoring.selectAssetFirst') }}</span>
+              </div>
+            </section>
+          </div>
+        </section>
       </div>
     </div>
       </el-tab-pane>
@@ -683,6 +822,129 @@
       </el-tab-pane>
     </el-tabs>
 
+    <el-dialog
+      v-model="monitoringSourceDialogVisible"
+      :title="monitoringSourceEditingId ? $t('settings.ai.monitoring.edit') : $t('settings.ai.monitoring.add')"
+      width="520px"
+      class="monitoring-dialog"
+    >
+      <p class="monitoring-dialog-lead">{{ $t('settings.ai.monitoring.intro') }}</p>
+      <el-form :model="monitoringSourceForm" label-position="top" class="monitoring-form">
+        <el-form-item :label="$t('settings.ai.monitoring.name')">
+          <el-input v-model="monitoringSourceForm.name" maxlength="64" show-word-limit :placeholder="$t('settings.ai.monitoring.namePlaceholder')" />
+        </el-form-item>
+        <el-form-item :label="$t('settings.ai.monitoring.type')">
+          <el-select v-model="monitoringSourceForm.source_type" :disabled="Boolean(monitoringSourceEditingId)" style="width:100%">
+            <template #label>
+              <span class="monitoring-type-option">
+                <img :src="monitoringSourceIcons[monitoringSourceForm.source_type]" alt="" />
+                <span>{{ monitoringSourceLabel(monitoringSourceForm.source_type) }}</span>
+              </span>
+            </template>
+            <el-option v-for="sourceType in monitoringSourceTypes" :key="sourceType" :label="monitoringSourceLabel(sourceType)" :value="sourceType">
+              <span class="monitoring-type-option">
+                <img :src="monitoringSourceIcons[sourceType]" alt="" />
+                <span>{{ monitoringSourceLabel(sourceType) }}</span>
+              </span>
+            </el-option>
+          </el-select>
+          <div v-if="monitoringSourceEditingId" class="monitoring-form-hint">{{ $t('settings.ai.monitoring.typeLocked') }}</div>
+        </el-form-item>
+        <el-form-item :label="$t('settings.ai.monitoring.baseUrl')">
+          <el-input v-model="monitoringSourceForm.base_url" :placeholder="$t('settings.ai.monitoring.baseUrlPlaceholder')" />
+        </el-form-item>
+        <el-form-item :label="$t('settings.ai.monitoring.token')">
+          <el-input
+            v-model="monitoringSourceForm.token"
+            type="password"
+            show-password
+            autocomplete="new-password"
+            :placeholder="$t('settings.ai.monitoring.tokenPlaceholder')"
+          />
+          <div class="monitoring-form-hint"><el-icon><Lock /></el-icon>{{ $t('settings.ai.monitoring.tokenHint') }}</div>
+        </el-form-item>
+        <div class="monitoring-form-switches">
+          <label><el-switch v-model="monitoringSourceForm.verify_tls" />{{ $t('settings.ai.monitoring.verifyTls') }}</label>
+          <label><el-switch v-model="monitoringSourceForm.enabled" />{{ $t('settings.ai.monitoring.enabled') }}</label>
+        </div>
+      </el-form>
+      <template #footer>
+        <el-button @click="monitoringSourceDialogVisible = false">{{ $t('settings.ai.monitoring.cancel') }}</el-button>
+        <el-button type="primary" :loading="monitoringSaving" @click="saveMonitoringSource">{{ $t('settings.ai.monitoring.save') }}</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="monitoringMappingDialogVisible"
+      :title="monitoringMappingSource ? `${$t('settings.ai.monitoring.mappingTitle')} · ${monitoringMappingSource.name}` : $t('settings.ai.monitoring.mappingTitle')"
+      width="520px"
+      class="monitoring-dialog"
+    >
+      <p class="monitoring-dialog-lead">{{ $t('settings.ai.monitoring.mappingHint') }}</p>
+      <el-form v-if="monitoringMappingSource" :model="monitoringMappingForm" label-position="top" class="monitoring-form">
+        <el-button
+          class="monitoring-discover-action"
+          plain
+          :loading="monitoringDiscovering"
+          @click="discoverMonitoringMappings"
+        >
+          <el-icon><Refresh /></el-icon>{{ $t('settings.ai.monitoring.discover') }}
+        </el-button>
+        <el-select
+          v-if="monitoringCandidates.length"
+          class="monitoring-candidate-select"
+          :placeholder="$t('settings.ai.monitoring.candidatePlaceholder')"
+          @change="applyMonitoringCandidate"
+        >
+          <el-option
+            v-for="(candidate, index) in monitoringCandidates"
+            :key="index"
+            :label="monitoringCandidateLabel(candidate, index)"
+            :value="index"
+          />
+        </el-select>
+        <template v-if="monitoringMappingSource.source_type === 'prometheus' || monitoringMappingSource.source_type === 'loki'">
+          <el-form-item :label="$t('settings.ai.monitoring.labelsJson')">
+            <el-input v-model="monitoringMappingForm.labels_text" type="textarea" :rows="4" placeholder='{"instance":"node-01"}' />
+            <div class="monitoring-form-hint">{{ $t('settings.ai.monitoring.labelsJsonHint') }}</div>
+          </el-form-item>
+        </template>
+        <template v-else-if="monitoringMappingSource.source_type === 'grafana'">
+          <el-form-item :label="$t('settings.ai.monitoring.datasourceUid')">
+            <el-input v-model="monitoringMappingForm.datasource_uid" :placeholder="$t('settings.ai.monitoring.datasourceUidPlaceholder')" />
+          </el-form-item>
+          <el-form-item :label="$t('settings.ai.monitoring.dashboardUid')">
+            <el-input v-model="monitoringMappingForm.dashboard_uid" :placeholder="$t('settings.ai.monitoring.dashboardUidPlaceholder')" />
+            <div class="monitoring-form-hint">{{ $t('settings.ai.monitoring.dashboardUidHint') }}</div>
+          </el-form-item>
+          <el-form-item :label="$t('settings.ai.monitoring.datasourceType')">
+            <el-select v-model="monitoringMappingForm.datasource_type" style="width:100%">
+              <el-option value="prometheus" :label="$t('settings.ai.monitoring.types.prometheus')" />
+              <el-option value="loki" :label="$t('settings.ai.monitoring.types.loki')" />
+            </el-select>
+            <div class="monitoring-form-hint">{{ $t('settings.ai.monitoring.datasourceTypeHint') }}</div>
+          </el-form-item>
+          <div class="monitoring-grafana-identity">
+            <el-form-item :label="$t('settings.ai.monitoring.identityLabel')">
+              <el-input v-model="monitoringMappingForm.identity_label" :placeholder="$t('settings.ai.monitoring.identityLabelPlaceholder')" />
+            </el-form-item>
+            <el-form-item :label="$t('settings.ai.monitoring.identityValue')">
+              <el-input v-model="monitoringMappingForm.identity_value" :placeholder="$t('settings.ai.monitoring.identityValuePlaceholder')" />
+            </el-form-item>
+          </div>
+        </template>
+        <template v-else>
+          <el-form-item :label="$t('settings.ai.monitoring.zabbixHostid')">
+            <el-input v-model="monitoringMappingForm.hostid" inputmode="numeric" :placeholder="$t('settings.ai.monitoring.zabbixHostidPlaceholder')" />
+          </el-form-item>
+        </template>
+      </el-form>
+      <template #footer>
+        <el-button @click="monitoringMappingDialogVisible = false">{{ $t('settings.ai.monitoring.cancel') }}</el-button>
+        <el-button type="primary" :loading="monitoringMappingSaving" @click="saveMonitoringMapping">{{ $t('settings.ai.monitoring.confirmMapping') }}</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 保存 -->
     <div v-if="activeTab !== 'ai'" class="setting-footer">
       <el-button type="primary" size="large" @click="save" :loading="saving">
@@ -696,16 +958,33 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Lock, Monitor, Document, Folder, Bell, Brush, Setting, Check, Refresh, InfoFilled, Sunny, Cloudy, Moon, Cpu, Connection, Delete } from '@element-plus/icons-vue'
+import { Lock, Monitor, Document, Folder, Bell, Brush, Setting, Check, Refresh, InfoFilled, Sunny, Cloudy, Moon, Cpu, Connection, Delete, Plus, EditPen, WarningFilled } from '@element-plus/icons-vue'
 import type { Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { getMailSettings, getSettings, testMailSettings, updateMailSettings, updateSettings } from '@/api'
+import { getHostList, getMailSettings, getSettings, testMailSettings, updateMailSettings, updateSettings } from '@/api'
+import {
+  createMonitoringSource,
+  deleteMonitoringSource,
+  discoverMonitoringCandidates,
+  listMonitoringMappings,
+  listMonitoringSources,
+  saveMonitoringMapping as saveMonitoringMappingRequest,
+  testMonitoringSource,
+  updateMonitoringSource,
+} from '@/api/aiMonitoring'
 import { applyTheme } from '@/store'
 import { t, setLocale, currentLocale } from '@/i18n'
 import { aiJsonRequest } from '@/utils/aiStream'
 import {
   AI_CONTEXT_TOKENS_DEEP,
   AI_CONTEXT_TOKENS_STANDARD,
+  type AiMonitoringDatasourceType,
+  type AiMonitoringCandidate,
+  type AiMonitoringExternalRef,
+  type AiMonitoringMapping,
+  type AiMonitoringSource,
+  type AiMonitoringSourcePayload,
+  type AiMonitoringSourceType,
 } from '@/types/ai'
 
 /** 设置表单 (后端 settings 返回结构) */
@@ -795,12 +1074,90 @@ const providerModels = ref<Record<string, string[]>>({})
 const activeProvider = computed<AiProviderConfig | undefined>(() =>
   aiProviders.value.find(provider => provider.provider_code === activeProviderCode.value),
 )
+
+interface MonitoringHostOption {
+  id: number
+  alias: string
+  host_ip: string
+  group?: string
+}
+
+interface MonitoringSourceForm {
+  name: string
+  source_type: AiMonitoringSourceType
+  base_url: string
+  token: string
+  verify_tls: boolean
+  enabled: boolean
+}
+
+interface MonitoringMappingForm {
+  labels_text: string
+  datasource_uid: string
+  dashboard_uid: string
+  datasource_type: AiMonitoringDatasourceType
+  identity_label: string
+  identity_value: string
+  hostid: string
+}
+
+const monitoringSourceTypes: readonly AiMonitoringSourceType[] = ['prometheus', 'grafana', 'loki', 'zabbix']
+const monitoringSourceIcons: Record<AiMonitoringSourceType, string> = {
+  prometheus: prometheusIcon,
+  grafana: grafanaIcon,
+  loki: lokiIcon,
+  zabbix: zabbixIcon,
+}
+const monitoringSources = ref<AiMonitoringSource[]>([])
+const monitoringHosts = ref<MonitoringHostOption[]>([])
+const monitoringMappings = ref<AiMonitoringMapping[]>([])
+const selectedMonitoringHostId = ref<number | undefined>(undefined)
+const monitoringLoading = ref(false)
+const monitoringMappingsLoading = ref(false)
+const monitoringError = ref('')
+const monitoringSourceDialogVisible = ref(false)
+const monitoringMappingDialogVisible = ref(false)
+const monitoringSourceEditingId = ref<number | null>(null)
+const monitoringMappingSource = ref<AiMonitoringSource | null>(null)
+const monitoringSaving = ref(false)
+const monitoringSavingId = ref<number | null>(null)
+const monitoringTestingId = ref<number | null>(null)
+const monitoringMappingSaving = ref(false)
+const monitoringDiscovering = ref(false)
+const monitoringCandidates = ref<AiMonitoringCandidate[]>([])
+
+const newMonitoringSourceForm = (): MonitoringSourceForm => ({
+  name: '',
+  source_type: 'prometheus',
+  base_url: '',
+  token: '',
+  verify_tls: true,
+  enabled: true,
+})
+
+const newMonitoringMappingForm = (): MonitoringMappingForm => ({
+  labels_text: '{\n  "instance": ""\n}',
+  datasource_uid: '',
+  dashboard_uid: '',
+  datasource_type: 'prometheus',
+  identity_label: 'instance',
+  identity_value: '',
+  hostid: '',
+})
+
+const monitoringSourceForm = ref<MonitoringSourceForm>(newMonitoringSourceForm())
+const monitoringMappingForm = ref<MonitoringMappingForm>(newMonitoringMappingForm())
 import { providerBrandColor, providerIcon } from '@/assets/provider-logos'
+import prometheusIcon from '@/assets/monitoring/prometheus.svg'
+import grafanaIcon from '@/assets/monitoring/grafana.svg'
+import lokiIcon from '@/assets/monitoring/loki.svg'
+import zabbixIcon from '@/assets/monitoring/zabbix.svg'
 const route = useRoute()
 const router = useRouter()
 const settingTabs = ['security', 'terminal', 'audit', 'transfer', 'notification', 'appearance', 'ai', 'system'] as const
 type SettingTab = typeof settingTabs[number]
-const requestedTab = typeof route.query.tab === 'string' ? route.query.tab : ''
+const monitoringOnly = computed(() => route.name === 'AiOpsSources')
+const requestedTab = monitoringOnly.value ? 'ai' : (typeof route.query.tab === 'string' ? route.query.tab : '')
 const activeTab = ref<SettingTab>(settingTabs.includes(requestedTab as SettingTab) ? requestedTab as SettingTab : 'security')
 const mailPreset = ref<keyof typeof MAIL_PRESETS | 'custom'>('126')
 const mailForm = ref<MailSettingsForm>({
@@ -916,6 +1273,10 @@ async function loadSettings(): Promise<void> {
 }
 
 async function reloadActiveTab(): Promise<void> {
+  if (monitoringOnly.value) {
+    await loadMonitoringData()
+    return
+  }
   if (activeTab.value === 'ai') {
     await Promise.all([loadSettings(), loadAiProviders()])
     return
@@ -1037,6 +1398,347 @@ async function loadAiProviders(): Promise<void> {
     ElMessage.error(error instanceof Error ? error.message : t('settings.ai.msg.loadFail'))
   } finally {
     providerLoading.value = false
+  }
+}
+
+function monitoringSourceLabel(sourceType: AiMonitoringSourceType): string {
+  return t(`settings.ai.monitoring.types.${sourceType}`)
+}
+
+function unwrapMonitoringHosts(response: unknown): MonitoringHostOption[] {
+  if (!response || typeof response !== 'object') return []
+  const payload = response as Record<string, unknown>
+  const nested = payload.data && typeof payload.data === 'object'
+    ? payload.data as Record<string, unknown>
+    : null
+  const rows = Array.isArray(payload.host_list_msg)
+    ? payload.host_list_msg
+    : (nested && Array.isArray(nested.host_list_msg) ? nested.host_list_msg : [])
+  return rows.flatMap((raw) => {
+    if (!raw || typeof raw !== 'object') return []
+    const row = raw as Record<string, unknown>
+    const id = Number(row.id)
+    if (!Number.isInteger(id) || id <= 0) return []
+    return [{
+      id,
+      alias: String(row.alias || row.name || `#${id}`),
+      host_ip: String(row.host_ip || row.host || ''),
+      group: row.group ? String(row.group) : undefined,
+    }]
+  })
+}
+
+async function loadMonitoringMappings(hostId: number | undefined): Promise<void> {
+  if (!hostId) {
+    monitoringMappings.value = []
+    return
+  }
+  monitoringMappingsLoading.value = true
+  try {
+    monitoringMappings.value = await listMonitoringMappings(hostId)
+  } catch (error) {
+    monitoringMappings.value = []
+    ElMessage.error(error instanceof Error ? error.message : t('settings.ai.monitoring.mappingLoadFail'))
+  } finally {
+    monitoringMappingsLoading.value = false
+  }
+}
+
+async function loadMonitoringData(): Promise<void> {
+  monitoringLoading.value = true
+  monitoringError.value = ''
+  try {
+    const [sources, hostResponse] = await Promise.all([listMonitoringSources(), getHostList()])
+    monitoringSources.value = sources
+    monitoringHosts.value = unwrapMonitoringHosts(hostResponse)
+    if (selectedMonitoringHostId.value && monitoringHosts.value.some(host => host.id === selectedMonitoringHostId.value)) {
+      await loadMonitoringMappings(selectedMonitoringHostId.value)
+    } else {
+      selectedMonitoringHostId.value = undefined
+      monitoringMappings.value = []
+    }
+  } catch (error) {
+    monitoringError.value = error instanceof Error ? error.message : t('settings.ai.monitoring.loadFail')
+  } finally {
+    monitoringLoading.value = false
+  }
+}
+
+function onMonitoringHostChange(value: unknown): void {
+  const hostId = typeof value === 'number' ? value : Number(value)
+  selectedMonitoringHostId.value = Number.isInteger(hostId) && hostId > 0 ? hostId : undefined
+  void loadMonitoringMappings(selectedMonitoringHostId.value)
+}
+
+function mappingForSource(sourceId: number): AiMonitoringMapping | undefined {
+  return monitoringMappings.value.find(mapping => mapping.source_id === sourceId)
+}
+
+function mappingSummary(mapping: AiMonitoringMapping): string {
+  const externalRef = mapping.external_ref
+  if ('datasource_uid' in externalRef) {
+    const [label, value] = Object.entries(externalRef.labels || {})[0] || []
+    return [externalRef.dashboard_uid, externalRef.datasource_uid, externalRef.datasource_type, label && value ? `${label}=${value}` : ''].filter(Boolean).join(' · ')
+  }
+  if ('labels' in externalRef) {
+    return Object.entries(externalRef.labels || {}).map(([label, value]) => `${label}=${value}`).join(', ')
+  }
+  return `hostid=${externalRef.hostid}`
+}
+
+function monitoringCandidateLabel(candidate: AiMonitoringCandidate, index: number): string {
+  const externalRef = candidate.external_ref
+  const fallback = t('settings.ai.monitoring.candidateFallback', { n: index + 1 })
+  if ('datasource_uid' in externalRef) {
+    const [label, value] = Object.entries(externalRef.labels || {})[0] || []
+    const datasource = candidate.source_name || candidate.datasource_name || externalRef.datasource_uid
+    const identity = label && value ? `${label}=${value}` : candidate.label || fallback
+    return `${datasource} · ${t(`settings.ai.monitoring.types.${externalRef.datasource_type}`)} · ${identity}`
+  }
+  if ('labels' in externalRef) {
+    const labels = Object.entries(externalRef.labels || {}).map(([key, value]) => `${key}=${value}`).join(', ')
+    return [candidate.label, labels].filter(Boolean).join(' · ') || fallback
+  }
+  return `${candidate.label || t('settings.ai.monitoring.types.zabbix')} · hostid=${externalRef.hostid}`
+}
+
+function openMonitoringSourceDialog(source?: AiMonitoringSource): void {
+  monitoringSourceEditingId.value = source?.id ?? null
+  monitoringSourceForm.value = source
+    ? {
+        name: source.name,
+        source_type: source.source_type,
+        base_url: source.base_url,
+        token: '',
+        verify_tls: source.verify_tls,
+        enabled: source.enabled,
+      }
+    : newMonitoringSourceForm()
+  monitoringSourceDialogVisible.value = true
+}
+
+function validMonitoringSourceForm(): boolean {
+  if (!monitoringSourceForm.value.name.trim() || !monitoringSourceForm.value.base_url.trim()) {
+    ElMessage.warning(t('settings.ai.monitoring.invalidSource'))
+    return false
+  }
+  return true
+}
+
+async function saveMonitoringSource(): Promise<void> {
+  if (!validMonitoringSourceForm()) return
+  monitoringSaving.value = true
+  const formValue = monitoringSourceForm.value
+  try {
+    let saved: AiMonitoringSource
+    if (monitoringSourceEditingId.value) {
+      const payload: Omit<AiMonitoringSourcePayload, 'source_type'> = {
+        name: formValue.name.trim(),
+        base_url: formValue.base_url.trim(),
+        verify_tls: formValue.verify_tls,
+        enabled: formValue.enabled,
+        ...(formValue.token.trim() ? { token: formValue.token } : {}),
+      }
+      saved = await updateMonitoringSource(monitoringSourceEditingId.value, payload)
+      const index = monitoringSources.value.findIndex(source => source.id === saved.id)
+      if (index >= 0) monitoringSources.value[index] = saved
+    } else {
+      const payload: AiMonitoringSourcePayload = {
+        name: formValue.name.trim(),
+        source_type: formValue.source_type,
+        base_url: formValue.base_url.trim(),
+        verify_tls: formValue.verify_tls,
+        enabled: formValue.enabled,
+        ...(formValue.token.trim() ? { token: formValue.token } : {}),
+      }
+      saved = await createMonitoringSource(payload)
+      monitoringSources.value = [...monitoringSources.value, saved]
+    }
+    monitoringSourceDialogVisible.value = false
+    ElMessage.success(t('settings.ai.monitoring.sourceSaved'))
+    if (selectedMonitoringHostId.value) await loadMonitoringMappings(selectedMonitoringHostId.value)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : t('settings.ai.monitoring.saveFail'))
+  } finally {
+    monitoringSaving.value = false
+  }
+}
+
+async function toggleMonitoringSource(source: AiMonitoringSource, enabled: boolean): Promise<void> {
+  const previous = source.enabled
+  if (previous === enabled) return
+  source.enabled = enabled
+  monitoringSavingId.value = source.id
+  try {
+    const saved = await updateMonitoringSource(source.id, {
+      name: source.name,
+      base_url: source.base_url,
+      verify_tls: source.verify_tls,
+      enabled,
+    })
+    Object.assign(source, saved)
+  } catch (error) {
+    source.enabled = previous
+    ElMessage.error(error instanceof Error ? error.message : t('settings.ai.monitoring.saveFail'))
+  } finally {
+    monitoringSavingId.value = null
+  }
+}
+
+async function testMonitoringConnection(source: AiMonitoringSource): Promise<void> {
+  monitoringTestingId.value = source.id
+  try {
+    const result = await testMonitoringSource(source.id)
+    ElMessage.success(t('settings.ai.monitoring.testPassed', {
+      version: result.version || source.source_type,
+    }))
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : t('settings.ai.monitoring.testFailed'))
+  } finally {
+    monitoringTestingId.value = null
+  }
+}
+
+async function removeMonitoringSource(source: AiMonitoringSource): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      t('settings.ai.monitoring.deleteConfirm', { name: source.name }),
+      t('settings.ai.monitoring.actions.delete'),
+      {
+        confirmButtonText: t('settings.ai.monitoring.actions.delete'),
+        cancelButtonText: t('settings.ai.monitoring.cancel'),
+        type: 'warning',
+      },
+    )
+  } catch {
+    return
+  }
+  try {
+    await deleteMonitoringSource(source.id)
+    monitoringSources.value = monitoringSources.value.filter(item => item.id !== source.id)
+    monitoringMappings.value = monitoringMappings.value.filter(mapping => mapping.source_id !== source.id)
+    ElMessage.success(t('settings.ai.monitoring.sourceDeleted'))
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : t('settings.ai.monitoring.deleteFail'))
+  }
+}
+
+function openMonitoringMappingDialog(source: AiMonitoringSource): void {
+  monitoringMappingSource.value = source
+  monitoringCandidates.value = []
+  monitoringMappingForm.value = newMonitoringMappingForm()
+  const existing = mappingForSource(source.id)?.external_ref
+  if (existing && source.source_type === 'grafana' && 'datasource_uid' in existing) {
+    const [label, value] = Object.entries(existing.labels || {})[0] || []
+    monitoringMappingForm.value.datasource_uid = existing.datasource_uid
+    monitoringMappingForm.value.dashboard_uid = existing.dashboard_uid
+    monitoringMappingForm.value.datasource_type = existing.datasource_type
+    monitoringMappingForm.value.identity_label = label || ''
+    monitoringMappingForm.value.identity_value = value || ''
+  } else if (existing && (source.source_type === 'prometheus' || source.source_type === 'loki') && 'labels' in existing && !('datasource_uid' in existing)) {
+    monitoringMappingForm.value.labels_text = JSON.stringify(existing.labels, null, 2)
+  } else if (existing && source.source_type === 'zabbix' && 'hostid' in existing) {
+    monitoringMappingForm.value.hostid = existing.hostid
+  }
+  monitoringMappingDialogVisible.value = true
+}
+
+async function discoverMonitoringMappings(): Promise<void> {
+  const source = monitoringMappingSource.value
+  const hostId = selectedMonitoringHostId.value
+  if (!source || !hostId) return
+  monitoringDiscovering.value = true
+  try {
+    monitoringCandidates.value = await discoverMonitoringCandidates(source.id, hostId)
+    if (!monitoringCandidates.value.length) {
+      ElMessage.warning(t('settings.ai.monitoring.candidatesEmpty'))
+    }
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : t('settings.ai.monitoring.discoverFailed'))
+  } finally {
+    monitoringDiscovering.value = false
+  }
+}
+
+function applyMonitoringCandidate(index: number): void {
+  const externalRef = monitoringCandidates.value[index]?.external_ref
+  if (!externalRef) return
+  if ('datasource_uid' in externalRef) {
+    const [label, value] = Object.entries(externalRef.labels || {})[0] || []
+    Object.assign(monitoringMappingForm.value, {
+      datasource_uid: externalRef.datasource_uid,
+      dashboard_uid: externalRef.dashboard_uid || '',
+      datasource_type: externalRef.datasource_type,
+      identity_label: label || '',
+      identity_value: value || '',
+    })
+  } else if ('labels' in externalRef) {
+    monitoringMappingForm.value.labels_text = JSON.stringify(externalRef.labels, null, 2)
+  } else {
+    monitoringMappingForm.value.hostid = externalRef.hostid
+  }
+}
+
+function buildMonitoringExternalRef(sourceType: AiMonitoringSourceType): AiMonitoringExternalRef | null {
+  const formValue = monitoringMappingForm.value
+  if (sourceType === 'prometheus' || sourceType === 'loki') {
+    try {
+      const parsed = JSON.parse(formValue.labels_text) as unknown
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error()
+      const labels: Record<string, string> = {}
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (!key.trim() || typeof value !== 'string' || !value.trim()) throw new Error()
+        labels[key.trim()] = value.trim()
+      }
+      if (!Object.keys(labels).length) throw new Error()
+      return { labels }
+    } catch {
+      ElMessage.warning(t('settings.ai.monitoring.invalidLabels'))
+      return null
+    }
+  }
+  if (sourceType === 'grafana') {
+    const uid = formValue.datasource_uid.trim()
+    const dashboardUid = formValue.dashboard_uid.trim()
+    const label = formValue.identity_label.trim()
+    const value = formValue.identity_value.trim()
+    if (!uid || !dashboardUid || !label || !value) {
+      ElMessage.warning(t('settings.ai.monitoring.invalidGrafana'))
+      return null
+    }
+    return {
+      datasource_uid: uid,
+      datasource_type: formValue.datasource_type,
+      dashboard_uid: dashboardUid,
+      labels: { [label]: value },
+    }
+  }
+  const hostid = formValue.hostid.trim()
+  if (!/^\d+$/.test(hostid)) {
+    ElMessage.warning(t('settings.ai.monitoring.invalidZabbix'))
+    return null
+  }
+  return { hostid }
+}
+
+async function saveMonitoringMapping(): Promise<void> {
+  const source = monitoringMappingSource.value
+  const hostId = selectedMonitoringHostId.value
+  if (!source || !hostId) return
+  const externalRef = buildMonitoringExternalRef(source.source_type)
+  if (!externalRef) return
+  monitoringMappingSaving.value = true
+  try {
+    const saved = await saveMonitoringMappingRequest(source.id, hostId, externalRef)
+    const index = monitoringMappings.value.findIndex(mapping => mapping.source_id === source.id)
+    if (index >= 0) monitoringMappings.value[index] = saved
+    else monitoringMappings.value = [...monitoringMappings.value, saved]
+    monitoringMappingDialogVisible.value = false
+    ElMessage.success(t('settings.ai.monitoring.mappingSaved'))
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : t('settings.ai.monitoring.mappingSaveFail'))
+  } finally {
+    monitoringMappingSaving.value = false
   }
 }
 
@@ -1272,6 +1974,10 @@ async function clearProviderKey(provider: AiProviderConfig): Promise<void> {
 }
 
 onMounted(() => {
+  if (monitoringOnly.value) {
+    void loadMonitoringData()
+    return
+  }
   void loadSettings()
   void loadMailSettings()
   void loadAiProviders()
@@ -1287,6 +1993,7 @@ watch(
 )
 
 watch(activeTab, (tab) => {
+  if (monitoringOnly.value) return
   if (route.query.tab === tab) return
   void router.replace({ query: { ...route.query, tab } })
 })
@@ -1709,6 +2416,396 @@ watch(activeTab, (tab) => {
 }
 .provider-actions :deep(.el-button + .el-button) {
   margin-left: 0;
+}
+
+.monitoring-only .settings-tabs :deep(.el-tabs__header) { display: none; }
+.monitoring-only .section-card {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.monitoring-only .section-card-head,
+.monitoring-only .provider-intro,
+.monitoring-only .provider-workbench { display: none; }
+.monitoring-only .section-card-body { padding: 0; }
+.monitoring-only .monitoring-management-head { display: none; }
+.monitoring-only .monitoring-management {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+/* 监控数据源：把配置与资产映射放在同一条只读信号工作台中 */
+.monitoring-management {
+  margin-top: 32px;
+  padding-top: 28px;
+  border-top: 1px solid var(--ogs-border);
+}
+.monitoring-management-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 14px;
+}
+.monitoring-eyebrow,
+.monitoring-panel-code {
+  color: var(--ogs-primary);
+  font: 700 9px var(--ogs-mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.monitoring-management-head h3 {
+  margin-top: 5px;
+  color: var(--ogs-text);
+  font-size: 20px;
+  letter-spacing: -.015em;
+}
+.monitoring-management-head p {
+  max-width: 700px;
+  margin-top: 6px;
+  color: var(--ogs-text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.monitoring-management-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.monitoring-management-actions :deep(.el-button + .el-button) {
+  margin-left: 0;
+}
+.monitoring-intro,
+.monitoring-error,
+.monitoring-mapping-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  line-height: 1.55;
+}
+.monitoring-intro {
+  margin-bottom: 16px;
+  padding: 11px 14px;
+  color: var(--ogs-text-secondary);
+  font-size: 12px;
+  background: var(--ogs-bg-sunken);
+  border: 1px solid var(--ogs-border-subtle);
+  border-radius: var(--ogs-radius-sm);
+}
+.monitoring-intro .el-icon,
+.monitoring-mapping-hint .el-icon {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--ogs-primary);
+}
+.monitoring-error {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  color: var(--ogs-danger, #ef4444);
+  font-size: 12px;
+  background: rgba(239, 68, 68, .06);
+  border: 1px solid rgba(239, 68, 68, .22);
+  border-radius: var(--ogs-radius-sm);
+}
+.monitoring-error .el-button {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0;
+}
+.monitoring-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(320px, .9fr);
+  align-items: start;
+  gap: 16px;
+}
+.monitoring-panel {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--ogs-border);
+  border-radius: var(--ogs-radius-sm);
+  background: var(--ogs-surface);
+}
+.monitoring-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 15px 16px 13px;
+  border-bottom: 1px solid var(--ogs-border-subtle);
+}
+.monitoring-panel-head > div {
+  min-width: 0;
+}
+.monitoring-panel-head strong {
+  display: block;
+  color: var(--ogs-text);
+  font-size: 13px;
+}
+.monitoring-panel-head strong + span {
+  display: block;
+  margin-top: 5px;
+  color: var(--ogs-text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.monitoring-panel-code {
+  flex: 0 0 auto;
+  color: var(--ogs-text-muted);
+  font-size: 8px;
+}
+.monitoring-panel-icon {
+  flex: 0 0 auto;
+  color: var(--ogs-primary);
+}
+.monitoring-source-list {
+  padding: 5px 14px 8px;
+}
+.monitoring-source-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  padding: 12px 2px;
+  border-bottom: 1px solid var(--ogs-border-subtle);
+}
+.monitoring-source-row:last-child {
+  border-bottom: 0;
+}
+.monitoring-source-mark {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--ogs-border);
+  border-radius: 9px;
+  background: var(--ogs-bg-sunken);
+}
+.monitoring-source-mark img { width: 22px; height: 22px; object-fit: contain; }
+.monitoring-source-mark.compact {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+}
+.monitoring-source-mark.compact img { width: 18px; height: 18px; }
+.monitoring-type-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  pointer-events: none;
+}
+.monitoring-type-option img {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  object-fit: contain;
+}
+.monitoring-source-copy {
+  min-width: 0;
+}
+.monitoring-source-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.monitoring-source-title strong {
+  min-width: 0;
+  color: var(--ogs-text);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.monitoring-source-title :deep(.el-tag) {
+  height: 20px;
+  font-size: 10px;
+}
+.monitoring-source-url {
+  display: block;
+  max-width: 100%;
+  margin-top: 5px;
+  overflow: hidden;
+  color: var(--ogs-text-muted);
+  font: 10px var(--ogs-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.monitoring-source-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 6px;
+  color: var(--ogs-text-muted);
+  font-size: 10px;
+}
+.monitoring-source-meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.monitoring-source-meta .is-configured { color: var(--ogs-success); }
+.monitoring-source-meta .is-muted { color: var(--ogs-text-muted); }
+.monitoring-source-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.monitoring-source-actions :deep(.el-button) {
+  margin-left: 0;
+  padding-inline: 5px;
+  font-size: 11px;
+}
+.monitoring-mapping-hint {
+  margin: 14px 16px;
+  color: var(--ogs-text-secondary);
+  font-size: 11px;
+}
+.monitoring-asset-select {
+  width: calc(100% - 32px);
+  margin: 0 16px 12px;
+}
+.monitoring-mapping-list {
+  border-top: 1px solid var(--ogs-border-subtle);
+}
+.monitoring-mapping-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--ogs-border-subtle);
+}
+.monitoring-mapping-row:last-child { border-bottom: 0; }
+.monitoring-mapping-source {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+.monitoring-mapping-source > div {
+  min-width: 0;
+}
+.monitoring-mapping-source strong,
+.monitoring-mapping-source span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.monitoring-mapping-source strong { color: var(--ogs-text); font-size: 12px; }
+.monitoring-mapping-source span { margin-top: 3px; color: var(--ogs-text-muted); font-size: 10px; }
+.monitoring-mapping-state {
+  min-width: 0;
+}
+.monitoring-mapping-summary {
+  display: block;
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--ogs-text-muted);
+  font: 10px var(--ogs-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.monitoring-mapping-row > :deep(.el-button) {
+  margin-left: 0;
+  white-space: nowrap;
+}
+.monitoring-mapping-placeholder,
+.monitoring-empty,
+.monitoring-mapping-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 150px;
+  padding: 24px 18px;
+  text-align: center;
+  color: var(--ogs-text-muted);
+  font-size: 12px;
+}
+.monitoring-empty strong,
+.monitoring-mapping-empty span { color: var(--ogs-text-secondary); }
+.monitoring-empty span,
+.monitoring-mapping-empty small { max-width: 260px; line-height: 1.5; }
+.monitoring-empty .el-icon,
+.monitoring-mapping-placeholder .el-icon { color: var(--ogs-primary); font-size: 24px; }
+.monitoring-mapping-empty { min-height: 100px; }
+.monitoring-dialog-lead {
+  margin: -4px 0 18px;
+  color: var(--ogs-text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.monitoring-form :deep(.el-form-item) { margin-bottom: 18px; }
+.monitoring-form :deep(.el-input),
+.monitoring-form :deep(.el-select) { width: 100%; }
+.monitoring-discover-action,
+.monitoring-candidate-select { width: 100%; margin-bottom: 12px; }
+.monitoring-form-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  margin-top: 6px;
+  color: var(--ogs-text-muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+.monitoring-form-hint .el-icon { flex: 0 0 auto; margin-top: 2px; }
+.monitoring-form-switches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-top: 2px;
+}
+.monitoring-form-switches label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ogs-text-secondary);
+  font-size: 12px;
+}
+.monitoring-grafana-identity {
+  display: grid;
+  grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr);
+  gap: 12px;
+}
+.monitoring-grafana-identity :deep(.el-form-item) { min-width: 0; }
+.monitoring-dialog :deep(.el-dialog) { max-width: calc(100vw - 24px); }
+.monitoring-dialog :deep(.el-dialog__body) { padding-top: 12px; }
+
+@media (max-width: 900px) {
+  .monitoring-layout { grid-template-columns: 1fr; }
+}
+@media (max-width: 620px) {
+  .monitoring-management { margin-top: 24px; padding-top: 22px; }
+  .monitoring-management-head { flex-direction: column; gap: 12px; }
+  .monitoring-management-actions { width: 100%; justify-content: flex-start; }
+  .monitoring-management-actions :deep(.el-button) { flex: 1 1 0; }
+  .monitoring-source-row {
+    grid-template-columns: 30px minmax(0, 1fr);
+    align-items: start;
+    gap: 9px;
+  }
+  .monitoring-source-mark { width: 30px; height: 30px; font-size: 12px; }
+  .monitoring-source-actions {
+    grid-column: 2;
+    justify-content: flex-start;
+    margin-top: 2px;
+  }
+  .monitoring-mapping-row {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+  }
+  .monitoring-mapping-row > :deep(.el-button) { justify-self: start; }
+  .monitoring-grafana-identity { grid-template-columns: 1fr; gap: 0; }
+  .monitoring-dialog :deep(.el-dialog__footer) { padding-top: 4px; }
 }
 @media (max-width: 820px) {
   .settings-tabs :deep(.el-tabs__header) {
