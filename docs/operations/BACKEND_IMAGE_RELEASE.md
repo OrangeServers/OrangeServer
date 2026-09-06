@@ -49,6 +49,14 @@ pwsh -File ops/smoke-ai-autonomy-s2.ps1 -ExpectedHead <40-hex-commit>
 pwsh -File ops/smoke-ai-autonomy-s3.ps1 -ExpectedHead <40-hex-commit>
 ```
 
+纯 Linux 主机无需 PowerShell 运行时，用等价的 bash 入口（场景步骤与 ps1 一一对应，
+由 `test_clean_deploy_contract.py` 的漂移防护锁定）：
+
+```bash
+bash ops/smoke-ai-autonomy-s2.sh --expected-head <40-hex-commit>
+bash ops/smoke-ai-autonomy-s3.sh --expected-head <40-hex-commit>
+```
+
 **全新安装的 setup 前状态必须专项验证**：未走 `/setup` 向导前，autonomy-worker 应
 保持 `Up` 且日志为「等待配置就绪」，而不是 crash-loop。这是 v1.1.1 修复过的问题，
 回归时最容易漏。

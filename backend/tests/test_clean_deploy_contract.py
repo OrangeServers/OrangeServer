@@ -1042,3 +1042,33 @@ def test_in_place_bcrypt_writes_keep_password_version_in_sync():
             assert "password_version" in window, (
                 f"{anchor} rewrites the stored format without updating the version"
             )
+
+
+def _smoke_runner_steps(text: str) -> set[str]:
+    return set(re.findall(r"smoke-runner\s+([a-z0-9-]+)", text))
+
+
+@pytest.mark.parametrize("stage", ["s2", "s3"])
+def test_bash_smoke_driver_matches_powershell_scenarios(stage: str):
+    powershell = (REPO_ROOT / "ops" / f"smoke-ai-autonomy-{stage}.ps1").read_text(
+        encoding="utf-8"
+    )
+    bash = (REPO_ROOT / "ops" / f"smoke-ai-autonomy-{stage}.sh").read_text(
+        encoding="utf-8"
+    )
+    lib = (REPO_ROOT / "ops" / "smoke-ai-autonomy-lib.sh").read_text(encoding="utf-8")
+
+    ps_steps = _smoke_runner_steps(powershell)
+    sh_steps = _smoke_runner_steps(bash)
+    assert len(ps_steps) >= (20 if stage == "s2" else 1), (
+        f"scenario parse for {stage} looks broken: {sorted(ps_steps)}"
+    )
+    assert sh_steps == ps_steps, (
+        f"{stage} bash driver scenarios drifted from the PowerShell driver: "
+        f"missing={sorted(ps_steps - sh_steps)} extra={sorted(sh_steps - ps_steps)}"
+    )
+    assert "set -Eeuo pipefail" in bash
+    assert "source \"${SCRIPT_DIR}/smoke-ai-autonomy-lib.sh\"" in bash
+    assert "set -Eeuo pipefail" in lib
+    assert "smoke_validate_head" in bash and "smoke_validate_head" in lib
+    assert "smoke_extract_exact_head" in bash and "smoke_extract_exact_head" in lib
