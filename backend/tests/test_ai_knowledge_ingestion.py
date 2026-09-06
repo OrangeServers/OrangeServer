@@ -1,6 +1,8 @@
 """Document ingestion trust-boundary and real converter checks."""
 from io import BytesIO
+from pathlib import Path
 import subprocess
+import sys
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
@@ -72,6 +74,57 @@ def test_all_supported_formats_produce_reviewable_markdown(upload, kind, expecte
     preview = preview_document(upload)
     assert preview['detected_type'] == kind
     assert expected in preview['content']
+
+
+CONVERTER = (
+    Path(__file__).resolve().parents[1] / 'app' / 'ai' / 'knowledge_converter.py'
+)
+# Half the production bound. The bounded converter needs far less, and this is
+# where a many-core host used to start returning empty markdown.
+TIGHT_ADDRESS_SPACE_MIB = 256
+
+
+def _convert_bounded(data: bytes, extension: str) -> str:
+    import resource
+
+    def bound():
+        limit = TIGHT_ADDRESS_SPACE_MIB * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+        resource.setrlimit(resource.RLIMIT_CPU, (20, 20))
+
+    completed = subprocess.run(
+        [sys.executable, str(CONVERTER), extension, str(len(data) + 1)],
+        input=data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+        preexec_fn=bound,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        completed.stderr.decode('utf-8', errors='replace')[-400:]
+    )
+    return completed.stdout.decode('utf-8')
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='RLIMIT_AS is POSIX only')
+def test_conversion_fits_a_tight_address_space_bound_on_any_host():
+    """Native thread pools must not scale with the host CPU count."""
+    assert 'systemd' in _convert_bounded(_pdf('systemd unit failed'), '.pdf')
+    assert 'E42' in _convert_bounded(
+        _docx('journalctl error code E42'), '.docx',
+    )
+
+
+def test_converter_sandbox_guards_are_installed_before_markitdown_loads():
+    source = CONVERTER.read_text(encoding='utf-8')
+    markitdown_import = source.index('from markitdown import')
+    for guard in (
+        "os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')",
+        "os.environ.setdefault('OMP_NUM_THREADS', '1')",
+        "sys.modules.setdefault(\n    'magika',",
+    ):
+        assert source.index(guard) < markitdown_import, guard
 
 
 def test_signature_mime_macro_and_filename_boundaries():
