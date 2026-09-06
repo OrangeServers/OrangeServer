@@ -185,6 +185,8 @@ def assert_generated_unique(connection):
 
 
 def insert_run(connection, run_id, host_id, status):
+    # The drive path revalidates the owner's current role, so a Worker-driven
+    # Run must belong to a seeded account that actually has one.
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -193,7 +195,7 @@ def insert_run(connection, run_id, host_id, status):
                  system_user_alias, mode, status, revision, budget_json,
                  latest_event_seq, graph_version)
             VALUES
-                (%s, 'smoke', 'disposable S2 smoke', %s, 'smoke-host', 1,
+                (%s, 'admin', 'disposable S2 smoke', %s, 'smoke-host', 1,
                  'smoke-user', 'assisted', %s, 0, %s, 0, 'v1')
             """,
             (run_id, host_id, status, json.dumps({
@@ -2152,18 +2154,29 @@ def worker_and_duplicate():
             and row['lease_expires_at'] is None,
             'terminal Run retained a worker lease fence',
         )
-        event = fetch_one(
+        events = fetch_all(
             connection,
             """
-            SELECT COUNT(*) AS count
+            SELECT event_type, COUNT(*) AS count
               FROM t_ai_autonomous_event
              WHERE run_id = %s
-               AND event_type IN ('planner_unavailable', 'planner_failed')
+             GROUP BY event_type
+             ORDER BY event_type
             """,
             (run_id,),
         )
-        require(int(event['count']) == 1,
-                'duplicate delivery produced more than one terminal event')
+        observed = ', '.join(
+            '%s=%s' % (row['event_type'], row['count']) for row in events
+        ) or 'none'
+        planner_terminal = sum(
+            int(row['count']) for row in events
+            if row['event_type'] in ('planner_unavailable', 'planner_failed')
+        )
+        require(
+            planner_terminal == 1,
+            'duplicate delivery did not produce exactly one planner '
+            'terminal event; observed events: %s' % observed,
+        )
     finally:
         connection.close()
 
