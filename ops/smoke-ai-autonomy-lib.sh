@@ -15,6 +15,14 @@ smoke_fail() {
     exit 1
 }
 
+# git -C needs git >= 1.8.5; release test machines may ship older git, so run
+# git inside a subshell of the target directory instead.
+smoke_git() {
+    local dir="$1"
+    shift
+    (cd "$dir" && exec git "$@")
+}
+
 smoke_require_commands() {
     local cmd
     for cmd in "$@"; do
@@ -27,22 +35,22 @@ smoke_require_commands() {
 # a dirty developer checkout or consume staged/untracked input.
 smoke_validate_head() {
     local repo_root="$1" expected="$2" head porcelain
-    head="$(git -C "$repo_root" rev-parse HEAD)" \
+    head="$(smoke_git "$repo_root" rev-parse HEAD)" \
         || smoke_fail 'cannot resolve the reviewed Git HEAD'
     [[ "$head" =~ ^[0-9a-f]{40}$ ]] \
         || smoke_fail "cannot resolve the reviewed Git HEAD: $head"
     [ "$head" = "$expected" ] \
         || smoke_fail "HEAD $head does not match expected head $expected"
-    git -C "$repo_root" diff --quiet \
+    smoke_git "$repo_root" diff --quiet \
         || smoke_fail 'working tree has unstaged changes; exact-head smoke refused'
-    git -C "$repo_root" diff --cached --quiet \
+    smoke_git "$repo_root" diff --cached --quiet \
         || smoke_fail 'index has staged changes; exact-head smoke refused'
-    porcelain="$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all)" \
+    porcelain="$(smoke_git "$repo_root" status --porcelain --untracked-files=all)" \
         || smoke_fail 'cannot inspect repository cleanliness'
     [ -z "$porcelain" ] \
         || smoke_fail 'working tree contains untracked or modified files; exact-head smoke refused'
     local v104
-    v104="$(git -C "$repo_root" rev-list -n 1 v1.0.4)" \
+    v104="$(smoke_git "$repo_root" rev-list -n 1 v1.0.4)" \
         || smoke_fail 'cannot resolve the pinned v1.0.4 commit'
     [ "$v104" = "$SMOKE_PINNED_V104_COMMIT" ] \
         || smoke_fail "v1.0.4 must resolve to the pinned commit $SMOKE_PINNED_V104_COMMIT"
@@ -74,8 +82,8 @@ smoke_extract_exact_head() {
         case "$entry" in
             120000\ *) smoke_fail "exact-head Git tree contains a forbidden symlink: $entry" ;;
         esac
-    done < <(git -C "$repo_root" ls-tree -r "$head")
-    git -C "$repo_root" archive --format=tar --output="$archive" "$head"
+    done < <(smoke_git "$repo_root" ls-tree -r "$head")
+    smoke_git "$repo_root" archive --format=tar --output="$archive" "$head"
     [ -s "$archive" ] || smoke_fail 'cannot inspect the exact-head source archive'
     while IFS= read -r entry; do
         [ -n "$entry" ] || smoke_fail 'unsafe path in Git archive: (empty)'

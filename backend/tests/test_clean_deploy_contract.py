@@ -1072,3 +1072,27 @@ def test_bash_smoke_driver_matches_powershell_scenarios(stage: str):
     assert "set -Eeuo pipefail" in lib
     assert "smoke_validate_head" in bash and "smoke_validate_head" in lib
     assert "smoke_extract_exact_head" in bash and "smoke_extract_exact_head" in lib
+
+
+def test_s2_smoke_upgrade_list_covers_every_autonomy_migration():
+    smoke = (REPO_ROOT / "ops" / "smoke-ai-autonomy-s2.py").read_text(encoding="utf-8")
+    block = re.search(r"UPGRADE_SCRIPTS = \(([\s\S]*?)\)", smoke)
+    assert block, "smoke must declare UPGRADE_SCRIPTS"
+    applied = set(re.findall(r"(rev\d+_[A-Za-z0-9_]+\.sql)", block.group(1)))
+    assert applied, "UPGRADE_SCRIPTS parse looks broken"
+
+    autonomy_tables = (
+        "t_ai_autonomous_run",
+        "t_ai_autonomous_step",
+        "t_ai_autonomous_event",
+        "t_ai_autonomous_artifact",
+    )
+    touching = set()
+    for path in sorted((REPO_ROOT / "backend" / "mysqldir").glob("rev*.sql")):
+        body = path.read_text(encoding="utf-8")
+        if any(table in body for table in autonomy_tables):
+            touching.add(path.name)
+    assert touching <= applied, (
+        f"autonomy migrations missing from the smoke upgrade path: "
+        f"{sorted(touching - applied)}"
+    )

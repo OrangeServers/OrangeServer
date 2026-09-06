@@ -28,7 +28,7 @@ done
     || smoke_fail '--wait-timeout must be within 60-1800'
 EXPECTED_HEAD="$(printf '%s' "$EXPECTED_HEAD" | tr 'A-F' 'a-f')"
 
-smoke_require_commands git docker tar ssh-keygen openssl sha256sum python3
+smoke_require_commands git docker tar ssh-keygen openssl sha256sum
 
 HEAD="$(smoke_validate_head "$REPO_ROOT" "$EXPECTED_HEAD")"
 SUFFIX="$(smoke_new_suffix "$HEAD")"
@@ -101,7 +101,7 @@ mkdir -p "$FIXTURE_ROOT"
 
 # `git show` is the only upgrade fixture source so the SQL cannot drift from
 # the immutable v1.0.4 release tag.
-git -C "$REPO_ROOT" show 'v1.0.4:backend/mysqldir/orange.sql' \
+smoke_git "$REPO_ROOT" show 'v1.0.4:backend/mysqldir/orange.sql' \
     > "${FIXTURE_ROOT}/v1.0.4-orange.sql" \
     || smoke_fail 'cannot extract backend/mysqldir/orange.sql from v1.0.4'
 
@@ -168,9 +168,14 @@ LEASE_EVIDENCE="$(printf '%s\n' "$LEASE_OUTPUT" | grep -c '^S2_WORKER_LEASE_EVID
 [ "$LEASE_EVIDENCE" = '1' ] \
     || smoke_fail 'Worker lease probe did not return exactly one evidence record'
 LEASE_JSON="$(printf '%s\n' "$LEASE_OUTPUT" | grep '^S2_WORKER_LEASE_EVIDENCE=' | cut -d= -f2-)"
-LEASE_OWNER="$(printf '%s' "$LEASE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lease_owner"])')"
-LEASE_REVISION="$(printf '%s' "$LEASE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])')"
-LEASE_EXPIRES="$(printf '%s' "$LEASE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lease_expires_at"])')"
+# The probe emits this single-line JSON itself with fixed keys, so shell
+# extraction keeps the gate free of a python3 dependency.
+LEASE_OWNER="$(printf '%s' "$LEASE_JSON" \
+    | sed -n 's/.*"lease_owner"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+LEASE_REVISION="$(printf '%s' "$LEASE_JSON" \
+    | sed -n 's/.*"revision"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+LEASE_EXPIRES="$(printf '%s' "$LEASE_JSON" \
+    | sed -n 's/.*"lease_expires_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
 [ -n "$LEASE_OWNER" ] && [ "$LEASE_REVISION" -ge 1 ] && [ -n "$LEASE_EXPIRES" ] \
     || smoke_fail 'Worker lease evidence omitted its owner or expiry'
 docker "${COMPOSE[@]}" kill --signal SIGKILL autonomy-worker
