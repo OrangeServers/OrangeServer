@@ -130,9 +130,13 @@ SHA-256；运行期不再下载模型。国内链路再跑一次「从零安装�
    git switch main && git pull --ff-only origin main
    git tag -a vX.Y.Z -m "Release vX.Y.Z"
    git push origin vX.Y.Z
-   # 大陆线路读 Gitee 同名 tag，需同步到 Gitee 镜像
    gh release create vX.Y.Z --draft --title "OrangeServer vX.Y.Z" --generate-notes
    ```
+   大陆线路读 Gitee 同名 tag，需同步到 Gitee 镜像。**重打（force-update）已存在的
+   tag 时，Gitee 单向镜像不会自动覆盖**——需登录 Gitee 后台「管理 → 仓库镜像 →
+   立即同步」手动触发；若同步后该 tag 仍停在旧 commit，先删掉 Gitee 上的同名 tag
+   再同步一次。同步成功的标志：Gitee 上 `ops/bootstrap-compose.sh` 已包含本次
+   tag 的改动内容（而不是旧版）。
 3. **CI 推 GHCR**：`gh workflow run "Publish backend image" --ref main -f tag=vX.Y.Z`，
    watch 到成功，确认 GHCR 匿名拉取成功。
 4. **本地 WSL 推 TCR**（见 3.2），确认 TCR 匿名拉取成功。
@@ -186,6 +190,16 @@ curl -fsSL https://github.com/OrangeServers/OrangeServer/releases/download/vX.Y.
 - **合同测试与 CI 耦合**：`test_clean_deploy_contract.py` 断言 workflow 的守卫字符串，
   改 workflow 时同步改该测试，否则 CI 红。
 - **全新安装 setup 前状态**：worker 不能 crash-loop，要等待配置就绪。
+- **Gitee 镜像不同步 force-update 的 tag**：重打已存在的 tag 后，Gitee 单向镜像
+  不会自动覆盖（只有新建 tag 才会同步），必须手动触发同步、必要时先删 Gitee 上的
+  旧 tag。不同步会让官网国内命令拉到旧脚本。
+- **从零安装验证要覆盖两条线路**：国内（Gitee raw tag）与国际（Release 下载产物）
+  都要验。Release 的 bundle 产物是独立构建上传的，修复部署脚本后若只重打 tag 不
+  重建 bundle 产物，国际线路会继续用旧脚本。
+- **umask 077 打包导致 schema 0600**：CN 安装脚本在硬化 umask 下构建 bundle 会把
+  `orange.sql` 打成 0600，MySQL 容器降权到 uid 999 后读不了 → 空库但容器仍报
+  healthy。构建器和安装器都要显式 `chmod 0644` schema，且从零安装验证要核对库里
+  的表数量（不能只看容器 healthy）。
 
 ## 6. 隐私边界
 
