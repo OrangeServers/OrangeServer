@@ -660,23 +660,27 @@ def assert_redis_policy(client):
             'autonomy Redis must use noeviction')
 
 
+# The upgrade path emulates an operator applying the documented migrations in
+# order. Every migration that touches AUTONOMY_TABLES must appear here, or the
+# upgraded schema diverges from a fresh install; the contract test enforces
+# this list against backend/mysqldir so it cannot drift silently again.
+UPGRADE_SCRIPTS = (
+    'rev53_ai_autonomy_baseline.sql',
+    'rev54_ai_autonomy_lease.sql',
+    'rev55_ai_autonomy_custom_profile.sql',
+    'rev56_ai_autonomy_evidence.sql',
+    'rev57_ai_ops_trigger.sql',
+    'rev59_ai_autonomy_conclusion.sql',
+)
+
+
 def migrate_and_prime():
     fresh = mysql_connection(os.environ['OGS_MYSQL_HOST'])
     upgrade = mysql_connection(os.environ['OGS_S2_SMOKE_UPGRADE_MYSQL_HOST'])
     try:
         for _ in range(2):
-            execute_sql_script(
-                upgrade, '/smoke/sql/rev53_ai_autonomy_baseline.sql',
-            )
-            execute_sql_script(
-                upgrade, '/smoke/sql/rev54_ai_autonomy_lease.sql',
-            )
-            execute_sql_script(
-                upgrade, '/smoke/sql/rev55_ai_autonomy_custom_profile.sql',
-            )
-            execute_sql_script(
-                upgrade, '/smoke/sql/rev56_ai_autonomy_evidence.sql',
-            )
+            for script in UPGRADE_SCRIPTS:
+                execute_sql_script(upgrade, '/smoke/sql/%s' % script)
         require(schema_snapshot(fresh) == schema_snapshot(upgrade),
                 'fresh and v1.0.4 upgraded autonomy schemas differ')
         for connection, prefix, host_id in (
