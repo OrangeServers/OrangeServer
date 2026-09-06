@@ -509,6 +509,7 @@ class t_ai_monitoring_host_mapping(db.Model, TimestampMixin):
     external_ref_json = db.Column(db.Text, nullable=False)
     confirmed_by = db.Column(db.String(24), nullable=False)
 
+
 class t_ai_diagnostic_run(db.Model, TimestampMixin):
     """Durable authoritative snapshot for a controlled diagnostic run."""
 

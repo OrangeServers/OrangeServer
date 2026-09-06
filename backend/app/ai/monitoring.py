@@ -628,9 +628,11 @@ class MonitoringAdapter:
         timeout = float(kwargs.get("timeout", QUERY_TIMEOUT_SECONDS))
         if parsed.scheme == "https":
             verify = bool(kwargs.get("verify", True))
+            # verify_tls is an admin-only per-source opt-out, default on.
             context = (
                 ssl.create_default_context()
-                if verify else ssl._create_unverified_context()
+                if verify
+                else ssl._create_unverified_context()  # nosec B323
             )
             connection = _PinnedHTTPSConnection(
                 str(parsed.hostname), address, port, timeout, context,
