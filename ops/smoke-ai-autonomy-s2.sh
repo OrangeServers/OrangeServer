@@ -101,7 +101,7 @@ mkdir -p "$FIXTURE_ROOT"
 
 # `git show` is the only upgrade fixture source so the SQL cannot drift from
 # the immutable v1.0.4 release tag.
-git -C "$REPO_ROOT" show 'v1.0.4:backend/mysqldir/orange.sql' \
+smoke_git "$REPO_ROOT" show 'v1.0.4:backend/mysqldir/orange.sql' \
     > "${FIXTURE_ROOT}/v1.0.4-orange.sql" \
     || smoke_fail 'cannot extract backend/mysqldir/orange.sql from v1.0.4'
 
