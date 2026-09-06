@@ -46,9 +46,13 @@ make_minimal_bundle() {
     local bundle_root="${stage}/orangeserver"
     local archive="${TEST_ROOT}/orangeserver-deploy-${version}.tar.gz"
 
-    mkdir -p "${bundle_root}/backend" "${bundle_root}/ops"
+    mkdir -p "${bundle_root}/backend/mysqldir" "${bundle_root}/ops"
     : > "${bundle_root}/.env.example"
     : > "${bundle_root}/backend/.env.example"
+    # Archived the way a hardened build umask leaves it, so the installer has to
+    # re-open the schema for the MySQL container's uid 999.
+    : > "${bundle_root}/backend/mysqldir/orange.sql"
+    chmod 0600 "${bundle_root}/backend/mysqldir/orange.sql"
     cat > "${bundle_root}/ops/preflight-compose.sh" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -128,6 +132,14 @@ run_canonical "canonical-custom" \
 run_canonical "canonical-registry-port" \
     "registry.example.test:5000/orangeserver/backend" \
     --backend-image "registry.example.test:5000/orangeserver/backend"
+
+# MySQL runs /docker-entrypoint-initdb.d/orange.sql as uid 999 and skips an
+# unreadable schema without failing the container, so the installed copy has to
+# be world-readable even though the bundle archived it at 0600.
+installed_schema="${TEST_ROOT}/canonical-default/backend/mysqldir/orange.sql"
+[ "$(stat -c '%a' "$installed_schema")" = "644" ] \
+    || fail "installed schema is not world-readable: $(stat -c '%a' "$installed_schema")"
+
 custom_record="${TEST_ROOT}/canonical-images.env"
 TEST_RECORD="$custom_record" PATH="${FAKE_BIN}:${PATH}" "$CANONICAL_INSTALLER" \
     --version "$VERSION" \
