@@ -171,6 +171,10 @@ tar -C "$WORK_DIR" -xzf "${WORK_DIR}/${archive_name}"
 bundle_root="${WORK_DIR}/orangeserver"
 cd "$bundle_root"
 
+# MySQL reads /docker-entrypoint-initdb.d/orange.sql as uid 999, so the schema
+# must stay readable even if the bundle was built under a hardened umask.
+chmod 0644 backend/mysqldir/*.sql
+
 cp .env.example .env
 cp backend/.env.example backend/.env
 chmod 600 .env backend/.env

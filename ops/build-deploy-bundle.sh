@@ -85,6 +85,11 @@ cp "${ROOT}/ops/bootstrap-compose.sh" "${bundle_root}/ops/"
 cp "${ROOT}/ops/bootstrap-compose-cn.sh" "${bundle_root}/ops/"
 cp "${ROOT}/ops/healthcheck.sh" "${bundle_root}/ops/"
 
+# The MySQL image drops to uid 999 before running /docker-entrypoint-initdb.d, so
+# the mounted schema must not inherit a hardened umask (bootstrap-compose-cn.sh
+# builds this bundle with umask 077).
+chmod 0644 "${bundle_root}/backend/mysqldir/"*.sql
+
 mkdir -p "$OUTPUT_DIR"
 tar -C "$STAGE" -czf "${OUTPUT_DIR}/${ARCHIVE}" orangeserver
 (
