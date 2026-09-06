@@ -18,6 +18,8 @@ REV47-M13: 模块 docstring (REV46 P3 L13 / REV47-M13)
      - PWD_VERSION_LEGACY_BASE64 = 1
      - PWD_VERSION_BCRYPT_1 = 2 (当前默认)
      - PWD_VERSION_CURRENT = PWD_VERSION_BCRYPT_1
+  5) 内置占位账号的不可登录口令:
+     - UNUSABLE_PASSWORD_HASH (随机明文的 bcrypt 摘要, 明文不可恢复)
 
 设计原则 (REV47-M12 / M14):
   - 全函数 type hints (M12): 入参 / 出参都标注, IDE / mypy 可校验
@@ -136,6 +138,27 @@ PWD_VERSION_BCRYPT_1 = 2       # bcrypt, rounds ≥ 10
 # PWD_VERSION_SCRYPT_1 = 3
 # PWD_VERSION_ARGON2_1 = 4
 PWD_VERSION_CURRENT = PWD_VERSION_BCRYPT_1
+
+
+# =============================================================================
+# 内置占位账号的不可登录口令
+# =============================================================================
+# 用于 system 这类"只为满足外键/默认值而存在, 永不交互式登录"的账号
+# (t_cron.job_owner FK -> t_acc_user.name ON DELETE SET DEFAULT)。
+#
+# 为什么不能用 hash_pwd('!disabled-xxx!') 这类可读占位串:
+#   占位串本身是入仓的公开明文, 任何人都能拿它登录 —— 等于把"禁用"变成了
+#   "改用一个人人皆知的口令"。同理 base64 占位串会被 verify_pwd 的兼容路径
+#   直接匹配成功。
+# 这里存的是一次性随机明文的 bcrypt 摘要, 明文从未落盘且不可恢复, 因此任何输入
+# 都无法通过 verify_pwd; 同时保留完整 bcrypt 开销, 不会因响应耗时差异暴露该账号
+# 与真实账号的区别 (对齐 P0-5 的防枚举设计)。
+#
+# 该字面量同时被 backend/mysqldir/orange.sql 与 rev47_h7_cron_owner_fk.sql 播种,
+# 三处必须一致, 由 tests/test_clean_deploy_contract.py 锁定。
+UNUSABLE_PASSWORD_HASH = (
+    '$2b$12$GrcI53JVdPLfQ/POoL9QBeuSC9lr2DgQ6MWaBHbGZWYSYRrcNiQ5K'
+)
 
 
 def base64_auto(base_type: str = 'de', string: Optional[str] = None) -> Optional[str]:

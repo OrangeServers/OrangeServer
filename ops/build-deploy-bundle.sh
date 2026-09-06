@@ -56,6 +56,7 @@ required=(
     "ops/bootstrap-compose.sh"
     "ops/bootstrap-compose-cn.sh"
     "ops/preflight-compose.sh"
+    "ops/healthcheck.sh"
 )
 for path in "${required[@]}"; do
     if [ ! -e "${ROOT}/${path}" ]; then
@@ -82,6 +83,7 @@ cp "${ROOT}/deploy/docker-compose.host.yml" "${bundle_root}/deploy/"
 cp "${ROOT}/ops/preflight-compose.sh" "${bundle_root}/ops/"
 cp "${ROOT}/ops/bootstrap-compose.sh" "${bundle_root}/ops/"
 cp "${ROOT}/ops/bootstrap-compose-cn.sh" "${bundle_root}/ops/"
+cp "${ROOT}/ops/healthcheck.sh" "${bundle_root}/ops/"
 
 mkdir -p "$OUTPUT_DIR"
 tar -C "$STAGE" -czf "${OUTPUT_DIR}/${ARCHIVE}" orangeserver

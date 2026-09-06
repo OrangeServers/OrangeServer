@@ -187,6 +187,9 @@ mysql -h <mysql-host> -u <mysql-user> -p <database> \
 
 mysql -h <mysql-host> -u <mysql-user> -p <database> \
   < backend/mysqldir/rev61_ai_monitoring.sql
+
+mysql -h <mysql-host> -u <mysql-user> -p <database> \
+  < backend/mysqldir/rev62_system_account_unusable.sql
 ```
 
 顺序不可颠倒：rev49 修改 rev48 创建的 `t_ai_provider`，rev50 增加受控诊断的
@@ -200,6 +203,10 @@ zh-CN，存量行为不变），rev52 增加由管理界面维护的 SMTP 配置
 rev59 为 Run 增加结构化结论详情（M2），rev60 幂等回填存量管理员到现有
 “所有权限”规则，避免自定义管理员名仍沿用旧 `admin` 权限关系；
 rev61 增加只读监控数据源与显式资产身份映射表，监控 Token 只保存 Fernet 密文；
+rev62 把内置 `system` 账号的口令改写为不可登录哨兵：旧基线种子用的是 base64
+占位串，会被登录时的 base64 兼容路径解码并匹配成功，而首次部署向导只在该行缺失
+时才创建 `system`、apply 成功后也不再运行，因此存量实例无法靠向导自动修复，必须
+执行这条迁移；
 Redis 向量是可重建数据，不需要数据库 chunk 表。标准 bundled 栈会启动统一 Redis 8
 与 Worker，自治能力默认可用。
 embedding 模型、维度或向量索引布局变化时，知识库会自动显示“索引待更新”；管理员

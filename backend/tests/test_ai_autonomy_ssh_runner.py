@@ -434,6 +434,12 @@ def test_stop_command_rejects_unsafe_process_group_ids(pgid):
 
 def _local_linux_shell(script):
     if os.path.exists("/bin/sh"):
+        # The remote wrapper hard-requires the /bin/kill binary (procps); minimal
+        # userlands such as debian-slim ship /bin/sh without /bin/kill, where the
+        # handshake can never appear and the gate would fail for environmental
+        # reasons instead of product ones.
+        if not os.path.exists("/bin/kill"):
+            pytest.skip("the remote wrapper requires /bin/kill (procps) locally")
         return ["/bin/sh", "-c", script]
     wsl = shutil.which("wsl.exe")
     if wsl:

@@ -239,6 +239,29 @@ def test_monitoring_tool_preserves_safe_validation_error():
         raise AssertionError("safe monitoring validation error was hidden")
 
 
+def test_monitoring_tool_surfaces_sample_budget_as_validation_error():
+    from app.ai.monitoring import MonitoringError
+    from app.ai.tools import ToolValidationError
+
+    _, _, registry = _registry(
+        role="user",
+        allowed_ids=[2],
+        monitoring_executor=lambda _operation, _arguments: (_ for _ in ()).throw(
+            MonitoringError("Prometheus sample limit exceeded")
+        ),
+    )
+
+    try:
+        registry.execute("query_prometheus", {
+            "host_id": 2, "source_id": 1, "metric": "node_cpu_seconds_total",
+            "calculation": "rate",
+        })
+    except ToolValidationError as exc:
+        assert str(exc) == "Prometheus sample limit exceeded"
+    else:
+        raise AssertionError("sample-budget error was hidden behind a generic failure")
+
+
 def test_user_knowledge_tool_returns_bounded_references(monkeypatch):
     from app.ai import knowledge
 

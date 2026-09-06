@@ -82,9 +82,9 @@ lint: ## 代码静态检查 (前端为 vue-tsc 类型检查, package.json 无独
 	cd $(BACKEND) && python -m pyflakes app/ || true
 	cd $(FRONTEND) && npm run type-check
 
-health: ## 健康检查（curl /local/health）
-	@echo ">>> 健康检查 http://127.0.0.1:28000/local/health"
-	@bash "$(OPS)/healthcheck.sh"
+health: ## 健康检查（curl /local/health，Compose 部署读根 .env 的 OGS_HTTP_PORT）
+	@port="$$(sed -n 's/^OGS_HTTP_PORT=//p' "$(ROOT)/.env" 2>/dev/null | tail -1)"; \
+	OGS_PORT="$${port:-28000}" bash "$(OPS)/healthcheck.sh"
 
 docker-check: ## 部署预检 (只读, 不启动容器)
 	@bash "$(OPS)/preflight-compose.sh" bundled

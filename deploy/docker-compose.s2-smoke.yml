@@ -200,8 +200,8 @@ services:
       test:
         - CMD
         - python
-        - -c
-        - from app.ai.autonomy.readiness import checkpoint_readiness, worker_readiness; raise SystemExit(0 if checkpoint_readiness() and worker_readiness() else 1)
+        - -m
+        - app.ai.autonomy.healthcheck
       interval: 4s
       timeout: 6s
       retries: 45
