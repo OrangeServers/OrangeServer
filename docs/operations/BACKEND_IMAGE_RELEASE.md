@@ -35,6 +35,11 @@ npm run build
 cd ..
 ```
 
+门禁环境要求标准 Linux/WSL 用户态：`ops/test-bootstrap-scripts.sh` 依赖
+`hostname -I`（Windows/MSYS 没有该参数，会静默失败）；`test_ai_autonomy_ssh_runner.py`
+的进程组用例要在本地 shell 执行远端 wrapper，依赖 procps 的 `/bin/kill`
+（debian-slim 这类极简用户态没有，用例按能力 skip，不算通过也不算失败）。
+
 M1/M2 自治还要用隔离的 MySQL、Redis 8、Worker 和 SSH 测试资产做
 smoke；从零安装必须能直接使用自治工作台并看到就绪状态，不要把「容器已启动」当成
 自治闭环。入口：
