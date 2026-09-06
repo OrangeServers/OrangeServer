@@ -45,7 +45,7 @@ smoke_validate_head() {
         || smoke_fail 'working tree has unstaged changes; exact-head smoke refused'
     smoke_git "$repo_root" diff --cached --quiet \
         || smoke_fail 'index has staged changes; exact-head smoke refused'
-    porcelain="$(smoke_git "$repo_root" status --porcelain=v1 --untracked-files=all)" \
+    porcelain="$(smoke_git "$repo_root" status --porcelain --untracked-files=all)" \
         || smoke_fail 'cannot inspect repository cleanliness'
     [ -z "$porcelain" ] \
         || smoke_fail 'working tree contains untracked or modified files; exact-head smoke refused'
