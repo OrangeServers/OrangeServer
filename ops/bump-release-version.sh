@@ -29,10 +29,19 @@ if [[ "$old" == "$new" ]]; then
   exit 1
 fi
 
-# 跨平台定位 python：WSL/Linux 用 python3，Windows Git Bash 可能只有 python
-PYTHON="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+# 跨平台定位 python：WSL/Linux 用 python3，Windows Git Bash 可能只有 python。
+# 注意 Git Bash 下 `command -v python3` 会命中 Windows 商店的占位程序：它不
+# 打印任何东西就以非零码退出，配合 set -e 会让脚本静默失败、版本号原封不动。
+PYTHON=''
+for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+        && "$candidate" -c 'import sys' >/dev/null 2>&1; then
+        PYTHON="$(command -v "$candidate")"
+        break
+    fi
+done
 if [[ -z "$PYTHON" ]]; then
-  echo "错误: 未找到 python3/python，无法执行二进制替换" >&2
+  echo "错误: 未找到可用的 python3/python（Windows 商店占位程序不算），无法执行二进制替换" >&2
   exit 1
 fi
 

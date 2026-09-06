@@ -3,7 +3,7 @@
 Notable user-visible changes are recorded here. This project follows the
 principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.2.0] - 2026-09-06
 
 ### Added
 

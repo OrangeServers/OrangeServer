@@ -104,13 +104,13 @@ Redis 8 与 Worker，默认可用。M2 还提供 Alertmanager 告警入口、运
 ```bash
 set -o pipefail
 curl -fsSL \
-  https://github.com/OrangeServers/OrangeServer/releases/download/v1.1.1/bootstrap-compose.sh \
-  | sudo bash -s -- --version v1.1.1
+  https://github.com/OrangeServers/OrangeServer/releases/download/v1.2.0/bootstrap-compose.sh \
+  | sudo bash -s -- --version v1.2.0
 ```
 
 这个固定版本的薄引导器会下载并校验同版本部署包，生成 MySQL 与 Redis
 基础设施密码，并启动已发布的
-`ghcr.io/orangeservers/orangeserver-backend:v1.1.1` 镜像。
+`ghcr.io/orangeservers/orangeserver-backend:v1.2.0` 镜像。
 如果环境不允许把下载内容直接交给 shell，请先下载并审阅引导器再执行。
 
 **中国大陆线路（Gitee 固定 tag + 腾讯云 TCR + 公共镜像）：**
@@ -119,8 +119,8 @@ curl -fsSL \
 
 ```bash
 set -o pipefail
-curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.1.1/ops/bootstrap-compose-cn.sh \
-  | sudo bash -s -- --version v1.1.1
+curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.2.0/ops/bootstrap-compose-cn.sh \
+  | sudo bash -s -- --version v1.2.0
 ```
 
 大陆线路会从 DaoCloud 匿名公共镜像拉取 Redis、MySQL 官方镜像。该社区公共服务
