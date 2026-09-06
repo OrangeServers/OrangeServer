@@ -105,6 +105,13 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   example the Prometheus sample-budget limit) as a validation error instead of
   one opaque generic message, so the Agent can shorten the time window or widen
   the step and retry.
+- Knowledge base uploads of PDF and DOCX files no longer fail on hosts with
+  many CPU cores. The isolated converter bounds its own address space, while
+  OpenBLAS and ONNX Runtime sized their thread pools from the host CPU count,
+  so conversion aborted, or silently produced an empty preview, once the two
+  no longer fit. The converter now pins its native thread pools to a single
+  thread and never loads the content-type model, because the upload path
+  already validates the file signature and passes the extension itself.
 
 ## [1.1.1] - 2026-08-19
 

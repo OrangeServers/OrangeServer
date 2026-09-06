@@ -1,6 +1,32 @@
 """Isolated MarkItDown process entry point; no plugins or remote converters."""
 from io import BytesIO
+import os
 import sys
+import types
+
+# OpenBLAS sizes its per-thread arenas and ONNX Runtime its thread pool from
+# the host CPU count, so on large machines neither fits the address-space bound
+# applied below: conversion aborted, or silently produced empty markdown once
+# the ONNX shared object failed to map. One thread is ample for one bounded
+# document, and it keeps the footprint independent of the host.
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+
+
+class _ExtensionOnlySniffer:
+    """Stands in for magika, whose guess the pinned extension already decides."""
+
+    @staticmethod
+    def identify_stream(stream):
+        return types.SimpleNamespace(status='unavailable')
+
+
+# The caller validates the file signature and passes the extension explicitly,
+# so markitdown's content sniffing adds nothing here. Stubbing the module keeps
+# ONNX Runtime out of this process entirely.
+sys.modules.setdefault(
+    'magika', types.SimpleNamespace(Magika=_ExtensionOnlySniffer),
+)
 
 from markitdown import MarkItDown, StreamInfo
 
