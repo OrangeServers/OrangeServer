@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Static contract for the disposable, exact-checkout M1/S2 smoke entry."""
+import re
 from pathlib import Path
 
 
@@ -7,6 +8,15 @@ ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = ROOT / 'deploy' / 'docker-compose.s2-smoke.yml'
 WRAPPER = ROOT / 'ops' / 'smoke-ai-autonomy-s2.ps1'
 PROBE = ROOT / 'ops' / 'smoke-ai-autonomy-s2.py'
+BASELINE = ROOT / 'backend' / 'mysqldir' / 'orange.sql'
+AUTONOMY_REPOSITORY = (
+    ROOT / 'backend' / 'app' / 'ai' / 'autonomy' / 'repository.py'
+)
+RUN_INSERT_OWNER = re.compile(
+    r'INSERT INTO t_ai_autonomous_run.*?VALUES\s*\(\s*%s,\s*\'([^\']+)\'',
+    re.DOTALL,
+)
+SUPPORTED_ROLES = re.compile(r'AUTONOMY_ROLES = frozenset\(\{([^}]*)\}\)')
 
 
 def test_s2_smoke_compose_is_isolated_and_builds_current_backend():
@@ -469,3 +479,58 @@ def test_s2_ssh_fixture_helpers_insert_each_action_once():
     assert run_helper.count('insert_ssh_action_step(') == 1
     assert step_helper.count('INSERT INTO t_ai_autonomous_step') == 1
     assert step_helper.count('action = StructuredAction(') == 1
+
+
+def _sql_fields(raw):
+    fields, current, quoted = [], [], False
+    for char in raw:
+        if char == "'":
+            quoted = not quoted
+        elif char == ',' and not quoted:
+            fields.append(''.join(current).strip().strip("'"))
+            current = []
+            continue
+        current.append(char)
+    fields.append(''.join(current).strip().strip("'"))
+    return fields
+
+
+def _seeded_accounts(baseline):
+    accounts = {}
+    for line in baseline.splitlines():
+        if not line.startswith('INSERT INTO `t_acc_user`'):
+            continue
+        columns = [
+            column.strip('` ')
+            for column in line.split('(', 1)[1].split(')', 1)[0].split(',')
+        ]
+        values = line.split(' VALUES ', 1)[1].strip()
+        row = dict(zip(columns, _sql_fields(values[1:values.rindex(')')])))
+        if row.get('is_deleted', '0') != '0':
+            continue
+        accounts[row['name']] = row['usrole'].lower()
+    return accounts
+
+
+def test_s2_smoke_run_owners_survive_the_owner_role_gate():
+    """The drive path revalidates the owner role before any planning."""
+    owners = set(RUN_INSERT_OWNER.findall(PROBE.read_text(encoding='utf-8')))
+    assert owners, 'the probe stopped inserting autonomous Runs'
+
+    source = AUTONOMY_REPOSITORY.read_text(encoding='utf-8')
+    declaration = SUPPORTED_ROLES.search(source)
+    assert declaration is not None, 'AUTONOMY_ROLES is no longer a frozenset'
+    supported = set(re.findall(r"'([a-z_]+)'", declaration.group(1)))
+    assert supported, 'AUTONOMY_ROLES lost its supported roles'
+
+    accounts = _seeded_accounts(BASELINE.read_text(encoding='utf-8'))
+    for owner in sorted(owners):
+        assert owner in accounts, (
+            'the probe inserts Runs owned by %r, which the baseline schema '
+            'does not seed; such a Run fails closed at authorization_revoked '
+            'before reaching the boundary the phase asserts' % owner
+        )
+        assert accounts[owner] in supported, (
+            'the probe owner %r holds role %r, which the autonomy role gate '
+            'rejects' % (owner, accounts[owner])
+        )
