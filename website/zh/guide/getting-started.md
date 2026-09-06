@@ -6,12 +6,12 @@
 ```bash
 set -o pipefail
 curl -fsSL \
-  https://github.com/OrangeServers/OrangeServer/releases/download/v1.1.1/bootstrap-compose.sh \
-  | sudo bash -s -- --version v1.1.1
+  https://github.com/OrangeServers/OrangeServer/releases/download/v1.2.0/bootstrap-compose.sh \
+  | sudo bash -s -- --version v1.2.0
 ```
 
 引导器会下载并校验同版本部署包，生成 MySQL 与 Redis 基础设施密码，并启动已发布的
-`ghcr.io/orangeservers/orangeserver-backend:v1.1.1` 镜像。若环境不允许将下载内容
+`ghcr.io/orangeservers/orangeserver-backend:v1.2.0` 镜像。若环境不允许将下载内容
 直接交给 shell，请先下载并审阅引导器。源码部署和复用宿主机服务的部署方式见
 [部署方式](/zh/guide/deployment)。
 
@@ -22,8 +22,8 @@ curl -fsSL \
 
 ```bash
 set -o pipefail
-curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.1.1/ops/bootstrap-compose-cn.sh \
-  | sudo bash -s -- --version v1.1.1
+curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.2.0/ops/bootstrap-compose-cn.sh \
+  | sudo bash -s -- --version v1.2.0
 ```
 
 DaoCloud 是不承诺可用性 SLA 的社区公共服务；需要时可通过

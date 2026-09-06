@@ -111,13 +111,13 @@ through `sudo`).
 ```bash
 set -o pipefail
 curl -fsSL \
-  https://github.com/OrangeServers/OrangeServer/releases/download/v1.1.1/bootstrap-compose.sh \
-  | sudo bash -s -- --version v1.1.1
+  https://github.com/OrangeServers/OrangeServer/releases/download/v1.2.0/bootstrap-compose.sh \
+  | sudo bash -s -- --version v1.2.0
 ```
 
 This version-pinned launcher downloads and verifies the matching deployment
 bundle, generates the MySQL and Redis infrastructure passwords, and starts the
-published `ghcr.io/orangeservers/orangeserver-backend:v1.1.1` image. Review the
+published `ghcr.io/orangeservers/orangeserver-backend:v1.2.0` image. Review the
 launcher first if your environment does not permit piping downloaded scripts to
 a shell.
 
@@ -127,8 +127,8 @@ The mainland route is available from v1.0.3 and also requires Git.
 
 ```bash
 set -o pipefail
-curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.1.1/ops/bootstrap-compose-cn.sh \
-  | sudo bash -s -- --version v1.1.1
+curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.2.0/ops/bootstrap-compose-cn.sh \
+  | sudo bash -s -- --version v1.2.0
 ```
 
 The mainland route uses digest-pinned DaoCloud public mirrors for the official
