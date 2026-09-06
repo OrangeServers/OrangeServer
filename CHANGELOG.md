@@ -112,6 +112,15 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   no longer fit. The converter now pins its native thread pools to a single
   thread and never loads the content-type model, because the upload path
   already validates the file signature and passes the extension itself.
+- A from-zero mainland install no longer starts with an empty schema while
+  every container reports healthy. The CN entry point builds the release
+  bundle from a fresh clone under `umask 077`, which archived
+  `backend/mysqldir/orange.sql` as `0600 root:root`; the MySQL image drops
+  to uid 999 before running `/docker-entrypoint-initdb.d`, so the schema
+  import died with "Permission denied" and the containers still reported
+  healthy. The bundle builder and the installer now both stage the schema
+  at `0644`, and the contract test runs the builder under `umask 077` to
+  assert the archived modes.
 
 ## [1.1.1] - 2026-08-19
 
