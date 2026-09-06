@@ -235,7 +235,7 @@ make docker-health
 # 只有跳过向导并保留基线种子数据时才存在 admin/admin，登录后必须立即改密。
 
 # 进容器排查
-docker compose --env-file .env -f deploy/docker-compose.yml exec backend bash
+docker compose --env-file .env -f deploy/docker-compose.yml exec app bash
 ```
 
 ### 两种模式

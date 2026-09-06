@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
-from app.ai.monitoring import MonitoringValidationError
+from app.ai.monitoring import MonitoringError, MonitoringValidationError
 from app.ai.storage import AgentStore
 
 
@@ -434,7 +434,7 @@ class ToolRegistry:
             result = self.monitoring_executor(name, normalized)
         except ToolError:
             raise
-        except MonitoringValidationError as exc:
+        except (MonitoringError, MonitoringValidationError) as exc:
             raise ToolValidationError(str(exc)) from exc
         except Exception as exc:
             raise ToolError("monitoring analysis failed") from exc

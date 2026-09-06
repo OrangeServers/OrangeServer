@@ -72,6 +72,39 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   instead of calling an administrator-only credential-management endpoint.
   Conversation profile changes and Agent turns share the existing run lock so
   neither can overwrite the other's Redis conversation state.
+- The built-in `system` account no longer ships a password that can sign in.
+  The baseline seed and its migration stored a placeholder that the login
+  compatibility path decoded and matched, and the first-boot wizard only
+  creates that row when it is absent and never runs again after a successful
+  apply, so existing installations keep the old value until
+  `rev62_system_account_unusable.sql` runs. Placeholder accounts now store a
+  bcrypt digest whose plaintext was never recorded, and the account keeps its
+  full verification cost so it stays indistinguishable from a real one.
+- Signing in now records the bcrypt password version whenever it transparently
+  upgrades a legacy stored password, as do administrator password resets,
+  self-service resets, and user edits that set a password. The
+  `password_version` audit count previously kept reporting upgraded accounts
+  as legacy base64 forever.
+- The release bundle now includes `ops/healthcheck.sh`, which the packaged
+  Makefile's `health` target requires, and `make health` probes the port from
+  `OGS_HTTP_PORT` instead of advertising the fixed development port 28000.
+  The probe also accepts the documented first-boot `status: setup` response as
+  healthy; it previously required `status: ok`, so `make health` reported a
+  healthy, not-yet-configured installation as failed.
+  DEPLOY.md points container troubleshooting at the `app` service now that
+  the bundled topology has no `backend` service.
+- A fresh installation no longer reports the Autonomy Worker as unhealthy while
+  the first-boot wizard is still pending. The container health probe imported
+  the readiness module, whose module-level configuration import fail-fasts on
+  the secret keys the wizard has not generated yet, so Docker marked a
+  correctly waiting worker unhealthy once its start period elapsed and
+  `docker compose up --wait` could not succeed. The probe now applies the same
+  three-state setup judgement as the worker entrypoint, and still gates on real
+  checkpoint and worker readiness once the deployment is configured.
+- Read-only monitoring tools now surface their actionable failure reason (for
+  example the Prometheus sample-budget limit) as a validation error instead of
+  one opaque generic message, so the Agent can shorten the time window or widen
+  the step and retry.
 
 ## [1.1.1] - 2026-08-19
 
