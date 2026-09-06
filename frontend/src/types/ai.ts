@@ -43,12 +43,19 @@ export interface AiChatMessage {
 
 export type AiToolEventStatus = 'running' | 'success' | 'error'
 
+export type AiConversationAutonomyMode = 'ask' | 'ai_review' | 'auto' | 'custom'
+
+export interface AiConversationAutonomyProfile {
+  action_categories: string[]
+}
+
 export interface AiToolEvent {
   id: string
   tool: string
   label: string
   status: AiToolEventStatus
   summary?: string
+  result_scope?: AiResultScope
   created_at?: string
 }
 
@@ -59,6 +66,7 @@ export interface AiAutonomyDraft {
   goal?: string
   status?: string
   mode?: string
+  action_categories?: string[]
   host_alias?: string
   created_at?: string
 }
@@ -69,38 +77,10 @@ export interface AiConversation {
   provider_code?: AiProviderCode
   model?: string
   context_mode?: AiContextMode
+  autonomy_mode?: AiConversationAutonomyMode
+  autonomy_profile?: AiConversationAutonomyProfile | null
   updated_at?: string
   created_at?: string
-  has_pending_action?: boolean
-}
-
-export interface AiApproval {
-  action_id: string
-  conversation_id?: string
-  command: string
-  sys_user: string
-  target_count: number
-  reason?: string
-  risk_level?: string
-  expires_at?: string
-  created_at?: string
-  updated_at?: string
-  status: 'pending' | 'running' | 'completed' | 'approved' | 'cancelled' | 'failed' | 'rejected' | 'expired'
-  outcome?: 'success' | 'partial' | 'failed'
-  result_summary?: {
-    total?: number
-    success?: number
-    failed?: number
-    status?: string
-    outcome?: 'success' | 'partial' | 'failed'
-  }
-}
-
-export interface AiExecutionItem {
-  host: string
-  status: 'running' | 'success' | 'failed'
-  output?: string
-  error?: string
 }
 
 export interface AiResultScope {
@@ -113,20 +93,11 @@ export interface AiResultScope {
   sample?: Array<Record<string, unknown>>
 }
 
-export interface AiActionHistory {
-  action: AiApproval
-  execution_items: AiExecutionItem[]
-}
-
 export interface AiConversationDetail extends AiConversation {
   messages?: AiChatMessage[]
   tool_events?: AiToolEvent[]
   autonomy_drafts?: AiAutonomyDraft[]
-  pending_action?: AiApproval | null
-  latest_action?: AiApproval | null
-  action_history?: AiActionHistory[]
   result_scope?: AiResultScope | null
-  execution_items?: AiExecutionItem[]
   diagnostics?: AiDiagnosticRun[]
   active_diagnostic?: AiDiagnosticRun | null
   latest_diagnostic?: AiDiagnosticRun | null
@@ -151,6 +122,74 @@ export interface AiProviderObservability {
     effective_input_tokens?: number
     estimated_input_tokens?: number
   }
+}
+
+/** 管理员配置的只读监控数据源。令牌只返回是否已配置，不返回密文。 */
+export type AiMonitoringSourceType = 'prometheus' | 'grafana' | 'loki' | 'zabbix'
+export type AiMonitoringDatasourceType = 'prometheus' | 'loki'
+
+export interface AiMonitoringLabelsRef {
+  labels: Record<string, string>
+}
+
+/** Grafana 复用已保存 Dashboard Panel 的 Prometheus/Loki 查询。 */
+export interface AiMonitoringGrafanaRef {
+  datasource_uid: string
+  datasource_type: AiMonitoringDatasourceType
+  dashboard_uid: string
+  labels: Record<string, string>
+}
+
+export interface AiMonitoringZabbixRef {
+  hostid: string
+}
+
+export type AiMonitoringExternalRef =
+  | AiMonitoringLabelsRef
+  | AiMonitoringGrafanaRef
+  | AiMonitoringZabbixRef
+
+export interface AiMonitoringSource {
+  id: number
+  name: string
+  source_type: AiMonitoringSourceType
+  base_url: string
+  token_configured: boolean
+  verify_tls: boolean
+  enabled: boolean
+  created_by?: string
+}
+
+export interface AiMonitoringSourcePayload {
+  name: string
+  source_type: AiMonitoringSourceType
+  base_url: string
+  token?: string
+  verify_tls: boolean
+  enabled: boolean
+}
+
+export type AiMonitoringSourceUpdatePayload = Omit<AiMonitoringSourcePayload, 'source_type'>
+
+export interface AiMonitoringMapping {
+  id: number
+  source_id: number
+  host_id: number
+  external_ref: AiMonitoringExternalRef
+  confirmed_by?: string
+}
+
+/** 后端候选发现结果；候选必须由管理员确认后才成为 mapping。 */
+export interface AiMonitoringCandidate {
+  label?: string
+  match?: string
+  source_name?: string
+  datasource_uid?: string
+  datasource_name?: string
+  datasource_type?: AiMonitoringDatasourceType
+  identity_label?: string
+  identity_value?: string
+  external_ref: AiMonitoringExternalRef
 }
 
 export type AiDiagnosticStatus =

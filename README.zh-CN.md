@@ -56,6 +56,7 @@ OrangeServer 把日常 Linux 运维工作集中在同一个权限边界内：
 | 日志审计 | 查询登录、命令和平台操作记录 |
 | AI 运维 | 查询已授权平台数据，运行固定只读诊断，生成需人工确认的批量操作 |
 | M1 受控自治 | 按计划调查、执行、验证并产出可引用结论 |
+| M2 告警与知识闭环 | 告警触发调查，受控关联指标，并检索审核 Runbook 与已验证任务 |
 | 双语界面 | 全站中英双语，设置 → 外观与语言即时切换，持久化到服务端 |
 
 ## AI 运维不是"把 Shell 交给模型"
@@ -89,8 +90,9 @@ Run 的证据 ID。需要改变主机状态的修复仍必须生成独立审批�
 M1/S3 还提供独立的自治任务工作台（`/ai-runs`）：管理员可以把调查、受控变更、
 服务操作、独立验证和结论组织成一个可恢复 Run。它不是把 Shell 交给模型：目标资产、
 系统用户、权限模式、预算和动作白名单由服务端固定，写动作仍按 `ask`/Guardian/人工
-  审批处理，`auto` 仅允许管理员标记为 `lab` 的资产。标准 bundled 安装会启动专用
-  Redis 与 Worker，默认可用。详见
+审批处理，`auto` 仅允许管理员标记为 `lab` 的资产。标准 bundled 安装会启动统一
+Redis 8 与 Worker，默认可用。M2 还提供 Alertmanager 告警入口、运维态势首页和
+管理员审核的向量知识库；知识引用只辅助调查，不能授权动作或替代独立验证。详见
   [AI 运维使用指南](docs/ai/USER_GUIDE.md)。
 
 ## 快速开始
@@ -121,9 +123,9 @@ curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.1.1/ops/bootstrap
   | sudo bash -s -- --version v1.1.1
 ```
 
-大陆线路会从 DaoCloud 匿名公共镜像拉取固定 digest 的 Nginx、Redis、MySQL 官方
-镜像。该社区公共服务不承诺可用性 SLA；可用 `OGS_CN_NGINX_IMAGE`、
-`OGS_CN_REDIS_IMAGE`、`OGS_CN_MYSQL_IMAGE` 分别覆盖完整镜像引用。
+大陆线路会从 DaoCloud 匿名公共镜像拉取 Redis、MySQL 官方镜像。该社区公共服务
+不承诺可用性 SLA；可用 `OGS_CN_REDIS_IMAGE`、`OGS_CN_MYSQL_IMAGE` 分别覆盖完整
+镜像引用。
 
 浏览器打开 `http://<服务器地址>:8080`。应用未配置时会进入 `/setup`，请使用
 向导创建的管理员登录；仅跳过向导并保留基线种子时才存在 `admin/admin`，必须

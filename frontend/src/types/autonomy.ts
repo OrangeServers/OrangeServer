@@ -63,6 +63,17 @@ export interface AutonomyCustomProfile {
   action_categories: string[]
 }
 
+export interface AutonomyConclusion {
+  confirmed_facts: string[]
+  impact_scope: string
+  root_cause_hypothesis: string
+  confidence: 'low' | 'medium' | 'high'
+  unknowns: string[]
+  recommended_actions: string[]
+  final_status: AutonomyRunOutcome
+  evidence_ids: string[]
+}
+
 /** Run 主体（repository._run_to_dict） */
 export interface AutonomyRun {
   id: string
@@ -76,6 +87,13 @@ export interface AutonomyRun {
   custom_profile: AutonomyCustomProfile | null
   status: AutonomyRunStatus
   outcome: AutonomyRunOutcome | null
+  conclusion: AutonomyConclusion | null
+  trigger_type: 'manual' | 'chat' | 'alertmanager' | string
+  trigger_ref: string | null
+  trigger_summary: string
+  /** Latest server-recorded Alertmanager event; only present on alert Runs. */
+  alert_state?: 'firing' | 'resolved' | null
+  alert_updated_at?: string | null
   revision: number
   graph_version: string
   budget: AutonomyBudget
@@ -97,11 +115,15 @@ export interface AutonomyStep {
   action_digest: string
   note: string
   created_at: string | null
+  /** 服务端从已签名计划快照生成的逐项审批摘要。 */
+  plan_actions?: string[]
 }
 
 /** Run 权威快照 = Run + 有序步骤 + 服务端允许的操作集合 */
 export interface AutonomySnapshot extends AutonomyRun {
   steps: AutonomyStep[]
+  /** Bounded terminal-event note when a Run failed before creating a Step. */
+  failure_reason?: string
   /** 决策词汇只可能来自这里（当前为 approve/reject）；空数组 = 无待决策 */
   allowed_operations: string[]
 }
@@ -151,6 +173,9 @@ export interface AutonomyReadiness {
   checkpoint_ready: boolean
   worker_ready: boolean
   ready: boolean
+  worker_pool: string
+  worker_concurrency_configured: number | null
+  worker_concurrency_observed: number | null
   reason:
     | 'ready'
     | 'feature_disabled'
@@ -158,6 +183,87 @@ export interface AutonomyReadiness {
     | 'checkpoint_unavailable'
     | 'worker_unavailable'
     | string
+}
+
+/** GET /ai/ops/status：当前用户可见的 AIOps 聚合，只引用现有 Run。 */
+export interface AIOpsStatus extends AutonomyReadiness {
+  web_worker_class: string
+  autonomy_pool: string
+  autonomy_concurrency: number
+  active_runs: number
+  queued_runs: number
+  knowledge_index_state: string
+  alertmanager_configured: boolean
+  prometheus_configured: boolean
+  pending_alerts: AutonomyRun[]
+  running_runs: AutonomyRun[]
+  recent_conclusions: AutonomyRun[]
+}
+
+export type KnowledgeIndexState = 'empty' | 'ready' | 'stale' | 'rebuilding' | 'error'
+
+export interface KnowledgeEmbeddingConfig {
+  provider_type: 'local' | 'openai_compatible'
+  base_url: string
+  model: string
+  dimension: number
+  api_key_configured: boolean
+  model_fingerprint: string
+  indexed_fingerprint: string | null
+  index_state: KnowledgeIndexState
+  indexed_chunks: number
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface KnowledgeDocument {
+  id: string
+  title: string
+  source_type: 'runbook' | 'verified_run'
+  source_ref: string | null
+  scope: string
+  content?: string
+  content_sha256: string
+  version: number
+  approved: boolean
+  indexed: boolean
+  chunk_count: number
+  created_by: string
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface KnowledgeDocumentPayload {
+  title: string
+  scope: string
+  content: string
+}
+
+export interface KnowledgeDocumentPreview {
+  title: string
+  content: string
+  detected_type: 'markdown' | 'text' | 'pdf' | 'docx'
+  warnings: string[]
+}
+
+export interface KnowledgeSearchResult {
+  citation_id: string
+  document_id: string
+  version: number
+  title: string
+  source_type: KnowledgeDocument['source_type']
+  source_ref: string | null
+  heading: string
+  scope: string
+  excerpt: string
+  score: number | null
+  match_reason: string
+}
+
+export interface KnowledgeSearchResponse {
+  results: KnowledgeSearchResult[]
+  count: number
+  index_state: KnowledgeIndexState
 }
 
 /** 创建草稿请求体 */

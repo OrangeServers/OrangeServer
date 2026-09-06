@@ -96,6 +96,7 @@ class TestAccUserUpdateIntegration:
             up_user_row = MagicMock()
             up_user_row.id = 1
             up_user_row.name = 'alice'
+            up_user_row.usrole = 'admin'
 
             conflict_row = MagicMock()
             conflict_row.id = 2
@@ -142,6 +143,7 @@ class TestAccUserUpdateIntegration:
             up_user_row = MagicMock()
             up_user_row.id = 1
             up_user_row.name = 'alice'
+            up_user_row.usrole = 'admin'
 
             def filter_by_side_effect(**kwargs):
                 f = MagicMock()
@@ -154,16 +156,27 @@ class TestAccUserUpdateIntegration:
             mock_query = MagicMock(filter_by=filter_by_side_effect)
             monkeypatch.setattr(_user_mod.t_acc_user, 'query', mock_query)
             monkeypatch.setattr(_user_mod, 'AuthAutoUpdate', MagicMock())
+            session = MagicMock()
+            permission_sync = MagicMock()
+            permission_sync.side_effect = (
+                lambda *args, **kwargs: session.commit.assert_not_called()
+            )
+            monkeypatch.setattr(
+                _user_mod, 'sync_user_permissions', permission_sync,
+            )
             monkeypatch.setattr(_user_mod, 'hash_pwd', lambda x: 'hashed')
             mock_ords = MagicMock()
             monkeypatch.setattr(_user_mod, 'get_current_user', lambda: (mock_ords, 'cz_admin'))
-            monkeypatch.setattr(_user_mod.db, 'session', MagicMock())
+            monkeypatch.setattr(_user_mod.db, 'session', session)
             monkeypatch.setattr(_user_mod, 'get_current_user_role', lambda: 'admin')
 
             upd = _user_mod.AccUserUpdate()
             resp = upd.update
             body = resp.get_json()
             assert body['code'] == 0
+            permission_sync.assert_called_once_with(
+                'alice', 'alice', True, True, commit=False,
+            )
 
     def test_id_not_found_rejected(self, monkeypatch):
         """集成测试: id 不存在 → 返回 100, 不 AttributeError."""
@@ -214,6 +227,7 @@ class TestAccUserUpdateIntegration:
             up_user_row = MagicMock()
             up_user_row.id = 1
             up_user_row.name = 'alice'
+            up_user_row.usrole = 'user'
 
             def filter_by_side_effect(**kwargs):
                 f = MagicMock()
@@ -226,6 +240,10 @@ class TestAccUserUpdateIntegration:
             mock_query = MagicMock(filter_by=filter_by_side_effect)
             monkeypatch.setattr(_user_mod.t_acc_user, 'query', mock_query)
             monkeypatch.setattr(_user_mod, 'AuthAutoUpdate', MagicMock())
+            permission_sync = MagicMock()
+            monkeypatch.setattr(
+                _user_mod, 'sync_user_permissions', permission_sync,
+            )
             monkeypatch.setattr(_user_mod, 'hash_pwd', lambda x: 'hashed')
             mock_ords = MagicMock()
             monkeypatch.setattr(_user_mod, 'get_current_user', lambda: (mock_ords, 'cz_admin'))
@@ -236,6 +254,11 @@ class TestAccUserUpdateIntegration:
             resp = upd.update
             body = resp.get_json()
             assert body['code'] == 0
+            permission_sync.assert_called_once_with(
+                'alice', 'freshname', False, False, commit=False,
+            )
+            mock_ords.conn.delete.assert_any_call('alice_role')
+            mock_ords.conn.delete.assert_any_call('alice_alias')
 
 
 class TestRenameCheckModuleFunction:

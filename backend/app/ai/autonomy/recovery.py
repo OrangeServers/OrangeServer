@@ -21,6 +21,7 @@ import json
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from app.ai.autonomy.actions import ActionValidationError, action_from_dict
 from app.ai.autonomy.repository import sanitize_text
 from app.ai.autonomy.state import (
     RunStatus,
@@ -151,6 +152,49 @@ class RecoveryService:
         if unknown:
             return self._halt_for_cursor_review(
                 run, unknown, 'write_outcome_unknown',
+            )
+
+        # Completed investigation probes are authoritative observations, not
+        # a partially executed change plan. Re-entering the planner neither
+        # replays them nor guesses a write cursor; their bounded MySQL history
+        # is supplied to the next turn. Any plan, unresolved state, malformed
+        # snapshot, or non-probe action still takes the fail-closed path below.
+        terminal_probes = []
+        if (
+            not checkpoint_present
+            and not any(step.kind == 'plan' for step in steps)
+        ):
+            for step in action_steps:
+                if step.status not in {
+                    StepStatus.SUCCEEDED.value, StepStatus.FAILED.value,
+                }:
+                    break
+                try:
+                    action = action_from_dict(json.loads(step.action_json or ''))
+                except (ActionValidationError, TypeError, ValueError):
+                    break
+                if str(action.kind) != 'probe':
+                    break
+                terminal_probes.append(step)
+        if terminal_probes and len(terminal_probes) == len(action_steps):
+            self._transition_running(run)
+            self.repo.append_event(run, EVENT_BOUNDARY_REBUILD, {
+                'entry': 'plan_after_terminal_probes',
+                'step_ids': [step.id for step in terminal_probes],
+            })
+            self.repo._commit()
+            return RecoveryOutcome(
+                mode=MODE_BOUNDARY,
+                entry={
+                    'run_id': run.id,
+                    'graph_version': str(run.graph_version or ''),
+                    'owner': str(run.owner or ''),
+                    'phase': 'decide',
+                    'loops': len(terminal_probes),
+                    'proposed_steps': 0,
+                    'done': False,
+                },
+                as_node='decide',
             )
 
         if len(action_steps) > 1:

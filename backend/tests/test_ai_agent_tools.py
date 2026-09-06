@@ -1,4 +1,4 @@
-"""AI Agent 工具注册与待审批动作的公开行为测试。"""
+"""AI Agent tool registration and read-only result-set behavior tests."""
 from __future__ import annotations
 
 from test_ai_agent_state import FakeRedis
@@ -44,7 +44,7 @@ class FakePlatform:
         return ToolData("audit_logs", [], [], {"total": 0})
 
     def validate_asset_ids(self, asset_ids):
-        return sorted(asset_ids) == sorted(self.allowed_ids)
+        return set(asset_ids).issubset(self.allowed_ids)
 
     def authorized_system_user_aliases(self):
         return set(self.sys_users)
@@ -56,7 +56,14 @@ class FakePlatform:
         )
 
 
-def _registry(role="user", allowed_ids=None):
+def _registry(
+    role="user",
+    allowed_ids=None,
+    autonomy_mode="ask",
+    autonomy_profile=None,
+    monitoring_executor=None,
+    monitoring_source_types=None,
+):
     from app.ai.storage import AgentStore
     from app.ai.tools import ToolRegistry
 
@@ -68,7 +75,11 @@ def _registry(role="user", allowed_ids=None):
         owner="alice",
         role=role,
         conversation_id=conversation["id"],
+        autonomy_mode=autonomy_mode,
+        autonomy_profile=autonomy_profile,
         command_checker=lambda command: None,
+        monitoring_executor=monitoring_executor,
+        monitoring_source_types=monitoring_source_types,
     )
     return store, conversation, registry
 
@@ -80,7 +91,8 @@ def test_normal_user_does_not_receive_admin_only_tools():
     assert "search_accounts" not in names
     assert "search_audit_logs" not in names
     assert "search_assets" in names
-    assert "prepare_batch_command" in names
+    assert "search_knowledge" in names
+    assert "prepare_batch_command" not in names
 
 
 def test_admin_receives_account_and_audit_tools():
@@ -89,6 +101,224 @@ def test_admin_receives_account_and_audit_tools():
 
     assert "search_accounts" in names
     assert "search_audit_logs" in names
+    assert "search_knowledge" in names
+
+
+def test_monitoring_tools_revalidate_asset_and_support_iterative_investigation():
+    calls = []
+    bounded_lines = [f"log-{index}" for index in range(100)]
+
+    def execute(operation, arguments):
+        calls.append((operation, arguments))
+        if operation == "discover_monitoring":
+            return {
+                "kind": "monitoring_catalog",
+                "rows": [{
+                    "source_id": 7,
+                    "source_type": "prometheus",
+                    "metrics": ["http_requests_total", "process_cpu_seconds_total"],
+                }],
+                "summary": {"source_count": 1, "metric_count": 2},
+            }
+        return {
+            "kind": "monitoring_observation",
+            "rows": [{
+                "source": "loki",
+                "status": "ok",
+                "observations": [{
+                    "template": "loki_query",
+                    "line_count": len(bounded_lines),
+                    "lines": bounded_lines,
+                }],
+            }],
+            "summary": {"source_count": 1, "partial": False},
+        }
+
+    _, _, registry = _registry(
+        role="user", allowed_ids=[2], monitoring_executor=execute,
+    )
+    names = {item["function"]["name"] for item in registry.definitions()}
+    assert {
+        "discover_monitoring", "query_prometheus", "query_loki",
+        "query_grafana_panel", "query_zabbix_history",
+    }.issubset(names)
+
+    catalog = registry.execute("discover_monitoring", {
+        "host_id": 2,
+        "source_types": ["prometheus", "loki"],
+        "search": "cpu",
+    })
+    result = registry.execute("query_loki", {
+        "host_id": 2,
+        "source_id": 8,
+        "contains": "timeout",
+        "lookback_minutes": 60,
+    })
+
+    assert calls == [
+        ("discover_monitoring", {
+            "host_id": 2, "source_types": ["prometheus", "loki"],
+            "search": "cpu",
+        }),
+        ("query_loki", {
+            "host_id": 2, "source_id": 8, "contains": "timeout",
+            "lookback_minutes": 60, "limit": 100,
+        }),
+    ]
+    assert catalog["kind"] == "monitoring_catalog"
+    assert result["kind"] == "monitoring_observation"
+    assert result["summary"] == {"source_count": 1, "partial": False}
+    assert result["preview"][0]["observations"][0]["lines"] == bounded_lines
+
+
+def test_monitoring_tool_uses_operator_selected_sources_not_model_choice():
+    calls = []
+
+    def execute(operation, arguments):
+        calls.append((operation, arguments))
+        return {
+            "rows": [],
+            "summary": {"title": "monitoring_observation", "total": 0},
+        }
+
+    _, _, registry = _registry(
+        role="user",
+        allowed_ids=[2],
+        monitoring_executor=execute,
+        monitoring_source_types=("prometheus", "loki"),
+    )
+    registry.execute("discover_monitoring", {
+        "host_id": 2,
+        "source_types": ["zabbix"],
+    })
+
+    assert calls == [("discover_monitoring", {
+        "host_id": 2,
+        "source_types": ["prometheus", "loki"],
+    })]
+def test_monitoring_tool_rejects_unauthorized_asset_before_query():
+    _, _, registry = _registry(
+        role="user",
+        allowed_ids=[2],
+        monitoring_executor=lambda _arguments: (_ for _ in ()).throw(
+            AssertionError("monitoring query must not run")
+        ),
+    )
+
+    from app.ai.tools import ToolValidationError
+
+    try:
+        registry.execute("discover_monitoring", {
+            "host_id": 3,
+        })
+    except ToolValidationError as exc:
+        assert "not authorized" in str(exc).lower()
+    else:
+        raise AssertionError("unauthorized asset was accepted")
+
+
+def test_monitoring_tool_preserves_safe_validation_error():
+    from app.ai.monitoring import MonitoringValidationError
+    from app.ai.tools import ToolValidationError
+
+    _, _, registry = _registry(
+        role="user",
+        allowed_ids=[2],
+        monitoring_executor=lambda _operation, _arguments: (_ for _ in ()).throw(
+            MonitoringValidationError(
+                "asset has no enabled confirmed monitoring mapping"
+            )
+        ),
+    )
+
+    try:
+        registry.execute("discover_monitoring", {"host_id": 2})
+    except ToolValidationError as exc:
+        assert str(exc) == "asset has no enabled confirmed monitoring mapping"
+    else:
+        raise AssertionError("safe monitoring validation error was hidden")
+
+
+def test_monitoring_tool_surfaces_sample_budget_as_validation_error():
+    from app.ai.monitoring import MonitoringError
+    from app.ai.tools import ToolValidationError
+
+    _, _, registry = _registry(
+        role="user",
+        allowed_ids=[2],
+        monitoring_executor=lambda _operation, _arguments: (_ for _ in ()).throw(
+            MonitoringError("Prometheus sample limit exceeded")
+        ),
+    )
+
+    try:
+        registry.execute("query_prometheus", {
+            "host_id": 2, "source_id": 1, "metric": "node_cpu_seconds_total",
+            "calculation": "rate",
+        })
+    except ToolValidationError as exc:
+        assert str(exc) == "Prometheus sample limit exceeded"
+    else:
+        raise AssertionError("sample-budget error was hidden behind a generic failure")
+
+
+def test_user_knowledge_tool_returns_bounded_references(monkeypatch):
+    from app.ai import knowledge
+
+    class FakeKnowledgeService:
+        def __init__(self, _session):
+            pass
+
+        def search(self, query, *, limit, scopes):
+            assert (query, limit) == ("disk full", 8)
+            assert scopes == ("global",)
+            return [{"citation_id": "K1", "title": "Disk runbook"}]
+
+    monkeypatch.setattr(knowledge, "KnowledgeService", FakeKnowledgeService)
+    _, _, registry = _registry(role="user")
+    result = registry.execute("search_knowledge", {"query": "disk full"})
+    assert result == {
+        "knowledge_references": [{"citation_id": "K1", "title": "Disk runbook"}],
+        "count": 1,
+    }
+
+
+def test_user_knowledge_tool_includes_authorized_host_scope(monkeypatch):
+    from app.ai import knowledge
+
+    class FakeKnowledgeService:
+        def __init__(self, _session):
+            pass
+
+        def search(self, query, *, limit, scopes):
+            assert (query, limit, scopes) == (
+                "restart cron", 8, ("global", "host:2"),
+            )
+            return [{"citation_id": "K1", "scope": "host:2"}]
+
+    monkeypatch.setattr(knowledge, "KnowledgeService", FakeKnowledgeService)
+    _, _, registry = _registry(role="user", allowed_ids=[1, 2])
+
+    result = registry.execute("search_knowledge", {
+        "query": "restart cron", "host_alias": "host-2",
+    })
+
+    assert result["knowledge_references"][0]["scope"] == "host:2"
+
+
+def test_user_knowledge_tool_rejects_unauthorized_host_scope():
+    from app.ai.tools import ToolValidationError
+
+    _, _, registry = _registry(role="user", allowed_ids=[1, 2])
+
+    try:
+        registry.execute(
+            "search_knowledge", {"query": "restart cron", "host_id": 3},
+        )
+    except ToolValidationError as exc:
+        assert str(exc) == "host_id is not authorized"
+    else:
+        raise AssertionError("unauthorized host scope must be rejected")
 
 
 def test_asset_query_returns_result_set_reference_instead_of_full_context():
@@ -279,75 +509,3 @@ def test_platform_overview_reads_online_status_in_one_batch(monkeypatch):
     assert requested == [[11, 12]]
     assert result.summary["online_count"] == 1
     assert result.summary["offline_count"] == 1
-
-
-def test_batch_command_creates_pending_action_from_server_result_set():
-    store, _, registry = _registry(allowed_ids=[1, 2])
-    query = registry.execute("search_assets", {})
-
-    response = registry.execute(
-        "prepare_batch_command",
-        {
-            "result_set_id": query["result_set_id"],
-            "sys_user": "ops",
-            "command": "df -h",
-            "reason": "磁盘巡检",
-        },
-    )
-
-    action = store.get_action("alice", response["action_id"])
-    assert action["status"] == "pending"
-    assert action["command"] == "df -h"
-    assert response["target_count"] == 2
-
-
-def test_batch_command_rejects_dangerous_command_and_unknown_sys_user():
-    from app.ai.tools import ToolValidationError
-
-    store, conversation, registry = _registry(allowed_ids=[1])
-    query = registry.execute("search_assets", {})
-    registry.command_checker = lambda command: "reboot" if "reboot" in command else None
-
-    for arguments in (
-        {
-            "result_set_id": query["result_set_id"],
-            "sys_user": "ops",
-            "command": "reboot",
-            "reason": "bad",
-        },
-        {
-            "result_set_id": query["result_set_id"],
-            "sys_user": "root-no-auth",
-            "command": "df -h",
-            "reason": "bad",
-        },
-    ):
-        try:
-            registry.execute("prepare_batch_command", arguments)
-        except ToolValidationError:
-            pass
-        else:
-            raise AssertionError("unsafe action must be rejected")
-
-
-def test_batch_command_rejects_cross_rule_asset_credential_pair():
-    from app.ai.tools import ToolValidationError
-
-    _, _, registry = _registry(allowed_ids=[1])
-    query = registry.execute("search_assets", {})
-    registry.platform.validate_asset_sys_user_pair = lambda _ids, _user: False
-
-    try:
-        registry.execute(
-            "prepare_batch_command",
-            {
-                "result_set_id": query["result_set_id"],
-                "sys_user": "ops",
-                "command": "df -h",
-                "reason": "跨规则凭据不应被允许",
-            },
-        )
-    except ToolValidationError:
-        pass
-    else:
-        raise AssertionError("asset and credential must share an authorization rule")

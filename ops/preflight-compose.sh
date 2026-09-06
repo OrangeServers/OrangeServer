@@ -8,7 +8,7 @@
 # 用法：
 #   bash ops/preflight-compose.sh             # 默认 bundled 模式
 #   bash ops/preflight-compose.sh bundled     # 同上
-#   bash ops/preflight-compose.sh host        # host 模式 (仅 backend+frontend)
+#   bash ops/preflight-compose.sh host        # host 模式 (app+worker)
 # =============================================================================
 
 set -Eeuo pipefail
@@ -36,7 +36,7 @@ version_ge() {
 }
 
 # =============================================================================
-echo ">>> 1/10 Docker 版本检查"
+echo ">>> 1/8 Docker 版本检查"
 # =============================================================================
 if command -v docker >/dev/null 2>&1; then
     DOCKER_VER=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "0")
@@ -62,7 +62,7 @@ else
 fi
 
 # =============================================================================
-echo ">>> 2/10 环境文件检查"
+echo ">>> 2/8 环境文件检查"
 # =============================================================================
 ROOT_ENV="${ROOT}/.env"
 BACKEND_ENV="${ROOT}/backend/.env"
@@ -92,16 +92,7 @@ else
 fi
 
 # =============================================================================
-echo ">>> 3/10 前端 dist 检查"
-# =============================================================================
-if [ -f "${ROOT}/frontend/dist/index.html" ]; then
-    ok "frontend/dist/index.html 存在"
-else
-    fail "frontend/dist/index.html 不存在 (先跑 make build-frontend)"
-fi
-
-# =============================================================================
-echo ">>> 4/10 MySQL SQL 文件检查"
+echo ">>> 3/8 MySQL SQL 文件检查"
 # =============================================================================
 if [ -f "${ROOT}/backend/mysqldir/orange.sql" ]; then
     ok "backend/mysqldir/orange.sql 存在"
@@ -110,20 +101,7 @@ else
 fi
 
 # =============================================================================
-echo ">>> 5/10 Nginx 挂载源检查"
-# =============================================================================
-for f in \
-    "${DEPLOY}/nginx/frontend_container.conf" \
-    "${DEPLOY}/nginx/ogs_proxy_common.conf"; do
-    if [ -f "$f" ]; then
-        ok "$(basename "$f") 存在"
-    else
-        fail "$(basename "$f") 不存在"
-    fi
-done
-
-# =============================================================================
-echo ">>> 6/10 环境变量一致性检查"
+echo ">>> 4/8 环境变量一致性检查"
 # =============================================================================
 
 # 从根 .env 读取变量 (不 export, 避免污染)
@@ -159,7 +137,7 @@ if [ -f "${ROOT_ENV}" ] && [ -f "${BACKEND_ENV}" ]; then
 fi
 
 # =============================================================================
-echo ">>> 7/10 密钥检查 (backend/.env)"
+echo ">>> 5/8 密钥检查 (backend/.env)"
 # =============================================================================
 # SETUP-WIZARD: SECRET_KEY / FERNET_KEYS 缺失降级 WARN——首次启动会进入
 #   /setup 网页向导并由服务端自动生成落盘（<数据卷>/runtime.env）。
@@ -192,17 +170,17 @@ if [ -f "${BACKEND_ENV}" ]; then
 fi
 
 # =============================================================================
-echo ">>> 8/10 端口占用检查"
+echo ">>> 6/8 端口占用检查"
 # =============================================================================
 HTTP_PORT_VALUE=$(load_env_val "${ROOT_ENV:-/dev/null}" "OGS_HTTP_PORT")
 HTTP_PORT_VALUE="${HTTP_PORT_VALUE:-8080}"
 
-# DEPLOY-AUDIT P1-2: 端口被本项目自己的 frontend 容器占用是"重启/升级"的正常
+# DEPLOY-AUDIT P1-2: 端口被本项目自己的 app 容器占用是"重启/升级"的正常
 #   状态, 判 FAIL 会让 make docker-up 不可重入 → 降级为 WARN 并说明。
 _port_owned_by_self() {
     command -v docker >/dev/null 2>&1 \
         && docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null \
-            | grep -E 'frontend' | grep -q ":${HTTP_PORT_VALUE}->"
+            | grep -E '[-_]app[-_ ]' | grep -q ":${HTTP_PORT_VALUE}->"
 }
 _port_in_use() {
     if command -v ss >/dev/null 2>&1; then
@@ -216,7 +194,7 @@ _port_in_use() {
 if command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1; then
     if _port_in_use; then
         if _port_owned_by_self; then
-            warn "端口 ${HTTP_PORT_VALUE} 由本项目 frontend 容器占用 (重启场景, compose 会接管)"
+            warn "端口 ${HTTP_PORT_VALUE} 由本项目 app 容器占用 (重启场景, compose 会接管)"
         else
             fail "端口 ${HTTP_PORT_VALUE} 已被其他进程占用 (换 OGS_HTTP_PORT 或停止占用进程)"
         fi
@@ -266,7 +244,7 @@ if [ -r /proc/sys/net/ipv4/ip_local_port_range ]; then
 fi
 
 # =============================================================================
-echo ">>> 9/10 Shell 环境变量覆盖检查"
+echo ">>> 7/8 Shell 环境变量覆盖检查"
 # =============================================================================
 # Compose 插值时 shell env 优先于 --env-file, 防止已 export 的旧值覆盖
 OVERRIDE_VARS="OGS_MYSQL_PASSWORD OGS_REDIS_PASSWORD MYSQL_ROOT_PASSWORD OGS_HTTP_PORT OGS_BACKEND_IMAGE OGS_BACKEND_TAG"
@@ -280,7 +258,7 @@ done
 [ "${OVERRIDE_FOUND}" = "0" ] && ok "Shell 环境变量无覆盖"
 
 # =============================================================================
-echo ">>> 10/10 Compose 配置解析检查"
+echo ">>> 8/8 Compose 配置解析检查"
 # =============================================================================
 if [ -f "${ROOT_ENV}" ] && [ -f "${COMPOSE_FILE}" ]; then
     PROFILE_ARG=""

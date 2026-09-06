@@ -18,7 +18,7 @@ curl -fsSL \
 ## 中国大陆线路
 
 中国大陆入口从 v1.0.3 起提供。固定 tag 的 Gitee 引导器会使用腾讯云 TCR 后端镜像，
-以及固定 digest 的 DaoCloud 匿名公共 Nginx、Redis、MySQL 镜像：
+以及 DaoCloud 匿名公共 Redis、MySQL 镜像：
 
 ```bash
 set -o pipefail
@@ -27,8 +27,8 @@ curl -fsSL https://gitee.com/orangeservers/OrangeServer/raw/v1.1.1/ops/bootstrap
 ```
 
 DaoCloud 是不承诺可用性 SLA 的社区公共服务；需要时可通过
-`OGS_CN_NGINX_IMAGE`、`OGS_CN_REDIS_IMAGE`、`OGS_CN_MYSQL_IMAGE` 覆盖完整镜像
-引用。覆盖示例见[部署方式](/zh/guide/deployment)。
+`OGS_CN_REDIS_IMAGE`、`OGS_CN_MYSQL_IMAGE` 覆盖完整镜像引用。覆盖示例见
+[部署方式](/zh/guide/deployment)。
 
 浏览器打开 `http://<服务器地址>:8080`。系统没有默认管理员账号或密码。
 

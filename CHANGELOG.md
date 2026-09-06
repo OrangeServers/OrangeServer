@@ -3,6 +3,109 @@
 Notable user-visible changes are recorded here. This project follows the
 principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- AI chat can now dynamically discover and query explicitly mapped Prometheus,
+  Grafana, Loki, and Zabbix data through bounded read-only tools. The existing
+  Agent can iteratively select metrics, log filters, saved panels, and Zabbix
+  items; all bounded evidence reaches the model while credentials remain redacted.
+  Administrators can test sources and confirm asset identities without adding a
+  second Agent runtime or monitoring container.
+- The AI Ops landing page now leads with pending alerts, active runs, recent
+  conclusions, Worker capacity, and knowledge-index status. An optional
+  Bearer-authenticated Alertmanager webhook creates idempotent `ask` runs and
+  attaches bounded, server-owned Prometheus observations to their timeline.
+- An administrator-reviewed operations knowledge base indexes Markdown
+  runbooks and independently verified runs with a bundled Chinese BGE ONNX
+  model or a separate OpenAI-compatible embedding endpoint. Chat and the
+  Autonomy Planner return bounded, versioned citations without granting
+  permissions or replacing live evidence.
+- Administrators can upload Markdown, text, PDF, and DOCX files into a
+  review-before-save preview. Original binaries are not retained, and RedisVL
+  now fuses BM25 keyword matching with embedding similarity in the existing
+  Redis service.
+
+### Changed
+
+- AI operations now uses a Codex-style workbench with grouped task and alert
+  views, vertical subnavigation, a dedicated administrator monitoring-source
+  screen, a collapsible recent-task rail, an in-place evidence and raw-output
+  inspector, on-demand run context, compact mobile actions, legacy-route
+  redirects, and a separate first-level knowledge destination. Task rows now
+  lead with a readable target and next action; alert groups show Alertmanager's
+  latest firing/resolved state separately from Run outcome. Terminal failures
+  now lead with the blocking step instead of a pending-conclusion message;
+  task, knowledge, and evidence read failures remain visible instead of being
+  presented as empty or zero-result states.
+  Authorized users can manage their own Runs and search scoped knowledge;
+  knowledge mutations remain administrator-only.
+- Chat now handles query, explanation, diagnosis, and Autonomy Run drafts;
+  every remote write is executed through the existing approval-gated Run path.
+  Its composer now offers four real operations starters and a user-owned
+  `ask`/`ai_review`/`auto`/`custom` permission selector. The server stores and
+  enforces that conversation profile for future drafts, so the model cannot
+  choose or widen execution permissions.
+- The Autonomy Worker keeps Celery prefork and defaults to two configurable
+  execution slots. DeepSeek reasoning is preserved across tool-call turns.
+- The standard Compose deployment now serves the bundled SPA from the app
+  image and uses four product containers with one Redis 8 service.
+
+### Removed
+
+- The unused in-tree Ansible Runner and its `ansible-core` dependency.
+
+### Fixed
+
+- Worker health checks no longer leak long-lived Celery inspect processes;
+  the bounded probe now verifies checkpoint storage and Worker registration
+  in one directly managed process.
+- Fresh-setup administrators now receive the existing all-access binding,
+  authorized host-scoped Run knowledge is available to chat, and ask-mode
+  approval plus final Run conclusions expose the complete operator-facing
+  action and evidence-backed conclusion fields.
+- Existing and renamed administrator accounts now retain direct permission
+  bindings used by asset and automation authorization, and the upgrade
+  migration backfills custom admin names into the existing all-access rule.
+- The Run composer now loads owner-scoped credential options for normal users
+  instead of calling an administrator-only credential-management endpoint.
+  Conversation profile changes and Agent turns share the existing run lock so
+  neither can overwrite the other's Redis conversation state.
+- The built-in `system` account no longer ships a password that can sign in.
+  The baseline seed and its migration stored a placeholder that the login
+  compatibility path decoded and matched, and the first-boot wizard only
+  creates that row when it is absent and never runs again after a successful
+  apply, so existing installations keep the old value until
+  `rev62_system_account_unusable.sql` runs. Placeholder accounts now store a
+  bcrypt digest whose plaintext was never recorded, and the account keeps its
+  full verification cost so it stays indistinguishable from a real one.
+- Signing in now records the bcrypt password version whenever it transparently
+  upgrades a legacy stored password, as do administrator password resets,
+  self-service resets, and user edits that set a password. The
+  `password_version` audit count previously kept reporting upgraded accounts
+  as legacy base64 forever.
+- The release bundle now includes `ops/healthcheck.sh`, which the packaged
+  Makefile's `health` target requires, and `make health` probes the port from
+  `OGS_HTTP_PORT` instead of advertising the fixed development port 28000.
+  The probe also accepts the documented first-boot `status: setup` response as
+  healthy; it previously required `status: ok`, so `make health` reported a
+  healthy, not-yet-configured installation as failed.
+  DEPLOY.md points container troubleshooting at the `app` service now that
+  the bundled topology has no `backend` service.
+- A fresh installation no longer reports the Autonomy Worker as unhealthy while
+  the first-boot wizard is still pending. The container health probe imported
+  the readiness module, whose module-level configuration import fail-fasts on
+  the secret keys the wizard has not generated yet, so Docker marked a
+  correctly waiting worker unhealthy once its start period elapsed and
+  `docker compose up --wait` could not succeed. The probe now applies the same
+  three-state setup judgement as the worker entrypoint, and still gates on real
+  checkpoint and worker readiness once the deployment is configured.
+- Read-only monitoring tools now surface their actionable failure reason (for
+  example the Prometheus sample-budget limit) as a validation error instead of
+  one opaque generic message, so the Agent can shorten the time window or widen
+  the step and retry.
+
 ## [1.1.1] - 2026-08-19
 
 ### Added

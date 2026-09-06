@@ -36,12 +36,18 @@ HTTP_CODE=$(curl ${CURL_K} -s -o /tmp/ogs_health.json -w "%{http_code}" --max-ti
 if [ "${HTTP_CODE}" = "200" ]; then
     BODY=$(cat /tmp/ogs_health.json)
     echo "[OK] HTTP ${HTTP_CODE}  body=${BODY}"
-    # 检查 JSON 字段
-    if echo "${BODY}" | grep -q '"status": "ok"' || echo "${BODY}" | grep -q '"status":"ok"'; then
+    # /local/health 有两个文档化的健康状态 (见 DEPLOY.md)，HTTP 均为 200:
+    #   初始化向导阶段  {"status":"setup","setup_required":true}
+    #   初始化完成后    {"status":"ok", ...}
+    # 两者都说明服务活着，都不能判失败；否则全新安装跑 make health 会误报。
+    if echo "${BODY}" | grep -qE '"status": ?"ok"'; then
         echo "[OK] status=ok"
         exit 0
+    elif echo "${BODY}" | grep -qE '"status": ?"setup"'; then
+        echo "[OK] status=setup（服务正常，初始化向导尚未完成）"
+        exit 0
     else
-        echo "[FAIL] 响应缺少 status=ok"
+        echo "[FAIL] 响应缺少可识别的 status（既不是 ok 也不是 setup）"
         exit 1
     fi
 else

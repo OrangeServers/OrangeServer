@@ -15,8 +15,9 @@
 - 租约丢失即中止：心跳续租失败后，驱动循环在下一个节点边界立刻
   中止，不再产生任何副作用，也不释放（已不属于自己）的租约。
 - v1 兼容图仍让所有动作经过 approval_pause；v2 使用服务端
-  allow/ask/deny 决策，仅 ask 暂停。role 固定 'admin'（自治入口在
-  路由层强制管理员），多角色支持需先把 role 持久化到 Run 行。
+  allow/ask/deny 决策，仅 ask 暂停。驱动每次接管 Run 都从当前
+  t_acc_user 解析 owner role，不把角色持久化到 Run，也不信任旧投递
+  中携带的角色。
 """
 import datetime
 import json
@@ -61,7 +62,13 @@ from app.ai.autonomy.recovery import (
     MODE_RESUME,
     RecoveryService,
 )
-from app.ai.autonomy.repository import redacted_summary, sanitize_text
+from app.ai.autonomy.repository import (
+    MAX_EVIDENCE_CITATIONS,
+    fallback_conclusion_details,
+    redacted_summary,
+    resolve_current_autonomy_role,
+    sanitize_text,
+)
 from app.ai.autonomy.state import (
     RunMode,
     RunStatus,
@@ -95,7 +102,7 @@ RESUME_CONTINUE = 'continue'
 MAX_RESUMES_PER_DRIVE = 64
 
 # DeepSeek 等 OpenAI-compatible planner 可能在调查已经充分后继续选择
-# propose_probe。完成三类成功的只读探针且尚未出现写动作时，服务端把
+# propose_probe。完成三类只读探针且尚未出现写动作时，服务端把
 # 下一轮阶段收束到 propose_plan；这只是工具阶段约束，不替模型生成
 # 计划，也不绕过后续计划审批。
 MIN_DISTINCT_PROBES_BEFORE_PLAN = 3
@@ -150,11 +157,13 @@ class _ClaimFencedPlannerRepository:
             self._repo.session.rollback()
             raise
 
-    def conclude_run(self, owner, role, run_id, outcome, evidence_ids):
+    def conclude_run(
+        self, owner, role, run_id, outcome, evidence_ids, details=None,
+    ):
         try:
             self._lock_claim(run_id)
             return self._repo.conclude_run(
-                owner, role, run_id, outcome, evidence_ids,
+                owner, role, run_id, outcome, evidence_ids, details,
             )
         except Exception:
             self._repo.session.rollback()
@@ -252,7 +261,7 @@ class AutonomyDriver:
         heartbeat_session_factory=None,
         worker_id=None,
         lease_ttl=None,
-        role='admin',
+        role=None,
     ):
         self.session = session
         self.role = role
@@ -442,7 +451,7 @@ class AutonomyDriver:
     def _planner_requires_plan(self, run_id):
         """Return whether the next planner turn must hand off to a plan.
 
-        This is derived only from successful server-owned probe actions and
+        This is derived only from completed server-owned probe actions and
         the presence of any structured write action. It is intentionally a
         bounded phase guard for providers that keep selecting a read tool;
         it never creates a plan or changes the action/approval policy.
@@ -464,12 +473,39 @@ class AutonomyDriver:
                 return False
             if (
                 kind == 'probe'
-                and row.status == StepStatus.SUCCEEDED.value
+                and row.status in {
+                    StepStatus.SUCCEEDED.value, StepStatus.FAILED.value,
+                }
             ):
                 probe_id = str(action.parameters.get('probe_id') or '')
                 if probe_id:
                     probe_ids.add(probe_id)
         return len(probe_ids) >= MIN_DISTINCT_PROBES_BEFORE_PLAN
+
+    def _planner_requires_finish(self, run_id):
+        """Require conclusion once the latest successful write is verified."""
+        from app.core.db.database import t_ai_autonomous_step
+
+        latest_write = 0
+        latest_verification = 0
+        rows = self.session.query(t_ai_autonomous_step).filter(
+            t_ai_autonomous_step.run_id == run_id,
+            t_ai_autonomous_step.status == StepStatus.SUCCEEDED.value,
+            t_ai_autonomous_step.kind.in_([
+                StepKind.ACTION.value, StepKind.VERIFICATION.value,
+            ]),
+        ).order_by(t_ai_autonomous_step.seq.asc()).all()
+        for row in rows:
+            if row.kind == StepKind.VERIFICATION.value:
+                latest_verification = int(row.seq)
+                continue
+            try:
+                action = action_from_dict(json.loads(row.action_json or ''))
+            except (ActionValidationError, TypeError, ValueError):
+                continue
+            if action.kind in WRITE_KINDS:
+                latest_write = int(row.seq)
+        return bool(latest_write and latest_verification > latest_write)
 
     def _build_handlers(self, run_id):
         planner_repo = _ClaimFencedPlannerRepository(
@@ -492,6 +528,19 @@ class AutonomyDriver:
             ).filter_by(
                 run_id=run_id, kind=StepKind.ACTION.value,
             ).count()
+            knowledge = []
+            try:
+                from app.ai.knowledge import KnowledgeService
+
+                knowledge = KnowledgeService(self.session).search(
+                    str(current_run.goal or ''),
+                    limit=4,
+                    scopes=('global', 'host:%d' % int(current_run.host_id)),
+                )
+            except Exception as exc:
+                # Retrieval is advisory; Redis/model failure must never change
+                # the server-owned authorization or stop incident handling.
+                logger.warning('knowledge retrieval unavailable: %s', exc)
             context = {
                 'run_id': run_id,
                 'owner': str(state.get('owner') or ''),
@@ -513,7 +562,9 @@ class AutonomyDriver:
                 # 大输出留在加密 Artifact；模型只读得到有界脱敏
                 # 的 Evidence 摘要（切片 4）。
                 'evidence': summarize_evidence(self.session, run_id),
+                'knowledge': knowledge,
                 'require_plan': self._planner_requires_plan(run_id),
+                'require_finish': self._planner_requires_finish(run_id),
             }
             proposed = list(self.planner(context) or [])
             return {
@@ -1284,6 +1335,17 @@ class AutonomyDriver:
         if bool(run.cancel_requested):
             return self._confirm_cancel(run)
 
+        current_role = resolve_current_autonomy_role(
+            self.session, str(run.owner or ''),
+        )
+        if current_role is None:
+            self._fail_run(
+                run, 'authorization_revoked',
+                'run owner is inactive or has no supported role',
+            )
+            return RESULT_FAILED
+        self.role = current_role
+
         try:
             self._configure_duration_budget(run)
             self._remaining_duration_seconds()
@@ -1367,6 +1429,12 @@ class AutonomyDriver:
                 # 独立 session 在 Redis 写期间持有 exact-claim Run 行
                 # 锁；这里不能先用主 session 持同一锁，否则真实
                 # MySQL 会与 wrapper 自锁。
+                if outcome.as_node == 'decide':
+                    # 已完成的调查探针可能在 execute 提交后、observe
+                    # 落 Evidence 前崩溃。先补齐幂等 Evidence，再回到
+                    # planner，避免后续结论失去可引用的观察。
+                    self._guard()
+                    self._record_run_evidence(run_id)
                 try:
                     compiled.update_state(
                         cfg, outcome.entry, as_node=outcome.as_node,
@@ -1386,8 +1454,8 @@ class AutonomyDriver:
                         return RESULT_PAUSED
                     entry = Command(resume=decision)
                 else:
-                    # as_node=plan 的下一节点是 policy；沿刚重建的
-                    # checkpoint 继续，绝不再次调用 planner。
+                    # as_node=plan 的下一节点是 policy；as_node=decide
+                    # 只用于已终结的只读调查，下一节点安全回到 planner。
                     entry = None
             elif outcome.mode == MODE_RESUME:
                 # 健康 checkpoint 的原生续跑输入是 None。重新传初始
@@ -1518,6 +1586,17 @@ class AutonomyDriver:
         if result in (RESULT_COMPLETED, RESULT_FAILED, RESULT_CANCELLED):
             run.completed_at = run.completed_at or _utcnow()
         run.outcome = run.outcome or _default_outcome(result)
+        if run.outcome and not run.conclusion_json:
+            evidence_ids = [
+                item['id'] for item in self.repo.list_evidence(
+                    str(run.owner), run_id,
+                )
+            ][-MAX_EVIDENCE_CITATIONS:]
+            run.conclusion_json = json.dumps({
+                **fallback_conclusion_details(),
+                'final_status': run.outcome,
+                'evidence_ids': evidence_ids,
+            }, ensure_ascii=False, separators=(',', ':'))
         self.repo._bump(run)
         if event is not None:
             self.repo.append_event(run, event, {

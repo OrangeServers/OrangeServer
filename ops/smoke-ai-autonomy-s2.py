@@ -185,6 +185,8 @@ def assert_generated_unique(connection):
 
 
 def insert_run(connection, run_id, host_id, status):
+    # The drive path revalidates the owner's current role, so a Worker-driven
+    # Run must belong to a seeded account that actually has one.
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -193,7 +195,7 @@ def insert_run(connection, run_id, host_id, status):
                  system_user_alias, mode, status, revision, budget_json,
                  latest_event_seq, graph_version)
             VALUES
-                (%s, 'smoke', 'disposable S2 smoke', %s, 'smoke-host', 1,
+                (%s, 'admin', 'disposable S2 smoke', %s, 'smoke-host', 1,
                  'smoke-user', 'assisted', %s, 0, %s, 0, 'v1')
             """,
             (run_id, host_id, status, json.dumps({
@@ -660,23 +662,27 @@ def assert_redis_policy(client):
             'autonomy Redis must use noeviction')
 
 
+# The upgrade path emulates an operator applying the documented migrations in
+# order. Every migration that touches AUTONOMY_TABLES must appear here, or the
+# upgraded schema diverges from a fresh install; the contract test enforces
+# this list against backend/mysqldir so it cannot drift silently again.
+UPGRADE_SCRIPTS = (
+    'rev53_ai_autonomy_baseline.sql',
+    'rev54_ai_autonomy_lease.sql',
+    'rev55_ai_autonomy_custom_profile.sql',
+    'rev56_ai_autonomy_evidence.sql',
+    'rev57_ai_ops_trigger.sql',
+    'rev59_ai_autonomy_conclusion.sql',
+)
+
+
 def migrate_and_prime():
     fresh = mysql_connection(os.environ['OGS_MYSQL_HOST'])
     upgrade = mysql_connection(os.environ['OGS_S2_SMOKE_UPGRADE_MYSQL_HOST'])
     try:
         for _ in range(2):
-            execute_sql_script(
-                upgrade, '/smoke/sql/rev53_ai_autonomy_baseline.sql',
-            )
-            execute_sql_script(
-                upgrade, '/smoke/sql/rev54_ai_autonomy_lease.sql',
-            )
-            execute_sql_script(
-                upgrade, '/smoke/sql/rev55_ai_autonomy_custom_profile.sql',
-            )
-            execute_sql_script(
-                upgrade, '/smoke/sql/rev56_ai_autonomy_evidence.sql',
-            )
+            for script in UPGRADE_SCRIPTS:
+                execute_sql_script(upgrade, '/smoke/sql/%s' % script)
         require(schema_snapshot(fresh) == schema_snapshot(upgrade),
                 'fresh and v1.0.4 upgraded autonomy schemas differ')
         for connection, prefix, host_id in (
@@ -2148,18 +2154,29 @@ def worker_and_duplicate():
             and row['lease_expires_at'] is None,
             'terminal Run retained a worker lease fence',
         )
-        event = fetch_one(
+        events = fetch_all(
             connection,
             """
-            SELECT COUNT(*) AS count
+            SELECT event_type, COUNT(*) AS count
               FROM t_ai_autonomous_event
              WHERE run_id = %s
-               AND event_type IN ('planner_unavailable', 'planner_failed')
+             GROUP BY event_type
+             ORDER BY event_type
             """,
             (run_id,),
         )
-        require(int(event['count']) == 1,
-                'duplicate delivery produced more than one terminal event')
+        observed = ', '.join(
+            '%s=%s' % (row['event_type'], row['count']) for row in events
+        ) or 'none'
+        planner_terminal = sum(
+            int(row['count']) for row in events
+            if row['event_type'] in ('planner_unavailable', 'planner_failed')
+        )
+        require(
+            planner_terminal == 1,
+            'duplicate delivery did not produce exactly one planner '
+            'terminal event; observed events: %s' % observed,
+        )
     finally:
         connection.close()
 

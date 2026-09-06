@@ -11,12 +11,11 @@ flowchart LR
     Proxy --> Web["Vue 前端"]
     Proxy --> API["Flask API"]
     API --> DB[("MySQL\n业务与审计")]
-    API --> Cache[("Redis 7\n会话与临时状态")]
+    API --> Cache[("Redis 8\ncheckpoint / broker / 缓存")]
     API -->|"解密后仅在内存使用"| SSH["SSH / SFTP 资产"]
     API -->|"受控消息与工具定义"| LLM["模型 Provider"]
-    API -.->|"默认关闭"| AutoRedis[("Redis 8\ncheckpoint / broker")]
-    API -.->|"默认关闭"| Worker["自治 Worker"]
-    Worker -.-> AutoRedis
+    API --> Worker["自治 Worker"]
+    Worker --> Cache
     Worker -->|"解密后仅在内存使用"| SSH
 ```
 
@@ -81,15 +80,16 @@ sequenceDiagram
 
 ## M1 受控自治边界
 
-M1 自治默认关闭。标准发布栈只有业务 Redis 7；专用 Redis 8 和 Worker 只出现在
-隔离开发/验收覆盖层。开启后仍遵守：
+标准发布栈默认启动统一 Redis 8 与 Worker；管理员可关闭自治入口。隔离开发/验收
+覆盖层仍使用专用 Redis，以免接触生产 checkpoint。启用后始终遵守：
 
 - 模型只提出动作；服务端用 `allow | ask | deny` 决定是否执行。`deny` 不能被模型、
   Guardian 或人工提升。
 - 目标资产、系统用户、权限档案、预算和动作白名单在 Run 启动后锁定。
 - `auto` 仅允许管理员标记为 `lab` 的资产；写动作执行前重新校验权限、凭据和环境。
 - Worker 用一次性租约认领 Run。写结果未知时进入 `needs_attention`，不自动重放。
-- Redis 8 只保存 checkpoint 和 Celery broker 数据，不是业务事实源。
+- Redis 8 的 DB0 保存 checkpoint/可重建向量，DB1 作为 Celery broker，DB2 保存带
+  TTL 的会话和缓存；它不是业务事实源。
 - 远端输出按不可信 Evidence 处理：清理、脱敏、限长后加密保存。
 
 启用命令和关闭条件见 [AI 运维使用指南](../ai/USER_GUIDE.md) 与
@@ -129,7 +129,7 @@ Redis 中的 AI 对话不是永久事件存储。若组织需要长期留存，�
 生产管理员负责：
 
 - 强制 HTTPS，设置正确的 `OGS_HTTPS` 和 CSRF 来源；
-- 对 MySQL、业务 Redis 7、隔离自治 Redis 8 和应用网络分段并使用最小权限账号；
+- 对 MySQL、统一 Redis 8、隔离验收 Redis 和应用网络分段并使用最小权限账号；
 - 生产实例保持 `OGS_AI_AUTONOMY_ENABLED` 为空，除非经过独立授权的隔离验收；
 - 保护并轮换 Fernet、会话和数据库密钥；
 - 对 Provider 出口和私有模型网关设置网络策略；

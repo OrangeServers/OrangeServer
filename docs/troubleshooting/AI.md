@@ -45,7 +45,7 @@ Issue。服务端错误日志也应先脱敏。
 安全收口为 `inconclusive`，不会虚构成功或重放写动作。其它修复仍失败时保持
 `planner_failed` 的 fail-closed 结果。
 
-如果 Run 已经完成至少三类成功的只读探针、且尚未出现写动作，驱动会把下一轮
+如果 Run 已经完成至少三类只读探针（包括确认故障的非零结果）、且尚未出现写动作，驱动会把下一轮
 阶段有界收束到 `propose_plan`，避免 DeepSeek 等兼容模型在调查充分后继续循环
 提议探针；这不会替模型生成计划，也不会绕过计划审批与动作白名单。
 
@@ -63,7 +63,6 @@ Issue。服务端错误日志也应先脱敏。
 - 查看浏览器 Network 中 `/ai/chat` 是否为 `text/event-stream`；
 - 确认代理没有压缩或缓存 SSE；
 - 刷新后会话会读取服务端保存的工具事件和动作状态；
-- 若动作已经结束，界面会轮询动作摘要并恢复最终结果。
 
 nginx 关键配置：
 
@@ -85,28 +84,14 @@ location /ai/ {
 - 检查会话详情中的 `tool_events` 是否已经合并；
 - 不要把历史 `started` 与新的独立工具调用误认为同一事件。
 
-## 执行完成后模型仍说“尚未执行”
+## 聊天请求变更但没有直接执行
 
-以执行卡、会话详情中的 `latest_action` 和审计日志为准。当前后端会在下一轮问答
-前注入最新动作的权威状态。如果仍复现：
+这是预期安全边界。聊天只会创建 Autonomy Run 草稿；请打开草稿引用卡进入自治任务
+工作台，在那里启动、审批并查看执行和独立验证证据。若没有出现草稿卡：
 
-- 确认动作和追问属于同一个会话；
-- 确认前端刷新到了最新会话详情；
-- 检查 Redis 中动作是否仍为 `pending`；
-- 确认没有混用多个后端实例且 Redis 指向不同数据库。
-
-## 命令部分失败
-
-部分失败表示至少一台成功、至少一台失败，不等同于计划未执行。常见分类包括：
-
-- SSH/网络连接失败；
-- 身份认证失败；
-- 权限不足；
-- 命令超时；
-- 非零退出码。
-
-模型只获得收敛后的失败分类，不会获得原始 stderr。管理员可通过执行卡和审计
-页面查看权限允许的详细结果。
+- 确认当前账号是管理员；
+- 确认自治功能和 Worker readiness 正常；
+- 检查目标资产与系统凭据是否仍在当前账号授权范围内。
 
 ## 只读诊断无法启动
 
@@ -151,8 +136,8 @@ location /ai/ {
 | `reason` | 含义 | 处理 |
 |---|---|---|
 | `feature_disabled` | `OGS_AI_AUTONOMY_ENABLED` 未打开 | 标准发布栈应保持关闭。只在隔离开发/验收环境设为 `true` |
-| `redis_not_configured` | 未配置专用自治 Redis | 设置 `OGS_AI_AUTONOMY_REDIS_HOST` 等变量，且不得指向业务 Redis 7 |
-| `checkpoint_unavailable` | 自治 Redis checkpoint 不可达 | 检查 bundled 栈 `autonomy-redis`、密码和网络 |
+| `redis_not_configured` | 未配置自治 Redis | bundled 栈应指向统一 `redis` 服务；外部模式设置对应 Redis 8 地址和密码 |
+| `checkpoint_unavailable` | Redis checkpoint 不可达 | 检查 bundled 栈 `redis`、统一密码和网络 |
 | `worker_unavailable` | 自治 Worker 未就绪 | 使用 `make docker-dev-autonomy-up` 启动覆盖层，不要只改 feature flag |
 | `ready` | flag、checkpoint 和 Worker 均可用 | 才允许创建或启动 Run |
 

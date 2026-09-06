@@ -6,6 +6,8 @@
 """
 import datetime
 import pickle
+import sys
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -31,6 +33,9 @@ class FakePlatform:
         pass
 
     def validate_asset_ids(self, asset_ids):
+        return True
+
+    def validate_asset_sys_user_id_pair(self, asset_ids, sys_user_id):
         return True
 
     def resolve_system_user(self, sys_user_id):
@@ -88,6 +93,7 @@ def worker_env(monkeypatch):
     monkeypatch.setattr(config, "AI_AUTONOMY_REDIS_HOST", "192.0.2.10")
     monkeypatch.setattr(config, "AI_AUTONOMY_REDIS_PORT", 6390)
     monkeypatch.setattr(config, "AI_AUTONOMY_REDIS_PASSWORD", "fake-pass")
+    monkeypatch.setattr(config, "AI_AUTONOMY_WORKER_CONCURRENCY", 2)
     monkeypatch.setattr(config, "AI_AUTONOMY_LEASE_TTL_SECONDS", 120)
     worker.reset_celery_app()
 
@@ -124,11 +130,83 @@ def test_celery_app_uses_dedicated_broker_db1(worker_env):
     assert app.conf.task_acks_late is True
     assert app.conf.task_reject_on_worker_lost is True
     assert app.conf.worker_prefetch_multiplier == 1
+    assert app.conf.worker_pool == "prefork"
+    assert app.conf.worker_concurrency == 2
     assert app.conf.result_backend is None
     assert worker.DRIVE_RUN_TASK in app.tasks
+    assert worker.REINDEX_KNOWLEDGE_TASK in app.tasks
     assert app.tasks[worker.DRIVE_RUN_TASK].max_retries is None
     # 单例：重复获取是同一实例。
     assert worker.get_celery_app() is app
+
+
+@pytest.mark.parametrize("concurrency", [1, 4])
+def test_celery_app_uses_configured_prefork_concurrency(
+    worker_env, monkeypatch, concurrency,
+):
+    monkeypatch.setattr(
+        config, "AI_AUTONOMY_WORKER_CONCURRENCY", concurrency,
+    )
+
+    app = worker.get_celery_app()
+
+    assert app.conf.worker_pool == "prefork"
+    assert app.conf.worker_concurrency == concurrency
+
+
+def test_worker_process_init_resets_inherited_resources(monkeypatch):
+    import app.app_factory as app_factory
+    import app.core.db.database as database_mod
+
+    class _Ctx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    class _FakeFlaskApp:
+        def app_context(self):
+            return _Ctx()
+
+    class _Session:
+        def __init__(self):
+            self.removed = 0
+
+        def remove(self):
+            self.removed += 1
+
+    class _Engine:
+        def __init__(self):
+            self.dispose_kwargs = None
+
+        def dispose(self, **kwargs):
+            self.dispose_kwargs = kwargs
+
+    class _Pool:
+        def __init__(self):
+            self.disconnect_kwargs = None
+
+        def disconnect(self, **kwargs):
+            self.disconnect_kwargs = kwargs
+
+    session = _Session()
+    engine = _Engine()
+    pool = _Pool()
+    monkeypatch.setattr(app_factory, "app", _FakeFlaskApp())
+    monkeypatch.setattr(
+        database_mod, "db", SimpleNamespace(session=session, engine=engine),
+    )
+    monkeypatch.setitem(
+        sys.modules, "app.tools.redisdb",
+        SimpleNamespace(_shared_pool=pool),
+    )
+
+    worker._on_worker_process_init()
+
+    assert session.removed == 1
+    assert engine.dispose_kwargs == {"close": False}
+    assert pool.disconnect_kwargs == {"inuse_connections": True}
 
 
 def test_broker_url_without_password(worker_env, monkeypatch):
@@ -333,7 +411,14 @@ def test_drive_run_task_runs_inside_flask_app_context(
         def app_context(self):
             return _Ctx()
 
-    sentinel_session = object()
+    class _Session:
+        def __init__(self):
+            self.removed = 0
+
+        def remove(self):
+            self.removed += 1
+
+    sentinel_session = _Session()
 
     class _FakeDb:
         session = sentinel_session
@@ -359,6 +444,7 @@ def test_drive_run_task_runs_inside_flask_app_context(
     assert result.result == worker.RESULT_SKIPPED
     assert captured["session"] is sentinel_session
     assert captured["inside_context"] is True
+    assert sentinel_session.removed == 1
 
 
 def test_drive_run_task_uses_delayed_celery_retry_for_live_lease(
@@ -379,8 +465,17 @@ def test_drive_run_task_uses_delayed_celery_retry_for_live_lease(
         def app_context(self):
             return _Ctx()
 
+    class _Session:
+        def __init__(self):
+            self.removed = 0
+
+        def remove(self):
+            self.removed += 1
+
+    sentinel_session = _Session()
+
     class _FakeDb:
-        session = object()
+        session = sentinel_session
 
     monkeypatch.setattr(app_factory, "app", _FakeFlaskApp())
     monkeypatch.setattr(database_mod, "db", _FakeDb())
@@ -411,6 +506,7 @@ def test_drive_run_task_uses_delayed_celery_retry_for_live_lease(
 
     assert isinstance(captured["exc"], worker.LeaseRetryRequired)
     assert captured["countdown"] == 17
+    assert sentinel_session.removed == 1
 
 
 def test_worker_ready_scan_runs_inside_flask_app_context(
@@ -556,6 +652,12 @@ def test_dispatch_recoverable_enqueues_candidates(worker_env):
     assert fake_app.sent == [(worker.DRIVE_RUN_TASK, (queued["id"],))]
 
 
+def test_dispatch_knowledge_reindex_uses_existing_worker(worker_env):
+    fake_app = FakeCeleryApp()
+    assert worker.dispatch_knowledge_reindex(celery_app=fake_app) is True
+    assert fake_app.sent == [(worker.REINDEX_KNOWLEDGE_TASK, ())]
+
+
 def test_dispatch_recoverable_sweeps_expired_before_dispatch(worker_env):
     """启动扫描先落掉超期 draft/待审批，再投递活动 Run。"""
     session = worker_env["session"]
@@ -632,4 +734,5 @@ def test_build_default_executor_wires_the_tool_calling_planner(monkeypatch):
 
     assert result == drive_mod.RESULT_COMPLETED
     assert isinstance(captured["planner"], ToolCallingPlanner)
+    assert captured.get("role") is None
     assert captured["drive"] == ("run-x", {"lease_token": "token-x"})

@@ -13,9 +13,12 @@
 #
 # 不跳过但关注:
 #   B324: hashlib weak SHA1 (user.py:299 已用 usedforsecurity=False 修)
+#   B323: 不做全局跳过, 仅在 app/ai/monitoring.py 的 pinned request 处 #nosec
+#         (该处由管理员按监控源配置的 verify_tls 决定, 严格 bool 默认 true,
+#         是自签内网 Prometheus 的单一开关点)
 #
 # 排除目录 (与 pytest CI 一致):
-#   tests / data / _archive / app/tools/ansible_runner / frontend
+#   tests / data / _archive / frontend
 
 skips:
   - B101
@@ -30,5 +33,4 @@ exclude_dirs:
   - tests
   - data
   - _archive
-  - app/tools/ansible_runner
   - frontend

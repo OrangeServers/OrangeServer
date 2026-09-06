@@ -180,7 +180,7 @@
             <span class="panel-title">{{ $t('dashboard.panel.aiOpsExec') }}</span>
             <span class="panel-sub">Last 7 days</span>
             <div class="panel-actions">
-              <el-button text size="small" @click="$router.push('/ai-agent')">
+              <el-button text size="small" @click="$router.push('/ai-ops')">
                 <el-icon><ArrowRight /></el-icon>
               </el-button>
             </div>
@@ -405,7 +405,7 @@ const stats = ref<StatCard[]>([
     // 与侧栏「AI 运维」保持同一图标，建立视觉关联
     icon: 'Cpu',
     color: '#06B6D4',
-    route: '/ai-agent',
+    route: '/ai-ops',
   },
   { labelKey: 'dashboard.stat.users',  value: '-', sub: 'Users',    icon: 'User',   color: '#8B5CF6', route: '/user-list' },
   { labelKey: 'dashboard.stat.groups', value: '-', sub: 'Groups',   icon: 'Box',    color: '#EC4899', route: '/group-list' },

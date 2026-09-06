@@ -58,6 +58,7 @@
 | GET | `/ai/conversations` | 当前用户最近会话 |
 | POST | `/ai/conversations` | 创建会话 |
 | GET | `/ai/conversations/{id}` | 会话、消息、工具事件和动作状态 |
+| PATCH | `/ai/conversations/{id}` | 更新当前用户会话的自治任务权限档案 |
 | DELETE | `/ai/conversations/{id}` | 删除当前用户会话 |
 | GET | `/ai/results/{id}` | 当前用户的权威结果集分页 |
 
@@ -66,7 +67,8 @@
 ```json
 {
   "provider_code": "siliconflow",
-  "context_mode": "standard_256k"
+  "context_mode": "standard_256k",
+  "autonomy_mode": "ask"
 }
 ```
 
@@ -74,6 +76,23 @@
 
 - `standard_256k`
 - `deep_diagnostic_1m`
+
+`autonomy_mode` 可用 `ask`、`ai_review`、`auto` 或 `custom`，省略时固定为安全默认值
+`ask`。`custom` 必须同时提交服务端固定类别组成的档案：
+
+```json
+{
+  "autonomy_mode": "custom",
+  "autonomy_profile": {
+    "action_categories": ["file_read", "systemd"]
+  }
+}
+```
+
+非 `custom` 模式不得提交 `autonomy_profile`。`PATCH /ai/conversations/{id}` 使用同一
+请求形状且只修改档案；跨 owner 会按不存在处理。列表和详情返回服务端保存的
+`autonomy_mode` 与 `autonomy_profile`。旧会话缺少字段时按 `ask` 读取。档案保存在现有
+Redis 会话状态中，不引入数据库迁移。
 
 会话详情支持 `?action_summary=1`，只返回最近动作摘要，供运行中轮询使用。结果集
 支持 `page` 和 `page_size`，其中 `page_size` 范围为 1–100。
@@ -118,28 +137,98 @@ Run 的权威状态为 `queued`、`running`、`completed`、`partial`、`failed`
 
 详情见 [受控只读诊断](DIAGNOSTICS.md)。
 
+## M2 告警与运维态势 API
+
+| 方法 | 路径 | 调用方 | 说明 |
+|---|---|---|---|
+| GET | `/ai/ops/status` | admin/user | 返回当前用户可见的待处理告警、活动/排队 Run、最近结论、Worker 容量和知识索引状态 |
+| POST | `/ai/ops/alertmanager/webhook` | Alertmanager | 使用独立 Bearer Token；单条 `firing` 幂等创建并启动 `ask` Run，`resolved` 只追加 Evidence |
+
+`GET /ai/autonomous-runs` 对 Alertmanager Run 额外返回可空的 `alert_state` 和
+`alert_updated_at`。`alert_state` 取该 Run 最新已记录的 `alert_firing` 或
+`alert_resolved` 事件，值为 `firing | resolved`；它表示告警源当前状态，不等同于 Run
+的 `status` 或 `outcome`。非告警 Run 不返回这两个附加字段。列表先返回所有进入当前
+有界窗口的活动 Run，再返回按创建时间倒序的近期终态 Run；默认最多 50 条，服务端硬上限
+200 条，因此该接口不是完整历史归档。
+
+Webhook 最大 256 KiB，首版每次只接受一条 Alertmanager alert。标签必须包含
+`ogs_host_id`、`ogs_system_user_id` 和 `service`（或 `alertname`）；服务端会重新验证
+固定管理员、资产、系统凭据和授权关系。幂等键由 `groupKey + startsAt` 计算，调用方
+不能指定 Run owner、执行模式或权限。配置 Prometheus 时还必须提供 `instance` 和
+`job`，缺失时整条告警会被拒绝，不会静默跳过指标证据。
+
+配置 Prometheus 后，服务端只执行固定的服务可用性模板：最近 15 分钟、30 秒步长、
+5 秒超时且最多保留 1000 个样本。Webhook 和模型都不能提供 URL、Header 或任意
+PromQL。返回的 Evidence/Artifact 不包含 Prometheus 地址、认证信息或原始指标标签。
+
+## M2 运维知识 API
+
+MySQL 保存文档正文和版本，Redis DB0 中的 chunk/vector 是可删除并重建的派生索引；
+配置接口永不返回 API Key 明文。普通用户只能读取获授权范围的来源元数据、索引健康
+和检索结果；配置、正文、增删改、重建和 Run 知识沉淀仍仅管理员可用。
+
+| 方法 | 路径 | 角色 | 说明 |
+|---|---|---|---|
+| GET/PATCH | `/ai/knowledge/config` | admin | 读取或更新本地/远程 embedding 配置；模型或维度变化将索引标记为 `stale` |
+| GET | `/ai/knowledge/documents` | admin/user | 列出获授权范围的来源元数据，不返回正文 |
+| POST | `/ai/knowledge/documents` | admin | 新增管理员审核的 Markdown Runbook |
+| POST | `/ai/knowledge/documents/preview` | admin | 接收一个 multipart `file`，把 Markdown/TXT/PDF/DOCX 转为待审阅 Markdown；不保存原文件或文档 |
+| GET/PATCH/DELETE | `/ai/knowledge/documents/{id}` | admin | 读取正文、更新版本或删除文档 |
+| POST | `/ai/knowledge/search` | admin/user | 在服务端验证的 `global` 与获授权 `host:*` 范围检索；查询最多 512 字符，最多返回 8 条 |
+| POST | `/ai/knowledge/reindex` | admin | 向现有 Celery Worker 提交重建任务，返回 `202`；最多生成 20,000 个 Redis 向量分片 |
+| POST | `/ai/autonomous-runs/{run_id}/knowledge` | admin | 将当前管理员拥有、已解决且独立验证通过的 Run 沉淀为审核知识 |
+
+上传文件最大 10 MiB，转换后的 Markdown 仍受单文档 1 MiB 限制。图片型 PDF 不启用
+OCR，无法提取文字时接口会明确报错。管理员审阅预览后，仍通过文档新增接口保存正文；
+服务端不持久化上传的原始二进制。
+
+固定边界为：单文档 1 MiB、分片 400 字符并重叠 60、检索最多 8 条、注入模型上下文
+最多 16 KiB。只允许 `runbook` 和 `verified_run` 来源。列表接口不返回正文；读取或编辑
+时使用单文档接口。索引状态为 `empty | ready | stale | rebuilding | error`，只有
+`ready` 且文档版本、模型及索引布局 fingerprint 一致时才返回引用；布局变化会
+自动显示为 `stale`，重建完成前不会查询旧布局。
+
+检索响应固定包含 `results`、`count` 和本次请求实际使用的 `index_state`。客户端必须用同一
+响应中的状态区分“索引未就绪”和“索引就绪但没有匹配”，不能用此前缓存的状态把失败显示成
+零结果。
+
+检索由 RedisVL 在统一 Redis 索引内分别执行 BM25 与 embedding 向量检索，两路候选窗口
+均固定为 32，再用确定性的 reciprocal rank fusion 合并并按上述范围、版本和总量边界返回
+引用。它不是模型重排，也不会调用聊天模型；
+只有离线质量样本证明融合不足时才考虑增加 CrossEncoder。
+
+文档范围只接受 `global` 或 `host:<资产 ID>`。聊天检索默认使用 `global`；工具参数提供
+当前用户有权访问的 `host_id` 或精确 `host_alias` 时，也使用对应资产范围。Autonomy
+Planner 仅使用 `global` 和当前 Run 的目标资产范围。
+
+聊天提供 `search_knowledge` 工具。Autonomy Planner 会用 Run 目标检索最多 4 条
+引用；系统提示固定说明这些引用只供假设，不能授权远程动作，也不能替代本次 Run 的
+实时 Evidence 和独立验证。
+
 ## M1 自治任务 API
 
-自治接口只对管理员开放。标准 bundled 栈启动专用 Redis 与 Worker，默认可用。
+管理员和普通用户都可以在各自已授权的资产与系统凭据范围内管理自己创建的 Run；
+跨 owner 访问保持拒绝。标准 bundled 栈启动统一 Redis 8 与 Worker，默认可用。
 未同时满足进程启用、checkpoint 和 Worker 就绪条件时，Run 不能启动。聊天只拥有
-创建草稿引用卡的能力，不能启动、审批或取消 Run。
+创建草稿引用卡的能力，启动、审批和取消仍通过工作台调用既有 Run 接口。
 
 ### 就绪状态与生命周期
 
 | 方法 | 路径 | 角色 | 说明 |
 |---|---|---|---|
-| GET | `/ai/autonomy/status` | admin/user | 返回 `enabled`、专用 Redis 配置、checkpoint、Worker 和 `ready` 布尔值，以及固定 `reason` 码 |
-| POST | `/ai/autonomous-runs` | admin | 校验目标资产、系统用户、模式和预算，创建 `draft` |
-| GET | `/ai/autonomous-runs` | admin | 当前管理员的 Run 列表 |
-| GET | `/ai/autonomous-runs/{run_id}` | admin | 当前管理员的权威快照、步骤和 `allowed_operations` |
-| POST | `/ai/autonomous-runs/{run_id}/start` | admin | 重新校验边界后将 `draft` 排入执行 |
-| POST | `/ai/autonomous-runs/{run_id}/cancel` | admin | 请求取消；远端停止被确认前不会虚报 `cancelled` |
+| GET | `/ai/autonomy/status` | admin/user | 返回 `enabled`、Redis checkpoint、Worker pool/并发和 `ready` 布尔值，以及固定 `reason` 码 |
+| GET | `/ai/autonomy/system-users` | admin/user | 返回当前 owner 获授权的系统凭据 `id` 与 `alias`；不返回登录名、密钥、密码或备注 |
+| POST | `/ai/autonomous-runs` | admin/user | 校验目标资产、系统用户组合授权、模式和预算，创建 `draft` |
+| GET | `/ai/autonomous-runs` | admin/user | 当前用户拥有的 Run 列表 |
+| GET | `/ai/autonomous-runs/{run_id}` | admin/user | 当前用户拥有 Run 的权威快照、步骤和 `allowed_operations` |
+| POST | `/ai/autonomous-runs/{run_id}/start` | admin/user | 重新校验资产与系统凭据组合授权后将 `draft` 排入执行 |
+| POST | `/ai/autonomous-runs/{run_id}/cancel` | admin/user | 请求取消；跨 owner 拒绝，远端停止被确认前不会虚报 `cancelled` |
 | POST | `/ai/autonomous-runs/{run_id}/steps` | admin | 提议服务端固定探针，不接受任意 Shell 作为探针参数 |
-| POST | `/ai/autonomous-runs/{run_id}/steps/{step_id}/decision` | admin | 对服务端返回的待审批 Step 作 `approve` 或 `reject` 决策 |
-| GET | `/ai/autonomous-runs/{run_id}/artifacts` | admin | 获取本 Run 的脱敏 Artifact 元数据 |
-| GET | `/ai/autonomous-runs/{run_id}/artifacts/{artifact_id}` | admin | 读取单条未过期 Artifact 的解密正文 |
-| GET | `/ai/autonomous-runs/{run_id}/evidence` | admin | 获取本 Run 的不可信 Evidence 引用 |
-| GET | `/ai/autonomous-runs/{run_id}/stream` | admin | 按事件序号续传 SSE；支持 `after_seq` 或 `Last-Event-ID` |
+| POST | `/ai/autonomous-runs/{run_id}/steps/{step_id}/decision` | admin/user | 对自己 Run 的待审批 Step 作 `approve` 或 `reject` 决策，副作用前再次验证授权 |
+| GET | `/ai/autonomous-runs/{run_id}/artifacts` | admin/user | 获取自己 Run 的脱敏 Artifact 元数据 |
+| GET | `/ai/autonomous-runs/{run_id}/artifacts/{artifact_id}` | admin/user | 读取自己 Run 的单条未过期 Artifact 解密正文 |
+| GET | `/ai/autonomous-runs/{run_id}/evidence` | admin/user | 获取自己 Run 的不可信 Evidence 引用 |
+| GET | `/ai/autonomous-runs/{run_id}/stream` | admin/user | 按事件序号续传 SSE；支持 `after_seq` 或 `Last-Event-ID` |
 | POST | `/ai/autonomy/hosts/{host_id}/environment` | admin | 设置资产的 `production`、`staging` 或 `lab` 环境 |
 
 创建草稿：
@@ -177,10 +266,16 @@ Run 的权威状态为 `queued`、`running`、`completed`、`partial`、`failed`
 
 ### 快照、事件和结论
 
-Run 快照包含目标和凭据的服务端绑定、权限模式、预算、状态、三态结论、`revision`、
+Run 快照包含目标和凭据的服务端绑定、权限模式、预算、状态、三态结论、`trigger_type`、
+脱敏的 `trigger_summary`、`revision`、
 `graph_version`、最新事件序号、取消请求和时间戳；每个 Step 包含 `kind`、状态、顺序、
-人类可读摘要、动作 digest 和受限备注。`GET /ai/autonomous-runs/{run_id}` 返回的
-`steps` 按 `seq` 排序，`allowed_operations` 为空表示当前没有待决策操作。
+人类可读摘要、动作 digest 和受限备注；待审批计划还返回从签名快照生成的
+`plan_actions` 完整动作参数，操作者不需要从被截断的模型摘要猜测实际动作。参数不含
+凭据引用；文件补丁内容命中常见密码、Token、Authorization 或私钥模式时服务端直接拒绝。
+`GET /ai/autonomous-runs/{run_id}` 返回的
+`steps` 按 `seq` 排序，`allowed_operations` 为空表示当前没有待决策操作。Run 在生成任何
+Step 前失败时，快照还会返回可选的、有界脱敏 `failure_reason`，供首屏显示直接阻塞原因；
+它不改变 Run 状态或结论语义。
 
 状态集合：
 
@@ -195,22 +290,61 @@ SSE 事件使用 MySQL 内的 Run 级单调 `sequence`。客户端断线后应�
 
 结论由服务端 Planner/Worker 写入，不提供客户端直接改写结论的接口。`resolved` 必须
 至少引用同一 Run 的 `verification_observation`；存在 `outcome_unknown` 写动作或缺少
-独立验证时，服务端会降级为 `inconclusive`，绝不自动重放写动作。
+独立验证时，服务端会降级为 `inconclusive`，绝不自动重放写动作。`conclusion`
+对新结论固定包含已确认事实、影响范围、根因假设、置信度、未知项、推荐动作、最终
+状态和同 Run Evidence ID 引用；所有文本和列表均有服务端上限并经过凭据脱敏。rev59
+以前已结束的历史 Run 没有这些字段时，`conclusion` 为 `null`。
 
-### M1 持久化数据结构
+### 监控数据源与资产映射
+
+管理员通过以下接口配置只读监控来源，并将 OrangeServer 资产与外部身份显式绑定：
+
+| 方法与路径 | 权限 | 用途 |
+|---|---|---|
+| `GET\|POST /ai/admin/monitoring-sources` | admin | 列出或新增 Prometheus、Grafana、Loki、Zabbix 来源 |
+| `PUT\|DELETE /ai/admin/monitoring-sources/{id}` | admin | 更新或删除来源；Token 留空表示保留原值 |
+| `POST /ai/admin/monitoring-sources/{id}/test` | admin | 验证服务与 Token 的只读访问能力 |
+| `GET /ai/admin/monitoring-sources/{id}/discover?host_id={id}` | admin | 返回与资产名称/IP 匹配的候选外部身份 |
+| `GET /ai/admin/monitoring-mappings?host_id={id}` | admin | 查看已确认映射 |
+| `PUT /ai/admin/monitoring-sources/{sourceId}/hosts/{hostId}` | admin | 确认一个来源的资产映射 |
+| `GET /ai/monitoring/sources?host_id={id}` | admin/user | 查看当前用户对该资产可用的来源元数据 |
+
+Token 只以 Fernet 密文保存，所有读取接口仅返回 `token_configured`。Grafana 映射保存
+Data Source UID、底层类型和身份标签；接口不会返回 Grafana 数据源 URL 或安全字段。
+聊天先用 `discover_monitoring` 枚举已授权资产的指标、日志标签、Grafana 面板和 Zabbix
+监控项，再按需要反复调用 `query_prometheus`、`query_loki`、`query_grafana_panel` 与
+`query_zabbix_history`。模型只提交来源 ID 和结构化查询参数；服务端重新验证资产映射，
+自动加入资产标签，并固定 URL、Header、Zabbix method、时间窗、步长、超时和返回上限。
+Prometheus 查询由指标、时序函数和聚合字段生成，Loki 查询只允许在映射日志流中进行
+文本或正则过滤；Grafana 只执行管理员映射 Dashboard 中已有的 Panel 查询。
+
+发现结果保存为 `monitoring_catalog`，每次查询保存为 `monitoring_observation`。查询入口
+最多返回 100 条日志、100 个序列和 1000 个时序值；在该边界内，实际查询、标签、时间戳、
+完整日志行、时序点、Panel Frame 或 Zabbix Item 会同时提供给模型和结果检查器。仅凭据、
+授权头、Cookie、私钥和控制字符会被脱敏，不能把原始证据压缩成只有 min/max/latest。
+`POST /ai/chat` 可携带 `monitoring_source_types` 数组；服务端仅接受唯一的
+`prometheus`、`grafana`、`loki`、`zabbix` 值，并覆盖模型在本轮工具调用中的来源选择。
+单次发现最多检查 100 个已确认映射；超限会明确拒绝，不会静默截断来源。
+
+### M1/M2 持久化数据结构
 
 全新安装由 `backend/mysqldir/orange.sql` 一次创建；已有实例按
-[统一升级流程](../operations/UPGRADE.md) 依次执行 rev53、rev54、rev55、rev56。表是
-业务事实源，Redis 8 只保存 LangGraph checkpoint 和 Celery broker 数据。
+[统一升级流程](../operations/UPGRADE.md) 依次执行 rev53、rev54、rev55、rev56、rev57、
+rev58、rev59、rev60、rev61。表是业务事实源，Redis 8 保存 LangGraph checkpoint、Celery broker 和可重建
+知识向量。
 
 | 表/字段 | 用途 | 关键约束 |
 |---|---|---|
 | `t_host.ai_environment` | 资产环境 | `production\|staging\|lab`，默认 `production`，仅管理员维护 |
-| `t_ai_autonomous_run` | Run 权威快照 | 目标资产/系统用户、`mode`/`custom_profile_json`、状态/结论、预算、`revision`/事件游标、租约 fencing、心跳和 `graph_version`；活动状态按 `active_host_id` 唯一约束封住同资产并行 Run |
+| `t_ai_autonomous_run` | Run 权威快照 | 目标资产/系统用户、`mode`/`custom_profile_json`、触发类型/幂等引用/脱敏摘要、状态/`conclusion_json`、预算、`revision`/事件游标、租约 fencing、心跳和 `graph_version`；活动状态按 `active_host_id` 唯一约束封住同资产并行 Run |
 | `t_ai_autonomous_step` | 有序计划、动作和验证 | `(run_id, seq)` 唯一；保存不可变动作摘要/digest、审批状态和有限备注 |
 | `t_ai_autonomous_event` | Run 内追加式事件 | `(run_id, sequence)` 唯一且单调；payload 不保存凭据 |
 | `t_ai_autonomous_artifact` | 加密执行产物 | 输出清洗、脱敏、限长后以 Fernet 密文保存；正文单条读取并按 `expires_at` 过期 |
 | `t_ai_autonomous_evidence` | 观察索引 | 只保存有界摘要和同 Run Artifact ID 列表；`trusted` 恒为 `0`，不是结论凭据 |
+| `t_ai_embedding_config` | embedding 与索引状态 | 单例配置；远程 API Key 为 Fernet 密文，模型 fingerprint 绑定索引版本 |
+| `t_ai_knowledge_document` | 已审核知识正文 | MySQL 保存正文、来源、版本、范围和 hash；Redis 不作为文档事实源 |
+| `t_ai_monitoring_source` | 只读监控来源 | 地址、类型、TLS 策略和加密 Token；配置接口不回显 Token |
+| `t_ai_monitoring_host_mapping` | 外部资产身份 | `(source_id, host_id)` 唯一；只保存管理员确认的标签、Grafana UID 或 Zabbix hostid |
 
 凭据、完整 Prompt、完整远端输出和可复用的授权不会写入 Graph State、Event payload
 或 Evidence 摘要。所有读取接口都会重新检查当前管理员和 Run 所有权；跨 Run 的
@@ -245,13 +379,13 @@ data: {"type":"assistant.delta","run_id":"...","content":"..."}
 | `assistant.delta` | `run_id`, `content` | 模型文本增量 |
 | `tool.started` | `id`, `tool`, `arguments` | 工具开始 |
 | `tool.completed` | `id`, `tool`, `result`/`error` | 同一工具完成 |
-| `approval.required` | `action_id`, `expires_at` | 需要用户确认 |
 | `diagnostic_started` | `event_seq`, `run_id`, `profile_id` | 只读诊断开始 |
 | `diagnostic_progress` | `event_seq`, `run_id`, `asset` | 逐资产探针进度 |
 | `diagnostic_evidence` | `event_seq`, `run_id`, `evidence_id` | 新证据已保存 |
 | `diagnostic_completed` | `event_seq`, `run_id`, `report` | 完成或部分完成 |
 | `diagnostic_failed` | `event_seq`, `run_id`, `message` | 失败或取消 |
-| `run.completed` | `waiting_for_approval` | 本轮正常结束 |
+| `autonomy.draft_created` | `run_id`, `goal`, `status`, `mode`, `action_categories?` | 已创建自治任务草稿；`custom` 额外返回动作类别 |
+| `run.completed` | `conversation_id` | 本轮正常结束 |
 | `run.failed` | `message` | 本轮失败 |
 
 `tool.started` 和对应的 `tool.completed` 使用相同 `id`。客户端应更新同一条时间线
@@ -259,40 +393,23 @@ data: {"type":"assistant.delta","run_id":"...","content":"..."}
 会话详情和诊断 Run 快照。诊断事件带递增 `event_seq`，Run 的
 `latest_event_seq` 可用于客户端判断快照新旧；当前没有公开事件重放接口。
 
-同一会话一次只允许一个运行锁；单轮最多执行有限个工具步骤，同一轮最多创建一个
-待审批批量动作。
-
-## 动作审批
-
-| 方法 | 路径 | 响应 |
-|---|---|---|
-| POST | `/ai/actions/{id}/approve` | SSE |
-| POST | `/ai/actions/{id}/cancel` | JSON |
-
-审批 SSE：
-
-| 事件 | 关键字段 | 含义 |
-|---|---|---|
-| `action.progress` | `action_id`, `alias`, `status`, `output`, `error` | 单资产进度 |
-| `action.completed` | `summary`, `outcome`, `results`, `status` | 最终聚合结果 |
-| `run.completed` | `action_id` | 审批流完成 |
-| `run.failed` | `action_id`, `message` | 校验或执行失败 |
-
-`action.completed.results` 只返回资产别名，不返回主机 ID/IP。单项输出限制为 8,192
-字符，错误限制为 2,048 字符；截断项带 `truncated: true`。
-
-审批不是对模型建议的盲信。服务端会原子认领动作并重新验证所有权、有效期、
-`result_set_id`、资产权限、系统用户权限、目标数量和危险命令规则。
+同一会话一次只允许一个运行锁，单轮最多执行有限个工具步骤。聊天工具只提供查询、
+固定只读诊断和 `create_autonomy_draft`；所有远程写操作必须进入 Autonomy Run，
+聊天侧没有启动、审批、取消或执行接口。`create_autonomy_draft` 的模型工具参数只有目标、
+资产 ID 和系统凭据 ID，不接受 `mode` 或权限档案；Agent 获取会话运行锁后再从服务端会话
+状态捕获权限快照，模型提交额外权限字段会被拒绝。档案更新复用同一把锁，运行期间返回
+`409`，避免覆盖消息或使用过期档案。Runner 在模型与工具阶段按 token 原子续租，释放时
+也只会原子删除自己的 token，不会误删后继运行的锁。同一会话之后修改档案只影响后续
+新建草稿，不会修改已有草稿或 Run。
 
 ## 保留和并发
 
 - AI 会话和结果集默认 TTL：7 天。
 - 每用户最多会话：20。
-- 待审批动作默认 TTL：10 分钟。
 - 会话展示事件最多保留最近 200 条。
 - 诊断原始证据默认写入 7 天到期时间，过期后证据接口不再返回；结构化报告、
   Run 快照和事件默认在 90 天后级联删除。管理员可通过环境变量调整两类保留期。
-- 会话删除时如果仍有待审批动作会返回冲突。
+- 删除会话会同时删除其临时结果集；已经创建的 Autonomy Run 不属于聊天临时状态。
 
 ## OpenAPI
 

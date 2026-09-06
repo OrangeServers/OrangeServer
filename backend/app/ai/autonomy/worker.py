@@ -2,8 +2,8 @@
 """M1/S2: 自治执行的 Celery Worker 接线与任务契约。
 
 设计要点：
-- 自治专用 Redis 8 的 DB 1 作为 broker（DB 0 留给 checkpoint），
-  与业务 Redis 7 完全隔离；功能关闭或接线未完成时不构建 Celery
+- Redis 8 的 DB 1 作为 broker（DB 0 留给 checkpoint/向量，DB 2
+  用于业务缓存）；功能关闭或接线未完成时不构建 Celery
   应用，现有聊天、诊断和批量审批不受影响。
 - 任务只携带 run_id，按至少一次投递设计：task_acks_late +
   worker 丢失时 reject 重投，重复投递的并行安全由 lease.claim_run
@@ -19,9 +19,10 @@ import logging
 import math
 import os
 import socket
+import sys
 
 from celery import Celery
-from celery.signals import worker_ready
+from celery.signals import worker_process_init, worker_ready
 
 from app.ai.autonomy.readiness import autonomy_redis_url
 from app.core import config
@@ -29,6 +30,7 @@ from app.core import config
 logger = logging.getLogger('autonomy_worker')
 
 DRIVE_RUN_TASK = 'ogs.autonomy.drive_run'
+REINDEX_KNOWLEDGE_TASK = 'ogs.knowledge.reindex'
 RECOVERY_SCAN_INTERVAL_SECONDS = 30
 
 RESULT_CLAIMED = 'claimed'
@@ -75,13 +77,77 @@ def _has_live_claimable_lease(state, now=None):
 
 
 def autonomy_broker_url() -> str:
-    """自治专用 broker：专用 Redis 8 的 DB 1。"""
+    """自治 broker：统一 Redis 8 的 DB 1。"""
     return autonomy_redis_url(1)
 
 
 def worker_identity() -> str:
     """租约持有者标识：主机名 + PID，截断到列宽。"""
     return ('%s-%d' % (socket.gethostname(), os.getpid()))[:64]
+
+
+def _remove_db_session(db) -> None:
+    """Discard the current Flask-SQLAlchemy scoped session if available."""
+    session = getattr(db, 'session', None)
+    remove = getattr(session, 'remove', None)
+    if not callable(remove):
+        return
+    try:
+        remove()
+    except Exception:
+        logger.exception('autonomy worker database session cleanup failed')
+
+
+def _reset_inherited_client_state() -> None:
+    """Close client-pool sockets copied across the prefork boundary.
+
+    The business Redis module owns a process-wide pool.  Do not import it
+    here: if the child has not used that client yet, creating a pool merely to
+    reset it is unnecessary.  A child gets a fresh connection after this
+    disconnect; the parent process keeps its own file descriptors.
+    """
+    redisdb = sys.modules.get('app.tools.redisdb')
+    pool = getattr(redisdb, '_shared_pool', None)
+    disconnect = getattr(pool, 'disconnect', None)
+    if not callable(disconnect):
+        return
+    try:
+        disconnect(inuse_connections=True)
+    except TypeError:
+        # Keep compatibility with small test doubles and older redis-py APIs.
+        try:
+            disconnect()
+        except Exception:
+            logger.exception(
+                'autonomy worker inherited Redis pool cleanup failed',
+            )
+    except Exception:
+        logger.exception('autonomy worker inherited Redis pool cleanup failed')
+
+
+def _reset_inherited_process_state() -> None:
+    """Dispose inherited DB connections and process-local client state."""
+    try:
+        from app.app_factory import app as flask_app
+        from app.core.db.database import db
+
+        with flask_app.app_context():
+            _remove_db_session(db)
+            engine = getattr(db, 'engine', None)
+            dispose = getattr(engine, 'dispose', None)
+            if callable(dispose):
+                # close=False leaves the parent's pool untouched while
+                # replacing the child's inherited pool.
+                dispose(close=False)
+    except Exception:
+        logger.exception('autonomy worker process state reset failed')
+    _reset_inherited_client_state()
+
+
+@worker_process_init.connect
+def _on_worker_process_init(**kwargs):
+    """Reset fork-inherited resources before a prefork child handles work."""
+    _reset_inherited_process_state()
 
 
 def get_celery_app():
@@ -97,6 +163,8 @@ def get_celery_app():
             task_acks_late=True,
             task_reject_on_worker_lost=True,
             worker_prefetch_multiplier=1,
+            worker_pool='prefork',
+            worker_concurrency=config.AI_AUTONOMY_WORKER_CONCURRENCY,
             broker_connection_retry_on_startup=True,
             result_backend=None,
         )
@@ -130,6 +198,20 @@ def _register_tasks(app):
                 raise self.retry(
                     exc=exc, countdown=exc.retry_after_seconds,
                 )
+            finally:
+                _remove_db_session(db)
+
+    @app.task(name=REINDEX_KNOWLEDGE_TASK)
+    def reindex_knowledge():
+        from app.app_factory import app as flask_app
+        from app.ai.knowledge import KnowledgeService
+        from app.core.db.database import db
+
+        with flask_app.app_context():
+            try:
+                return KnowledgeService(db.session).reindex()
+            finally:
+                _remove_db_session(db)
 
 
 def build_default_executor(session):
@@ -174,6 +256,15 @@ def dispatch_drive_run(run_id, celery_app=None):
     if celery_app is None:
         return False
     celery_app.send_task(DRIVE_RUN_TASK, args=[run_id])
+    return True
+
+
+def dispatch_knowledge_reindex(celery_app=None):
+    if celery_app is None:
+        celery_app = get_celery_app()
+    if celery_app is None:
+        return False
+    celery_app.send_task(REINDEX_KNOWLEDGE_TASK)
     return True
 
 
@@ -262,6 +353,9 @@ def _run_recovery_scan():
 
     try:
         with flask_app.app_context():
-            dispatch_recoverable(db.session)
+            try:
+                dispatch_recoverable(db.session)
+            finally:
+                _remove_db_session(db)
     except Exception:
         logger.exception('autonomy recovery scan failed')

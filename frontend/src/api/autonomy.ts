@@ -5,9 +5,10 @@
 //   且 Last-Event-ID 是浏览器禁止手动设置的请求头，续传统一走 after_seq 参数
 //   （后端两者同语义，Last-Event-ID 优先）。
 // =============================================================================
-import { aiJsonRequest, parseEventBlock } from '@/utils/aiStream'
+import { aiFormRequest, aiJsonRequest, parseEventBlock } from '@/utils/aiStream'
 import { t } from '@/i18n'
 import type {
+  AIOpsStatus,
   AutonomyArtifact,
   AutonomyArtifactDetail,
   AutonomyCreateRunPayload,
@@ -18,6 +19,11 @@ import type {
   AutonomyReadiness,
   AutonomyRun,
   AutonomySnapshot,
+  KnowledgeDocument,
+  KnowledgeDocumentPayload,
+  KnowledgeDocumentPreview,
+  KnowledgeEmbeddingConfig,
+  KnowledgeSearchResponse,
 } from '@/types/autonomy'
 
 const BASE = '/ai/autonomous-runs'
@@ -31,6 +37,95 @@ async function envelopeData<T>(promise: Promise<AutonomyEnvelope<T>>): Promise<T
 /** 功能与基础设施就绪度（不受 flag 阻断，user 角色也可读） */
 export function getAutonomyStatus(): Promise<AutonomyReadiness> {
   return envelopeData(aiJsonRequest<AutonomyEnvelope<AutonomyReadiness>>('/ai/autonomy/status'))
+}
+
+/** 当前运维用户可见的 AIOps 聚合状态。 */
+export function getAIOpsStatus(): Promise<AIOpsStatus> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<AIOpsStatus>>('/ai/ops/status'))
+}
+
+/** 当前 owner 经服务端权限过滤后的 Run 凭据选项。 */
+export async function listAutonomySystemUsers(): Promise<Array<{ id: number; alias: string }>> {
+  const data = await envelopeData(aiJsonRequest<AutonomyEnvelope<{
+    system_users: Array<{ id: number; alias: string }>
+  }>>('/ai/autonomy/system-users'))
+  return data.system_users || []
+}
+
+const KNOWLEDGE_BASE = '/ai/knowledge'
+
+export function getKnowledgeConfig(): Promise<KnowledgeEmbeddingConfig> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeEmbeddingConfig>>(`${KNOWLEDGE_BASE}/config`))
+}
+
+export function saveKnowledgeConfig(
+  payload: Partial<KnowledgeEmbeddingConfig> & { api_key?: string },
+): Promise<KnowledgeEmbeddingConfig> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeEmbeddingConfig>>(
+    `${KNOWLEDGE_BASE}/config`, { method: 'PATCH', body: { ...payload } },
+  ))
+}
+
+export async function listKnowledgeDocuments(): Promise<KnowledgeDocument[]> {
+  const data = await envelopeData(aiJsonRequest<AutonomyEnvelope<{ documents: KnowledgeDocument[] }>>(
+    `${KNOWLEDGE_BASE}/documents`,
+  ))
+  return data.documents || []
+}
+
+export function getKnowledgeDocument(documentId: string): Promise<KnowledgeDocument> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeDocument>>(
+    `${KNOWLEDGE_BASE}/documents/${encodeURIComponent(documentId)}`,
+  ))
+}
+
+export function createKnowledgeDocument(payload: KnowledgeDocumentPayload): Promise<KnowledgeDocument> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeDocument>>(
+    `${KNOWLEDGE_BASE}/documents`, { method: 'POST', body: { ...payload } },
+  ))
+}
+
+export function previewKnowledgeDocument(file: File): Promise<KnowledgeDocumentPreview> {
+  const body = new FormData()
+  body.append('file', file)
+  return envelopeData(aiFormRequest<AutonomyEnvelope<KnowledgeDocumentPreview>>(
+    `${KNOWLEDGE_BASE}/documents/preview`, body,
+  ))
+}
+
+export function updateKnowledgeDocument(
+  documentId: string,
+  payload: Partial<KnowledgeDocumentPayload>,
+): Promise<KnowledgeDocument> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeDocument>>(
+    `${KNOWLEDGE_BASE}/documents/${encodeURIComponent(documentId)}`,
+    { method: 'PATCH', body: { ...payload } },
+  ))
+}
+
+export function deleteKnowledgeDocument(documentId: string): Promise<{ deleted: boolean }> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<{ deleted: boolean }>>(
+    `${KNOWLEDGE_BASE}/documents/${encodeURIComponent(documentId)}`,
+    { method: 'DELETE' },
+  ))
+}
+
+export function reindexKnowledge(): Promise<KnowledgeEmbeddingConfig> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeEmbeddingConfig>>(
+    `${KNOWLEDGE_BASE}/reindex`, { method: 'POST', body: {} },
+  ))
+}
+
+export function searchKnowledge(query: string, limit = 8): Promise<KnowledgeSearchResponse> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeSearchResponse>>(
+    `${KNOWLEDGE_BASE}/search`, { method: 'POST', body: { query, limit } },
+  ))
+}
+
+export function captureRunKnowledge(runId: string): Promise<KnowledgeDocument> {
+  return envelopeData(aiJsonRequest<AutonomyEnvelope<KnowledgeDocument>>(
+    `${BASE}/${encodeURIComponent(runId)}/knowledge`, { method: 'POST', body: {} },
+  ))
 }
 
 /** 当前用户的 Run 列表（owner 隔离） */

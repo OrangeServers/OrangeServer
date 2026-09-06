@@ -18,6 +18,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 from setup import checks, envwrite, security, state
+from setup.spa import register_spa
 
 BUSINESS_PREFIXES = ('/local', '/account', '/server', '/mail', '/auth', '/ai')
 ADMIN_MIN_PASSWORD = 8
@@ -164,6 +165,7 @@ def create_setup_app() -> Flask:
         return jsonify({'ok': False, 'msg': 'unknown setup endpoint'}), 404
 
     _register_business_catchall(app)
+    register_spa(app)
     return app
 
 
@@ -313,4 +315,5 @@ def create_maintenance_app(error: BaseException | None = None) -> Flask:
             '%s/<path:_rest>' % prefix, 'maint_catchall_%d' % index,
             unavailable, methods=['GET', 'POST', 'PUT', 'DELETE'],
         )
+    register_spa(app)
     return app

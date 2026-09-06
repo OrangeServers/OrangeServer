@@ -67,10 +67,12 @@ def test_adapter_aggregates_fragmented_stream_tool_calls():
     chunks = [
         _ns(choices=[_ns(delta=_ns(
             content="准备查询",
+            reasoning_content="先检查",
             tool_calls=None,
         ))]),
         _ns(choices=[_ns(delta=_ns(
             content=None,
+            reasoning_content="资产范围",
             tool_calls=[
                 _ns(
                     index=0,
@@ -81,6 +83,7 @@ def test_adapter_aggregates_fragmented_stream_tool_calls():
         ))]),
         _ns(choices=[_ns(delta=_ns(
             content=None,
+            reasoning_content=None,
             tool_calls=[
                 _ns(
                     index=0,
@@ -104,6 +107,7 @@ def test_adapter_aggregates_fragmented_stream_tool_calls():
     )
 
     assert result.content == "准备查询"
+    assert result.reasoning_content == "先检查资产范围"
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0].id == "call_asset"
     assert result.tool_calls[0].name == "search_assets"
@@ -147,6 +151,35 @@ def test_adapter_retries_once_without_stream_when_streaming_is_incompatible():
     assert [call["stream"] for call in completions.calls] == [True, False]
     assert result.used_stream is False
     assert result.tool_calls[0].arguments == {"online": True}
+
+
+def test_adapter_keeps_non_stream_reasoning_content_for_tool_roundtrip():
+    from app.ai.provider import OpenAICompatibleAdapter
+
+    message = _ns(
+        content=None,
+        reasoning_content="需要先读取服务状态",
+        tool_calls=[_ns(
+            id="call_probe",
+            function=_ns(name="run_diagnostic", arguments="{}"),
+        )],
+    )
+    response = _ns(choices=[_ns(message=message)])
+    completions = _FakeCompletions(
+        stream_error=RuntimeError("stream unsupported"),
+        non_stream_response=response,
+    )
+    adapter = OpenAICompatibleAdapter(
+        api_key="sk-test",
+        base_url="https://example.test/v1",
+        model="deepseek-chat",
+        client_factory=lambda **_: _fake_client(completions),
+    )
+
+    result = adapter.complete(messages=[{"role": "user", "content": "检查"}])
+
+    assert result.reasoning_content == "需要先读取服务状态"
+    assert result.tool_calls[0].name == "run_diagnostic"
 
 
 def test_public_providers_expose_configured_disabled_and_unavailable_reasons(

@@ -23,6 +23,7 @@
   /* —— Text —— */
   --ogs-text: #18181B;
   --ogs-text-secondary: #57534E;
+  --ogs-text-tertiary: #78716C;
   --ogs-text-muted: #A8A29E;
 
   /* —— Sidebar（中性炭灰，去掉蓝调） —— */
@@ -147,6 +148,7 @@
   /* —— 文字：深蓝灰（Slate 系，比 Sky 更沉稳） —— */
   --ogs-text: #0F172A;             /* Slate-900 */
   --ogs-text-secondary: #475569;   /* Slate-600 */
+  --ogs-text-tertiary: #64748B;    /* Slate-500 */
   --ogs-text-muted: #94A3B8;       /* Slate-400 */
 
   /* —— 侧边栏：深→中蓝渐变（关键变化） —— */
@@ -233,6 +235,7 @@
   --ogs-border-subtle: #1F1F1F;
   --ogs-text: #F5F5F4;
   --ogs-text-secondary: #A8A29E;
+  --ogs-text-tertiary: #A8A29E;
   --ogs-text-muted: #57534E;
   --ogs-header-bg: rgba(10, 10, 10, 0.7);
   --ogs-header-border: rgba(255, 255, 255, 0.06);
@@ -935,10 +938,14 @@ body {
   display: inline-flex;
   align-items: center; justify-content: center;
   width: 36px; height: 36px;
+  padding: 0;
+  border: 0;
   border-radius: var(--ogs-radius-sm);
   cursor: pointer;
   transition: all 0.18s ease;
   color: var(--ogs-text-secondary);
+  background: transparent;
+  font: inherit;
   font-size: 18px;
 }
 .layout-header .collapse-btn:hover {
@@ -985,9 +992,13 @@ body {
   display: inline-flex;
   align-items: center; justify-content: center;
   width: 36px; height: 36px;
+  padding: 0;
+  border: 0;
   border-radius: var(--ogs-radius-sm);
   cursor: pointer;
   color: var(--ogs-text-secondary);
+  background: transparent;
+  font: inherit;
   transition: all 0.18s ease;
   position: relative;
 }

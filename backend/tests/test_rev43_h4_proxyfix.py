@@ -34,8 +34,8 @@ class TestProxyFixInstalled:
 class TestProxyFixLayers:
     """ProxyFix x_for/x_proto/x_host 配置."""
 
-    def test_default_x_for_is_one(self):
-        """默认 OGS_PROXY_LAYERS=1 表示信任 1 层反代."""
+    def test_configured_x_for_is_one(self):
+        """测试部署显式信任 1 层反代。"""
         import init as _init  # noqa: F401
         from werkzeug.middleware.proxy_fix import ProxyFix
         from app.app_factory import app
@@ -87,11 +87,11 @@ class TestProxyFixDisabled:
     def test_layers_zero_means_no_proxy_fix(self, monkeypatch):
         """OGS_PROXY_LAYERS=0 时 ProxyFix 不包裹 (直连无反代场景).
 
-        此测试只能验证当前 app 是有 ProxyFix 的 (OGS_PROXY_LAYERS=1 默认),
+        此测试只能验证当前 app 是有 ProxyFix 的 (测试环境显式配置 1),
         因为 init.py 已在模块加载时固定 ProxyFix 设置, 不可运行时切换.
         """
         import init as _init  # noqa: F401
         from app.app_factory import app
         from werkzeug.middleware.proxy_fix import ProxyFix
-        # 当前 app 一定有 ProxyFix（OGS_PROXY_LAYERS 默认 1）
+        # 当前测试 app 一定有 ProxyFix（conftest 显式配置 1）
         assert isinstance(app.wsgi_app, ProxyFix)

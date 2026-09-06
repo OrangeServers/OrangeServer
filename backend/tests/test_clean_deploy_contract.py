@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -54,7 +55,7 @@ def test_backend_image_publish_is_guarded_while_repository_is_private():
     assert "linux/amd64" in workflow
     assert "release:" not in workflow.split("permissions:", 1)[0]
     assert "workflow_dispatch:" in workflow
-    assert "npm run build" in workflow
+    assert "context: ." in workflow
     assert "ops/build-deploy-bundle.sh" in workflow
     assert "gh release upload" in workflow
     assert "gh release view" in workflow
@@ -103,13 +104,13 @@ def test_compose_bootstrap_is_a_versioned_checksumming_thin_wrapper():
     assert "openssl rand -hex" in bootstrap
     assert "OGS_FLASK_SECRET_KEY \"\"" in bootstrap
     assert "OGS_FERNET_KEYS \"\"" in bootstrap
-    assert 'autonomy_redis_password="$(openssl rand -hex 24)"' in bootstrap
     assert 'set_key .env OGS_AI_AUTONOMY_ENABLED true' in bootstrap
-    assert 'set_key .env OGS_AI_AUTONOMY_REDIS_HOST autonomy-redis' in bootstrap
+    assert 'set_key .env OGS_AI_AUTONOMY_REDIS_HOST redis' in bootstrap
     assert (
         'set_key .env OGS_AI_AUTONOMY_REDIS_PASSWORD '
-        '"$autonomy_redis_password"'
+        '"$redis_password"'
     ) in bootstrap
+    assert 'set_key .env OGS_AUTONOMY_WORKER_CONCURRENCY 2' in bootstrap
     assert "docker volume inspect" in bootstrap
     assert "docker build" not in bootstrap
     assert "down -v" not in bootstrap
@@ -125,23 +126,37 @@ def test_compose_does_not_force_global_container_names():
     assert "container_name:" not in compose
 
 
-def test_standard_compose_starts_autonomy_redis_and_worker():
+def test_standard_compose_is_four_containers_with_one_redis():
     compose = (DEPLOY / "docker-compose.yml").read_text(encoding="utf-8")
+    redis_service = compose.split("  redis:\n", 1)[1].split("\n  mysql:\n", 1)[0]
     env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
     backend_env = (REPO_ROOT / "backend" / ".env.example").read_text(
         encoding="utf-8",
     )
-    assert "  autonomy-redis:" in compose
-    assert "  autonomy-worker:" in compose
-    assert "redis/redis-stack-server:7.4.0-v3" in compose
+    assert all(f"  {service}:" in compose for service in ("app", "worker", "redis", "mysql"))
+    assert "  frontend:" not in compose
+    assert "  autonomy-redis:" not in compose
+    assert "redis:8.10.0" in compose
+    assert "redis:8.10.0-alpine" not in compose
+    assert "docker-entrypoint.sh redis-server --appendonly yes" in redis_service
+    assert "--maxmemory-policy volatile-lru" in redis_service
+    assert '"$$OGS_REDIS_PASSWORD"' in redis_service
+    assert "--requirepass\n      - ${OGS_REDIS_PASSWORD:-}" not in redis_service
     assert "app.ai.autonomy.celery_entry:celery_app" in compose
     assert compose.count(
         "OGS_AI_AUTONOMY_ENABLED: ${OGS_AI_AUTONOMY_ENABLED:-true}",
     ) == 2
-    assert "OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-autonomy-redis}" in compose
+    assert compose.count("OGS_AI_AUTONOMY_REDIS_HOST: ${OGS_AI_AUTONOMY_REDIS_HOST:-redis}") == 2
+    assert compose.count("OGS_REDIS_DB: ${OGS_REDIS_DB:-2}") == 2
+    assert compose.count(
+        "OGS_REDIS_MAX_CONNECTIONS: ${OGS_REDIS_MAX_CONNECTIONS:-256}",
+    ) == 2
+    assert 'OGS_PROXY_LAYERS: "0"' in compose
+    assert "OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}" in compose
     assert "autonomy-redis-data:" in compose
     assert "OGS_AI_AUTONOMY_ENABLED=" in env_example
-    assert "OGS_AI_AUTONOMY_REDIS_PASSWORD=" in env_example
+    assert "OGS_REDIS_MAX_CONNECTIONS=256" in env_example
+    assert "OGS_AI_AUTONOMY_REDIS_PASSWORD=" not in env_example
     assert "OGS_AI_AUTONOMY_ENABLED=" in backend_env
 
 
@@ -153,20 +168,101 @@ def test_release_bundle_contains_all_compose_runtime_inputs():
         "backend/.env.example",
         "backend/mysqldir/orange.sql",
         "deploy/docker-compose.yml",
-        "deploy/nginx/frontend_container.conf",
-        "deploy/nginx/ogs_proxy_common.conf",
-        "frontend/dist/index.html",
         "ops/preflight-compose.sh",
         "ops/bootstrap-compose.sh",
     ):
         assert f'"{path}"' in builder
     assert "sha256sum" in builder
-    assert "references missing file" in builder
+    assert "frontend/dist" not in builder
+    assert "deploy/nginx" not in builder
     assert '"CHANGELOG.md"' in builder
     assert '"docs/operations/UPGRADE.md"' in builder
     assert '"${ROOT}/backend/mysqldir/"*.sql' in builder
     assert '"${OUTPUT_DIR}/bootstrap-compose.sh"' in builder
     assert "install -m 0755" in builder
+
+
+def _shell_path(path: Path) -> str:
+    # MSYS tar reads a leading drive letter as a remote host, so paths handed to
+    # bash must be POSIX-style. cygpath is absent on Linux, hence the fallback.
+    cygpath = shutil.which("cygpath")
+    if cygpath is None:
+        return path.as_posix()
+    result = subprocess.run(
+        [cygpath, "-u", str(path)], capture_output=True, text=True, check=False,
+    )
+    return result.stdout.strip() or path.as_posix()
+
+
+def test_release_bundle_builder_stages_every_runtime_input(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required to execute the bundle builder")
+    if shutil.which("tar") is None:
+        pytest.skip("tar is required to inspect the built bundle")
+    output_dir = tmp_path / "release-assets"
+    result = subprocess.run(
+        [
+            "bash",
+            _shell_path(OPS / "build-deploy-bundle.sh"),
+            "--version",
+            "v1.2.3",
+            "--output-dir",
+            _shell_path(output_dir),
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+    archive = output_dir / "orangeserver-deploy-v1.2.3.tar.gz"
+    assert archive.is_file()
+    assert (output_dir / "bootstrap-compose.sh").is_file()
+    assert (output_dir / "bootstrap-compose-cn.sh").is_file()
+
+    listing = subprocess.run(
+        ["bash", "-c", 'tar -tzf "$1"', "tar", _shell_path(archive)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert listing.returncode == 0, listing.stderr
+    entries = set(listing.stdout.splitlines())
+    for expected in (
+        "orangeserver/.env.example",
+        "orangeserver/CHANGELOG.md",
+        "orangeserver/Makefile",
+        "orangeserver/backend/.env.example",
+        "orangeserver/backend/mysqldir/orange.sql",
+        "orangeserver/deploy/docker-compose.yml",
+        "orangeserver/deploy/docker-compose.host.yml",
+        "orangeserver/docs/operations/UPGRADE.md",
+        "orangeserver/ops/bootstrap-compose.sh",
+        "orangeserver/ops/bootstrap-compose-cn.sh",
+        "orangeserver/ops/preflight-compose.sh",
+        "orangeserver/ops/healthcheck.sh",
+    ):
+        assert expected in entries, f"release bundle is missing {expected}"
+
+    # M2 dropped the nginx frontend container and bakes the SPA into the backend
+    # image, so neither may creep back into the bundle.
+    assert not any(entry.startswith("orangeserver/deploy/nginx/") for entry in entries)
+    assert not any(entry.startswith("orangeserver/frontend/") for entry in entries)
+
+    digest = output_dir / "orangeserver-deploy-v1.2.3.tar.gz.sha256"
+    assert digest.is_file()
+    verified = subprocess.run(
+        [
+            "bash", "-c",
+            'cd "$(dirname "$1")" && sha256sum -c "$(basename "$1")"',
+            "sha256sum", _shell_path(digest),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert verified.returncode == 0, verified.stderr or verified.stdout
 
 
 def test_docker_daemon_example_contains_only_supported_documented_keys():
@@ -450,8 +546,8 @@ def test_rev54_autonomy_migration_matches_baseline_and_orm():
         assert f"_utf8mb4''{status}''" in rev54
 
 
-def test_rev55_autonomy_migration_matches_baseline_and_orm():
-    """M1/S3: rev55 追加列后，rev53+rev54+rev55、orange.sql 与 ORM 一致。"""
+def test_autonomy_run_migrations_match_baseline_and_orm():
+    """自治 Run 迁移、orange.sql 与 ORM 列集合一致。"""
     from app.core.db.database import db
 
     def migration_columns(path):
@@ -486,12 +582,18 @@ def test_rev55_autonomy_migration_matches_baseline_and_orm():
 
     rev53_columns = create_columns(rev53, "t_ai_autonomous_run")
     rev54_added = migration_columns("rev54_ai_autonomy_lease.sql")
+    rev57_added = migration_columns("rev57_ai_ops_trigger.sql")
+    assert rev57_added == {
+        "trigger_type", "trigger_ref", "trigger_summary",
+    }
+    rev59_added = migration_columns("rev59_ai_autonomy_conclusion.sql")
+    assert rev59_added == {"conclusion_json"}
     baseline_columns = create_columns(schema, "t_ai_autonomous_run")
     orm_columns = set(
         db.metadata.tables["t_ai_autonomous_run"].columns.keys()
     )
     assert (
-        rev53_columns | rev54_added | added
+        rev53_columns | rev54_added | added | rev57_added | rev59_added
         == baseline_columns == orm_columns
     )
 
@@ -502,6 +604,15 @@ def test_rev55_autonomy_migration_matches_baseline_and_orm():
     )
     assert run_ddl, "orange.sql must define t_ai_autonomous_run"
     assert "`custom_profile_json` text DEFAULT NULL" in run_ddl.group(1)
+    assert "`conclusion_json` text DEFAULT NULL" in run_ddl.group(1)
+    assert "UNIQUE KEY `uq_ai_auto_run_trigger`" in run_ddl.group(1)
+
+    rev57 = (
+        BACKEND / "mysqldir" / "rev57_ai_ops_trigger.sql"
+    ).read_text(encoding="utf-8")
+    assert rev57.count("information_schema.COLUMNS") == 3
+    assert rev57.count("information_schema.STATISTICS") == 1
+    assert rev57.count("PREPARE stmt FROM @sql;") == 4
 
 
 def test_rev56_autonomy_evidence_table_matches_baseline_and_orm():
@@ -555,12 +666,103 @@ def test_rev56_autonomy_evidence_table_matches_baseline_and_orm():
     ) < schema.index("DROP TABLE IF EXISTS `t_ai_autonomous_run`;")
 
 
+def test_rev58_knowledge_tables_match_fresh_schema_and_orm():
+    from app.core.db.database import db
+
+    migration = (
+        BACKEND / "mysqldir" / "rev58_ai_knowledge.sql"
+    ).read_text(encoding="utf-8")
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+
+    def columns(source, table):
+        match = re.search(
+            r"CREATE TABLE(?: IF NOT EXISTS)? `" + table
+            + r"` \((.*?)\)\s*ENGINE=",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        assert match, table
+        return set(re.findall(r"^\s*`([^`]+)`\s+", match.group(1), re.MULTILINE))
+
+    for table in ("t_ai_embedding_config", "t_ai_knowledge_document"):
+        assert columns(migration, table) == columns(schema, table)
+        assert columns(schema, table) == set(db.metadata.tables[table].columns.keys())
+    assert migration.count("CREATE TABLE IF NOT EXISTS") == 2
+    assert "INSERT IGNORE INTO `t_ai_embedding_config`" in migration
+    assert "BAAI/bge-small-zh-v1.5" in migration
+    assert "09b6e5dccb3cf9c17b68c4493ceb1cf6eb4c6980e8a429a8c3343d46932e75ec" in migration
+    assert "`content` longtext NOT NULL" in migration
+
+
+def test_rev60_backfills_all_active_admins_into_all_permissions():
+    migration = (
+        BACKEND / "mysqldir" / "rev60_admin_all_permissions.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "SET NAMES utf8mb4;" in migration
+    assert "INSERT IGNORE INTO `t_auth_host_user`" in migration
+    assert "admin_user.`usrole` = 'admin'" in migration
+    assert "admin_user.`is_deleted` = 0" in migration
+    assert "all_auth.`name` = '所有权限'" in migration
+
+
+def test_rev61_monitoring_tables_match_fresh_schema_and_orm():
+    from app.core.db.database import db
+
+    migration = (
+        BACKEND / "mysqldir" / "rev61_ai_monitoring.sql"
+    ).read_text(encoding="utf-8")
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+
+    def columns(source, table):
+        match = re.search(
+            r"CREATE TABLE(?: IF NOT EXISTS)? `" + table
+            + r"` \((.*?)\)\s*ENGINE=",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        assert match, table
+        return set(re.findall(r"^\s*`([^`]+)`\s+", match.group(1), re.MULTILINE))
+
+    tables = ("t_ai_monitoring_source", "t_ai_monitoring_host_mapping")
+    for table in tables:
+        assert columns(migration, table) == columns(schema, table)
+        assert columns(schema, table) == set(db.metadata.tables[table].columns.keys())
+    assert migration.count("CREATE TABLE IF NOT EXISTS") == 2
+    assert "ON DELETE CASCADE" in migration
+
+
+def test_dockerfile_pins_and_verifies_local_embedding_model():
+    dockerfile = (BACKEND / "Dockerfile").read_text(encoding="utf-8")
+    requirements = (BACKEND / "requirements.txt").read_text(encoding="utf-8")
+    assert "fastembed==0.8.0" in requirements
+    assert "langchain-text-splitters==1.1.2" in requirements
+    assert "markitdown[pdf,docx]==0.1.7" in requirements
+    assert "redisvl==0.25.0" in requirements
+    assert "fast-bge-small-zh-v1.5.tar.gz" in dockerfile
+    assert "bf023219b6029148fddf764d248808816c0ca1f107f058231bb1ae0fa526f83f" in dockerfile
+    assert "sha256sum -c -" in dockerfile
+    assert "libgomp1" in dockerfile
+    assert "OGS_AI_EMBEDDING_MODEL_PATH=/opt/orangeserver/models/fast-bge-small-zh-v1.5" in dockerfile
+    assert "PIP_EXTRA_INDEX_URL" not in dockerfile
+    compose = (REPO_ROOT / "deploy" / "docker-compose.yml").read_text(
+        encoding="utf-8",
+    )
+    assert compose.count(
+        "OGS_AI_EMBEDDING_MODEL_PATH: "
+        "/opt/orangeserver/models/fast-bge-small-zh-v1.5"
+    ) == 2
+
+
 def test_dockerfile_builds_from_committed_requirements_without_resolving_lock():
     dockerfile = (BACKEND / "Dockerfile").read_text(encoding="utf-8")
     assert "pip-compile" not in dockerfile
-    assert "COPY requirements.txt" in dockerfile
+    assert "COPY backend/requirements.txt" in dockerfile
     assert "pip wheel" in dockerfile
     assert "FROM base AS runtime" in dockerfile
+    assert "FROM node:22.22.1-alpine AS frontend-builder" in dockerfile
+    assert "npm ci --no-audit --no-fund" in dockerfile
+    assert "COPY --from=frontend-builder" in dockerfile
     assert "/app/.gunicorn" in dockerfile
 
 
@@ -613,11 +815,30 @@ def test_autonomy_dev_overlay_uses_dedicated_redis8_and_worker():
         "${OGS_DEV_AUTONOMY_BACKEND_TAG:-local}"
     )
     assert overlay.count("image: " + image) == 2
-    assert overlay.count("context: ../backend") == 2
+    assert overlay.count("context: ..") == 2
+    assert overlay.count("dockerfile: backend/Dockerfile") == 2
     assert overlay.count("pull_policy: never") == 2
     assert "app.ai.autonomy.celery_entry:celery_app" in overlay
-    assert "--concurrency=1" in overlay
-    assert "inspect ping" in overlay
+    assert "--concurrency=1" not in overlay
+    assert "OGS_AUTONOMY_WORKER_CONCURRENCY: ${OGS_AUTONOMY_WORKER_CONCURRENCY:-2}" in overlay
+    # The probe must go through the setup-aware entry point: readiness imports
+    # app.core.config at module level, which fail-fasts while the first-boot
+    # wizard is still pending and would mark a correctly-waiting worker
+    # unhealthy on every fresh install.
+    health_probe = "app.ai.autonomy.healthcheck"
+    assert health_probe in overlay
+    assert "inspect ping" not in overlay
+    for compose_name in ("docker-compose.yml", "docker-compose.s2-smoke.yml"):
+        assert health_probe in (
+            REPO_ROOT / "deploy" / compose_name
+        ).read_text(encoding="utf-8")
+
+    probe_module = (
+        BACKEND / "app" / "ai" / "autonomy" / "healthcheck.py"
+    ).read_text(encoding="utf-8")
+    assert "resolve_mode()" in probe_module
+    assert "checkpoint_readiness()" in probe_module
+    assert "worker_readiness()" in probe_module
     assert "../backend:/app" in overlay
     assert overlay.count("condition: service_healthy") == 4
     assert "docker-compose.dev-autonomy.yml" in makefile
@@ -641,3 +862,237 @@ def test_dev_env_is_generated_and_not_committed():
     assert "umask 077" in init_script
     assert "OGS_AI_AUTONOMY_ENABLED=false" in init_script
     assert "OGS_AI_AUTONOMY_REDIS_PASSWORD=$(random_hex 24)" in init_script
+
+
+def test_health_target_probes_the_configured_http_port():
+    makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    target = makefile.split("\nhealth:", 1)[1].split("\n\n", 1)[0]
+    assert "OGS_HTTP_PORT" in target
+    assert "healthcheck.sh" in target
+    assert "OGS_PORT=" in target
+    # 28000 is the physical-machine dev default only; advertising it as the probe
+    # URL is what made `make health` report an unreachable endpoint on a Compose
+    # deployment that publishes OGS_HTTP_PORT instead.
+    assert "http://127.0.0.1:28000" not in target
+
+
+def test_release_bundle_builder_ships_the_healthcheck_script():
+    source = (OPS / "build-deploy-bundle.sh").read_text(encoding="utf-8")
+    required = re.search(r"required=\((.*?)\n\)", source, re.DOTALL)
+    assert required, "build-deploy-bundle.sh must declare its required inputs"
+    assert '"ops/healthcheck.sh"' in required.group(1)
+    assert 'cp "${ROOT}/ops/healthcheck.sh" "${bundle_root}/ops/"' in source
+
+
+def _run_healthcheck(tmp_path, body: str, code: str):
+    """Execute the real ops/healthcheck.sh against a stub curl on PATH."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    stub = fake_bin / "curl"
+    stub.write_text(
+        "#!/bin/bash\n"
+        "out=/tmp/ogs_health.json\n"
+        'while [ "$#" -gt 0 ]; do\n'
+        '  case "$1" in\n'
+        '    -o) out="$2"; shift 2 ;;\n'
+        "    *) shift ;;\n"
+        "  esac\n"
+        "done\n"
+        'printf "%s" "$OGS_FAKE_BODY" > "$out"\n'
+        'printf "%s" "$OGS_FAKE_CODE"\n',
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{_shell_path(fake_bin)}{os.pathsep}{env['PATH']}"
+    env["OGS_FAKE_BODY"] = body
+    env["OGS_FAKE_CODE"] = code
+    return subprocess.run(
+        ["bash", _shell_path(OPS / "healthcheck.sh")],
+        capture_output=True, text=True, check=False, env=env,
+        # text=True would decode with the locale codec (GBK on a Chinese Windows
+        # host), and the probe emits UTF-8 Chinese; the reader thread then dies
+        # and stdout silently comes back as None.
+        encoding="utf-8", errors="replace",
+    )
+
+
+@pytest.mark.parametrize(
+    "body,code,expect_rc,expect_text",
+    [
+        ('{"status": "ok", "service": "orange-server-backend"}', "200", 0, "status=ok"),
+        ('{"status":"ok"}', "200", 0, "status=ok"),
+        # First-boot wizard: DEPLOY.md documents this as HTTP 200 and healthy.
+        ('{"setup_required":true,"status":"setup"}', "200", 0, "status=setup"),
+        ('{"status":"degraded"}', "200", 1, "[FAIL]"),
+        ("", "000", 1, "[FAIL]"),
+    ],
+)
+def test_healthcheck_accepts_both_documented_healthy_states(
+    tmp_path, body, code, expect_rc, expect_text
+):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required to execute the health probe")
+    result = _run_healthcheck(tmp_path, body, code)
+    assert result.returncode == expect_rc, result.stdout + result.stderr
+    assert expect_text in result.stdout
+
+
+def test_worker_probe_treats_pending_setup_as_healthy_waiting(monkeypatch):
+    """A fresh install has no secret keys yet, so readiness cannot even be
+    imported; a worker that is correctly waiting must not be marked unhealthy."""
+    import setup.state as state
+    from app.ai.autonomy import healthcheck as probe
+
+    for mode in ("setup", "maintenance"):
+        monkeypatch.setattr(state, "resolve_mode", lambda m=mode: m)
+        assert probe.main() == 0, f"mode={mode} should count as healthy waiting"
+
+
+def test_worker_probe_still_gates_on_readiness_once_configured(monkeypatch):
+    import setup.state as state
+    from app.ai.autonomy import healthcheck as probe, readiness
+
+    monkeypatch.setattr(state, "resolve_mode", lambda: "normal")
+    monkeypatch.setattr(readiness, "checkpoint_readiness", lambda **kw: True)
+    monkeypatch.setattr(readiness, "worker_readiness", lambda **kw: True)
+    assert probe.main() == 0
+
+    monkeypatch.setattr(readiness, "worker_readiness", lambda **kw: False)
+    assert probe.main() == 1
+
+    monkeypatch.setattr(readiness, "worker_readiness", lambda **kw: True)
+    monkeypatch.setattr(readiness, "checkpoint_readiness", lambda **kw: False)
+    assert probe.main() == 1
+
+
+def _builtin_system_seed(schema: str) -> tuple[str, int]:
+    match = re.search(
+        r"INSERT INTO `t_acc_user`[^;]*?'system','system','admin','([^']*)',(\d+),",
+        schema,
+    )
+    assert match, "orange.sql must seed the built-in system account"
+    return match.group(1), int(match.group(2))
+
+
+def test_seeded_builtin_system_account_is_not_loginable():
+    """MySQL runs orange.sql at volume init, *before* the setup wizard, and the
+    wizard only creates `system` when the row is absent — so this INSERT decides
+    what a fresh bundled deployment can log in with."""
+    from app.tools.basesec import UNUSABLE_PASSWORD_HASH, verify_pwd
+
+    schema = (BACKEND / "mysqldir" / "orange.sql").read_text(encoding="utf-8")
+    stored, version = _builtin_system_seed(schema)
+    assert stored == UNUSABLE_PASSWORD_HASH
+    assert version == 2, "bcrypt seed must not report the legacy base64 version"
+    assert stored.startswith("$2b$") and len(stored) == 60
+
+    for candidate in ("admin", "system", UNUSABLE_PASSWORD_HASH):
+        assert verify_pwd(candidate, stored) == (False, False)
+
+
+def test_no_seeding_site_hashes_a_committed_placeholder_literal():
+    """hash_pwd('!disabled-...!') reads like a lockout, but the plaintext is in
+    the repository, so it turns "disabled" into a publicly known password."""
+    from app.tools.basesec import UNUSABLE_PASSWORD_HASH
+
+    bootstrap = (BACKEND / "setup" / "bootstrap_db.py").read_text(encoding="utf-8")
+    assert "!disabled-" not in bootstrap
+    assert "UNUSABLE_PASSWORD_HASH" in bootstrap
+
+    for name in ("rev47_h7_cron_owner_fk.sql", "rev62_system_account_unusable.sql"):
+        migration = (BACKEND / "mysqldir" / name).read_text(encoding="utf-8")
+        assert UNUSABLE_PASSWORD_HASH in migration, (
+            f"{name} must use the same sentinel as basesec.UNUSABLE_PASSWORD_HASH"
+        )
+
+    # rev62 repairs deployments whose wizard already ran, so it must be safe to
+    # re-apply and must not touch any account other than the built-in one.
+    remediation = (
+        BACKEND / "mysqldir" / "rev62_system_account_unusable.sql"
+    ).read_text(encoding="utf-8")
+    assert "WHERE `name` = 'system'" in remediation
+    assert f"AND `password` <> '{UNUSABLE_PASSWORD_HASH}'" in remediation
+
+
+def test_in_place_bcrypt_writes_keep_password_version_in_sync():
+    """basesec documents that whoever rehashes must bump password_version, and
+    rev47_h9 ships an audit query that counts remaining base64 accounts by
+    reading that column."""
+    source = (BACKEND / "app" / "users" / "user.py").read_text(encoding="utf-8")
+
+    login = re.search(
+        r"def\s+login_dl\s*\(\s*self\s*\)([\s\S]*?)(?=\n    def\s|\Z)", source,
+    )
+    assert login, "user.py must define login_dl"
+    rehash = re.search(
+        r"user_info\.password = hash_pwd\(self\.password\)([\s\S]*?)"
+        r"db\.session\.commit\(\)",
+        login.group(1),
+    )
+    assert rehash, "login_dl must transparently rehash legacy passwords"
+    assert "password_version" in rehash.group(1)
+
+    for anchor in (
+        "user.password = password_en",
+        "update_kwargs['password'] = hash_pwd(self.password)",
+    ):
+        for match in re.finditer(re.escape(anchor), source):
+            window = source[match.end(): match.end() + 160]
+            assert "password_version" in window, (
+                f"{anchor} rewrites the stored format without updating the version"
+            )
+
+
+def _smoke_runner_steps(text: str) -> set[str]:
+    return set(re.findall(r"smoke-runner\s+([a-z0-9-]+)", text))
+
+
+@pytest.mark.parametrize("stage", ["s2", "s3"])
+def test_bash_smoke_driver_matches_powershell_scenarios(stage: str):
+    powershell = (REPO_ROOT / "ops" / f"smoke-ai-autonomy-{stage}.ps1").read_text(
+        encoding="utf-8"
+    )
+    bash = (REPO_ROOT / "ops" / f"smoke-ai-autonomy-{stage}.sh").read_text(
+        encoding="utf-8"
+    )
+    lib = (REPO_ROOT / "ops" / "smoke-ai-autonomy-lib.sh").read_text(encoding="utf-8")
+
+    ps_steps = _smoke_runner_steps(powershell)
+    sh_steps = _smoke_runner_steps(bash)
+    assert len(ps_steps) >= (20 if stage == "s2" else 1), (
+        f"scenario parse for {stage} looks broken: {sorted(ps_steps)}"
+    )
+    assert sh_steps == ps_steps, (
+        f"{stage} bash driver scenarios drifted from the PowerShell driver: "
+        f"missing={sorted(ps_steps - sh_steps)} extra={sorted(sh_steps - ps_steps)}"
+    )
+    assert "set -Eeuo pipefail" in bash
+    assert "source \"${SCRIPT_DIR}/smoke-ai-autonomy-lib.sh\"" in bash
+    assert "set -Eeuo pipefail" in lib
+    assert "smoke_validate_head" in bash and "smoke_validate_head" in lib
+    assert "smoke_extract_exact_head" in bash and "smoke_extract_exact_head" in lib
+
+
+def test_s2_smoke_upgrade_list_covers_every_autonomy_migration():
+    smoke = (REPO_ROOT / "ops" / "smoke-ai-autonomy-s2.py").read_text(encoding="utf-8")
+    block = re.search(r"UPGRADE_SCRIPTS = \(([\s\S]*?)\)", smoke)
+    assert block, "smoke must declare UPGRADE_SCRIPTS"
+    applied = set(re.findall(r"(rev\d+_[A-Za-z0-9_]+\.sql)", block.group(1)))
+    assert applied, "UPGRADE_SCRIPTS parse looks broken"
+
+    autonomy_tables = (
+        "t_ai_autonomous_run",
+        "t_ai_autonomous_step",
+        "t_ai_autonomous_event",
+        "t_ai_autonomous_artifact",
+    )
+    touching = set()
+    for path in sorted((REPO_ROOT / "backend" / "mysqldir").glob("rev*.sql")):
+        body = path.read_text(encoding="utf-8")
+        if any(table in body for table in autonomy_tables):
+            touching.add(path.name)
+    assert touching <= applied, (
+        f"autonomy migrations missing from the smoke upgrade path: "
+        f"{sorted(touching - applied)}"
+    )

@@ -113,6 +113,7 @@ def chat_draft_only():
                 PlatformQueryService,
                 ToolNotAllowed,
                 ToolRegistry,
+                ToolValidationError,
             )
             from app.tools.redisdb import ConnRedis
 
@@ -122,8 +123,12 @@ def chat_draft_only():
                 'chat tool surface exposes autonomy Run lifecycle tools',
             )
             require(
-                'create_autonomy_draft' in ADMIN_ONLY_TOOLS,
-                'create_autonomy_draft must remain admin-only',
+                'create_autonomy_draft' not in ADMIN_ONLY_TOOLS,
+                'chat draft creation must stay open to every autonomy role',
+            )
+            require(
+                'search_accounts' in ADMIN_ONLY_TOOLS,
+                'the admin-only tool surface lost its account gate',
             )
 
             store = AgentStore(ConnRedis().conn)
@@ -132,7 +137,8 @@ def chat_draft_only():
             )
             conversation_id = conversation['id']
 
-            # 非管理员聊天不能创建草稿。
+            # 普通用户：管理员专属工具仍然拒绝；草稿工具开放，但仓库层
+            # 按所有者授权重新校验，未绑定该主机/凭据就绝不能落草稿。
             user_registry = ToolRegistry(
                 store=store,
                 platform=PlatformQueryService('smoke-user', 'user'),
@@ -141,15 +147,22 @@ def chat_draft_only():
                 conversation_id=conversation_id,
             )
             try:
+                user_registry.execute('search_accounts', {})
+                raise AssertionError(
+                    'non-admin chat executed an admin-only tool',
+                )
+            except ToolNotAllowed:
+                pass
+            try:
                 user_registry.execute('create_autonomy_draft', {
                     'goal': 'S3 unauthorized draft',
                     'host_id': CHAT_DRAFT_HOST_ID,
                     'system_user_id': CHAT_DRAFT_SYSTEM_USER_ID,
                 })
                 raise AssertionError(
-                    'non-admin chat executed create_autonomy_draft',
+                    'non-admin chat drafted an unauthorized host',
                 )
-            except ToolNotAllowed:
+            except ToolValidationError:
                 pass
 
             # 管理员聊天只产生 draft 落库，绝不产生执行态。
@@ -160,11 +173,11 @@ def chat_draft_only():
                 role='admin',
                 conversation_id=conversation_id,
             )
+            # 权限档位由会话决定，模型不能在参数里选：默认 ask。
             result = registry.execute('create_autonomy_draft', {
                 'goal': 'S3 chat draft smoke',
                 'host_id': CHAT_DRAFT_HOST_ID,
                 'system_user_id': CHAT_DRAFT_SYSTEM_USER_ID,
-                'mode': 'ask',
             })
             draft = result['autonomy_draft']
             require(
@@ -175,14 +188,15 @@ def chat_draft_only():
 
             run_row = fetch_one(
                 connection,
-                'SELECT status, owner, started_at FROM t_ai_autonomous_run'
-                ' WHERE id = %s',
+                'SELECT status, owner, mode, started_at'
+                ' FROM t_ai_autonomous_run WHERE id = %s',
                 (run_id,),
             )
             require(
                 run_row is not None
                 and run_row['status'] == 'draft'
                 and run_row['owner'] == 'admin'
+                and run_row['mode'] == 'ask'
                 and run_row['started_at'] is None,
                 'chat-created draft row was not a pristine draft',
             )

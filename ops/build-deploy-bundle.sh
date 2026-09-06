@@ -53,12 +53,10 @@ required=(
     "docs/operations/UPGRADE.md"
     "deploy/docker-compose.yml"
     "deploy/docker-compose.host.yml"
-    "deploy/nginx/frontend_container.conf"
-    "deploy/nginx/ogs_proxy_common.conf"
-    "frontend/dist/index.html"
     "ops/bootstrap-compose.sh"
     "ops/bootstrap-compose-cn.sh"
     "ops/preflight-compose.sh"
+    "ops/healthcheck.sh"
 )
 for path in "${required[@]}"; do
     if [ ! -e "${ROOT}/${path}" ]; then
@@ -67,24 +65,11 @@ for path in "${required[@]}"; do
     fi
 done
 
-while IFS= read -r asset; do
-    asset="${asset#/}"
-    if [ ! -f "${ROOT}/frontend/dist/${asset}" ]; then
-        echo "[FAIL] frontend/dist/index.html references missing file: ${asset}" >&2
-        exit 1
-    fi
-done < <(
-    grep -oE '(src|href)="(/)?assets/[^"]+"' "${ROOT}/frontend/dist/index.html" \
-        | sed -E 's/^(src|href)="//; s/"$//' \
-        | sort -u
-)
-
 bundle_root="${STAGE}/orangeserver"
 mkdir -p \
     "${bundle_root}/backend/mysqldir" \
-    "${bundle_root}/deploy/nginx" \
+    "${bundle_root}/deploy" \
     "${bundle_root}/docs/operations" \
-    "${bundle_root}/frontend" \
     "${bundle_root}/ops"
 
 cp "${ROOT}/.env.example" "${bundle_root}/"
@@ -95,12 +80,10 @@ cp "${ROOT}/backend/mysqldir/"*.sql "${bundle_root}/backend/mysqldir/"
 cp "${ROOT}/docs/operations/UPGRADE.md" "${bundle_root}/docs/operations/"
 cp "${ROOT}/deploy/docker-compose.yml" "${bundle_root}/deploy/"
 cp "${ROOT}/deploy/docker-compose.host.yml" "${bundle_root}/deploy/"
-cp "${ROOT}/deploy/nginx/frontend_container.conf" "${bundle_root}/deploy/nginx/"
-cp "${ROOT}/deploy/nginx/ogs_proxy_common.conf" "${bundle_root}/deploy/nginx/"
-cp -a "${ROOT}/frontend/dist" "${bundle_root}/frontend/"
 cp "${ROOT}/ops/preflight-compose.sh" "${bundle_root}/ops/"
 cp "${ROOT}/ops/bootstrap-compose.sh" "${bundle_root}/ops/"
 cp "${ROOT}/ops/bootstrap-compose-cn.sh" "${bundle_root}/ops/"
+cp "${ROOT}/ops/healthcheck.sh" "${bundle_root}/ops/"
 
 mkdir -p "$OUTPUT_DIR"
 tar -C "$STAGE" -czf "${OUTPUT_DIR}/${ARCHIVE}" orangeserver

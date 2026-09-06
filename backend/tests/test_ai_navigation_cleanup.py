@@ -28,9 +28,14 @@ def test_ai_agent_navigation_is_operator_only():
     layout = _read("frontend/src/views/Layout.vue")
 
     assert "path: 'ai-agent'" in router
-    assert "operatorRoutes: readonly string[] = ['/ai-agent', '/batch-command']" in router
+    assert "path: 'ai-ops'" in router
+    assert "path: 'ai-knowledge'" in router
+    assert "'/ai-ops', '/ai-knowledge', '/ai-agent', '/ai-runs', '/batch-command'" in router
+    assert "path: 'ai-agent', redirect: { name: 'AiOpsWorkbench' }" in router
+    assert "path: 'ai-runs', redirect: { name: 'AiOpsTasks' }" in router
     assert "['admin', 'user'].includes(role)" in router
-    assert 'index="/ai-agent"' in layout
+    assert 'index="/ai-ops"' in layout
+    assert 'index="/ai-knowledge"' in layout
     assert "isAdmin || isUser" in layout
 
 
@@ -54,4 +59,4 @@ def test_dashboard_no_longer_exposes_container_count():
     assert "container_len" not in backend
     assert "container_len" not in dashboard
     assert "getAiProviders" in dashboard
-    assert "route: '/ai-agent'" in dashboard
+    assert "route: '/ai-ops'" in dashboard

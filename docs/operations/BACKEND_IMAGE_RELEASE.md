@@ -28,20 +28,33 @@ pwsh -File ops/check-docs.ps1
 bash ops/test-bootstrap-scripts.sh
 
 cd backend
-python -m pytest tests/ -q --ignore=app/tools/ansible_runner
+python -m pytest tests/ -q
 cd ../frontend
 npm ci --no-audit --no-fund
 npm run build
 cd ..
 ```
 
-M1 自治还要用隔离的 MySQL、业务 Redis、自治 Redis Stack、Worker 和 SSH 测试资产做
+门禁环境要求标准 Linux/WSL 用户态：`ops/test-bootstrap-scripts.sh` 依赖
+`hostname -I`（Windows/MSYS 没有该参数，会静默失败）；`test_ai_autonomy_ssh_runner.py`
+的进程组用例要在本地 shell 执行远端 wrapper，依赖 procps 的 `/bin/kill`
+（debian-slim 这类极简用户态没有，用例按能力 skip，不算通过也不算失败）。
+
+M1/M2 自治还要用隔离的 MySQL、Redis 8、Worker 和 SSH 测试资产做
 smoke；从零安装必须能直接使用自治工作台并看到就绪状态，不要把「容器已启动」当成
 自治闭环。入口：
 
 ```powershell
 pwsh -File ops/smoke-ai-autonomy-s2.ps1 -ExpectedHead <40-hex-commit>
 pwsh -File ops/smoke-ai-autonomy-s3.ps1 -ExpectedHead <40-hex-commit>
+```
+
+纯 Linux 主机无需 PowerShell 运行时，用等价的 bash 入口（场景步骤与 ps1 一一对应，
+由 `test_clean_deploy_contract.py` 的漂移防护锁定）：
+
+```bash
+bash ops/smoke-ai-autonomy-s2.sh --expected-head <40-hex-commit>
+bash ops/smoke-ai-autonomy-s3.sh --expected-head <40-hex-commit>
 ```
 
 **全新安装的 setup 前状态必须专项验证**：未走 `/setup` 向导前，autonomy-worker 应
@@ -87,9 +100,9 @@ GitHub Release 存在（draft 或已发布均可）且 GHCR 同名 tag 不存在
 ```bash
 wsl -d <wsl-发行版> -u root -e bash -c '
   rm -rf /root/ogs-build && mkdir -p /root/ogs-build
-  cp -r /mnt/<源码路径>/backend /root/ogs-build/
+  cp -r /mnt/<源码路径>/. /root/ogs-build/
   cd /root/ogs-build
-  docker build -t ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend:vX.Y.Z backend/
+  docker build -f backend/Dockerfile -t ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend:vX.Y.Z .
   docker push ccr.ccs.tencentyun.com/xuwei777/orangeserver-backend:vX.Y.Z
 '
 ```
@@ -103,7 +116,9 @@ wsl -d <wsl-发行版> -u root -e bash -c '
 ### 3.3 发布后验证
 
 两个 registry 都从未 `docker login` 的环境各做一次匿名拉取，确认平台为 `linux/amd64`、
-镜像能启动到 healthy。国内链路再跑一次「从零安装验证」（见第 4 节）。
+镜像能启动到 healthy，并在 app 容器内确认内置 BGE 模型文件存在且知识库重建可用。
+镜像构建阶段需要访问固定的 Qdrant FastEmbed 模型归档，并在解压前校验仓库固定的
+SHA-256；运行期不再下载模型。国内链路再跑一次「从零安装验证」（见第 4 节）。
 
 ## 4. 发布步骤 checklist
 
@@ -148,9 +163,18 @@ curl -fsSL https://github.com/OrangeServers/OrangeServer/releases/download/vX.Y.
   | sudo bash -s -- --version vX.Y.Z
 ```
 
-安装后验证：6 容器全部 `Up`，backend/mysql/redis/autonomy-redis healthy；setup 完成
+安装后验证：4 个产品容器全部 `Up`，app/worker/mysql/redis healthy；setup 完成
 前 worker 保持等待、不 crash-loop（见第 1 节）；`/local/health` 返回 200；完成
 `/setup` 后登录、资产、审计、AI Provider、只读诊断正常。
+随后分别上传无敏感信息的 Markdown、TXT、DOCX 和文本型 PDF，确认图片型 PDF 会明确
+提示未启用 OCR；核对转换预览后保存其中一个示例 Runbook，重建索引，并用关键词命中
+与同义表达各完成一次带版本引用的检索；删除
+示例文档后再次重建，确认索引回到预期状态。
+
+混合检索的确定性回归使用独立 Redis 8（不能指向业务实例）：设置
+`OGS_TEST_KNOWLEDGE_REDIS_URL` 后运行
+`python -m pytest backend/tests/test_ai_knowledge_redis_integration.py -q -s`。公开合成语料
+同时覆盖精确故障码与语义改写，门槛为 `Recall@8=1.000`、`MRR=1.000`。
 
 ## 5. 已知坑（踩过，别重蹈）
 

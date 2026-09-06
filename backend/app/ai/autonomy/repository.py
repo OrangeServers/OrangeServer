@@ -19,7 +19,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
 
 from app.ai.autonomy.actions import (
@@ -68,6 +68,7 @@ from app.ai.autonomy.state import (
     assert_run_transition,
     assert_step_transition,
 )
+from app.ai.diagnostic_adapters import sanitize_evidence
 
 
 class AutonomyError(Exception):
@@ -107,9 +108,35 @@ CUSTOM_ACTION_CATEGORIES = frozenset({
 # 限长 500；结论至多引用 16 条同一 Run 的 Evidence。
 EVIDENCE_KINDS = frozenset({
     'action_observation', 'verification_observation',
+    'alert_observation', 'prometheus_observation',
 })
 EVIDENCE_SUMMARY_CHARS = 500
 MAX_EVIDENCE_CITATIONS = 16
+CONCLUSION_ITEM_LIMIT = 8
+CONCLUSION_ITEM_CHARS = 240
+CONCLUSION_TEXT_CHARS = 512
+CONCLUSION_CONFIDENCE = frozenset({'low', 'medium', 'high'})
+RUN_TRIGGER_TYPES = frozenset({'manual', 'chat', 'alertmanager'})
+AUTONOMY_ROLES = frozenset({'admin', 'user'})
+RUN_FAILURE_EVENT_TYPES = frozenset({
+    'authorization_revoked',
+    'budget_exhausted',
+    'planner_failed',
+    'planner_unavailable',
+    'unknown_graph_version',
+})
+
+
+def resolve_current_autonomy_role(session, owner: str) -> Optional[str]:
+    """Resolve the owner's current usable role without persisting it on Run."""
+    from app.core.db.database import t_acc_user
+
+    row = session.query(t_acc_user).filter_by(
+        name=str(owner),
+        is_deleted=False,
+    ).first()
+    role = str(getattr(row, 'usrole', '') or '').lower() if row else ''
+    return role if role in AUTONOMY_ROLES else None
 
 
 def parse_custom_profile(payload):
@@ -143,8 +170,13 @@ def parse_custom_profile(payload):
 
 
 _ACTIVE_HOST_UNIQUE_KEY = 'uq_ai_auto_run_active_host'
+_TRIGGER_UNIQUE_KEY = 'uq_ai_auto_run_trigger'
 _SQLITE_ACTIVE_HOST_UNIQUE_ERROR = (
     'UNIQUE constraint failed: t_ai_autonomous_run.active_host_id'
+)
+_SQLITE_TRIGGER_UNIQUE_ERROR = (
+    'UNIQUE constraint failed: '
+    't_ai_autonomous_run.trigger_type, t_ai_autonomous_run.trigger_ref'
 )
 
 
@@ -157,9 +189,76 @@ def _is_active_host_unique_violation(exc: IntegrityError) -> bool:
     )
 
 
+def _is_trigger_unique_violation(exc: IntegrityError) -> bool:
+    message = str(getattr(exc, 'orig', None) or exc)
+    return (
+        _TRIGGER_UNIQUE_KEY in message
+        or _SQLITE_TRIGGER_UNIQUE_ERROR in message
+    )
+
+
 def sanitize_text(value: str) -> str:
     """清洗控制字符（保留换行/制表），防 ANSI 注入。"""
     return _CONTROL_CHARS_RE.sub('', str(value or ''))
+
+
+def _conclusion_text(value: Any, field: str) -> str:
+    text = sanitize_evidence(value).strip()
+    if not text:
+        raise AutonomyValidationError('%s is required' % field)
+    return text[:CONCLUSION_TEXT_CHARS]
+
+
+def _conclusion_items(value: Any, field: str) -> List[str]:
+    if not isinstance(value, list) or len(value) > CONCLUSION_ITEM_LIMIT:
+        raise AutonomyValidationError('%s must be a bounded list' % field)
+    return [
+        _conclusion_text(item, field)[:CONCLUSION_ITEM_CHARS]
+        for item in value
+    ]
+
+
+def normalize_conclusion_details(value: Any) -> Dict[str, Any]:
+    """Validate the model-authored, operator-facing conclusion fields."""
+    if not isinstance(value, dict):
+        raise AutonomyValidationError('conclusion details must be an object')
+    required = {
+        'confirmed_facts', 'impact_scope', 'root_cause_hypothesis',
+        'confidence', 'unknowns', 'recommended_actions',
+    }
+    if set(value) != required:
+        raise AutonomyValidationError('conclusion details fields mismatch')
+    confidence = str(value.get('confidence') or '')
+    if confidence not in CONCLUSION_CONFIDENCE:
+        raise AutonomyValidationError('unknown conclusion confidence')
+    return {
+        'confirmed_facts': _conclusion_items(
+            value.get('confirmed_facts'), 'confirmed_facts',
+        ),
+        'impact_scope': _conclusion_text(
+            value.get('impact_scope'), 'impact_scope',
+        ),
+        'root_cause_hypothesis': _conclusion_text(
+            value.get('root_cause_hypothesis'), 'root_cause_hypothesis',
+        ),
+        'confidence': confidence,
+        'unknowns': _conclusion_items(value.get('unknowns'), 'unknowns'),
+        'recommended_actions': _conclusion_items(
+            value.get('recommended_actions'), 'recommended_actions',
+        ),
+    }
+
+
+def fallback_conclusion_details() -> Dict[str, Any]:
+    """Return the bounded fail-closed conclusion used without model details."""
+    return {
+        'confirmed_facts': ['结论由服务端根据当前终态收口'],
+        'impact_scope': '未确认影响范围',
+        'root_cause_hypothesis': '未形成根因假设',
+        'confidence': 'low',
+        'unknowns': ['未生成有效的结构化结论详情'],
+        'recommended_actions': ['查看 Evidence 与任务事件后人工复核'],
+    }
 
 
 def _truncate_utf8(text: str, max_bytes: int):
@@ -277,7 +376,9 @@ class AutonomyRepository:
         self.secret_key = secret_key
         if platform_factory is None:
             from app.ai.tools import PlatformQueryService
-            platform_factory = PlatformQueryService
+
+            def platform_factory(owner, role):
+                return PlatformQueryService(owner, role, session=session)
         self.platform_factory = platform_factory
 
     # ------------------------------------------------------------------
@@ -313,10 +414,12 @@ class AutonomyRepository:
     def _revalidate_boundaries(self, owner: str, role: str, run_row) -> None:
         """创建/启动/决策边界统一复核资产与凭据授权。"""
         platform = self._platform(owner, role)
-        if not platform.validate_asset_ids([int(run_row.host_id)]):
-            raise AutonomyPermissionError('asset authorization revoked')
-        if platform.resolve_system_user(int(run_row.system_user_id)) is None:
-            raise AutonomyPermissionError('credential authorization revoked')
+        if not platform.validate_asset_sys_user_id_pair(
+            [int(run_row.host_id)], int(run_row.system_user_id),
+        ):
+            raise AutonomyPermissionError(
+                'asset and credential authorization revoked'
+            )
         host = self._get_host_row(run_row.host_id)
         try:
             validate_mode_for_environment(run_row.mode, host.ai_environment)
@@ -365,12 +468,19 @@ class AutonomyRepository:
             'system_user_id': int(row.system_user_id),
             'system_user_alias': row.system_user_alias,
             'mode': row.mode,
+            'trigger_type': getattr(row, 'trigger_type', 'manual'),
+            'trigger_ref': getattr(row, 'trigger_ref', None),
+            'trigger_summary': getattr(row, 'trigger_summary', '') or '',
             'custom_profile': (
                 json.loads(row.custom_profile_json)
                 if getattr(row, 'custom_profile_json', None) else None
             ),
             'status': row.status,
             'outcome': row.outcome,
+            'conclusion': (
+                json.loads(row.conclusion_json)
+                if getattr(row, 'conclusion_json', None) else None
+            ),
             'revision': int(row.revision or 0),
             'graph_version': row.graph_version,
             'budget': json.loads(row.budget_json or '{}'),
@@ -382,7 +492,7 @@ class AutonomyRepository:
         }
 
     def _step_to_dict(self, row) -> Dict[str, Any]:
-        return {
+        result = {
             'id': row.id,
             'run_id': row.run_id,
             'kind': row.kind,
@@ -393,6 +503,16 @@ class AutonomyRepository:
             'note': row.note or '',
             'created_at': getattr(row, 'created_at', None),
         }
+        if row.kind == StepKind.PLAN.value:
+            try:
+                snapshot = parse_plan_snapshot(row.action_json or '')
+                result['plan_actions'] = [
+                    redacted_summary(action_from_dict(item), max_chars=None)
+                    for item in snapshot['actions']
+                ]
+            except (ActionValidationError, PlanAuthorizationError):
+                result['plan_actions'] = []
+        return result
 
     # ------------------------------------------------------------------
     # Run 生命周期
@@ -409,6 +529,9 @@ class AutonomyRepository:
         mode: str,
         budget_payload: Optional[Dict[str, Any]] = None,
         profile_payload: Optional[Dict[str, Any]] = None,
+        trigger_type: str = 'manual',
+        trigger_ref: Optional[str] = None,
+        trigger_summary: str = '',
     ) -> Dict[str, Any]:
         from app.core.db.database import t_ai_autonomous_run
 
@@ -417,6 +540,19 @@ class AutonomyRepository:
             raise AutonomyValidationError('goal must be 1..512 characters')
         if mode not in {m.value for m in CANONICAL_RUN_MODES}:
             raise AutonomyValidationError('unknown mode: %r' % (mode,))
+        trigger_type = sanitize_text(trigger_type).strip().lower()
+        if trigger_type not in RUN_TRIGGER_TYPES:
+            raise AutonomyValidationError(
+                'unknown trigger type: %r' % (trigger_type,)
+            )
+        trigger_ref = sanitize_text(trigger_ref or '').strip() or None
+        if trigger_ref is not None and len(trigger_ref) > 64:
+            raise AutonomyValidationError('trigger_ref is too long')
+        if trigger_type == 'alertmanager' and not trigger_ref:
+            raise AutonomyValidationError(
+                'alertmanager trigger requires trigger_ref'
+            )
+        trigger_summary = sanitize_text(trigger_summary).strip()[:512]
         if mode == RunMode.CUSTOM.value:
             if profile_payload is None:
                 raise AutonomyValidationError(
@@ -447,11 +583,15 @@ class AutonomyRepository:
             )
 
         platform = self._platform(owner, role)
-        if not platform.validate_asset_ids([host_id]):
-            raise AutonomyPermissionError('asset authorization failed')
         credential = platform.resolve_system_user(system_user_id)
         if credential is None:
             raise AutonomyPermissionError('credential authorization failed')
+        if not platform.validate_asset_sys_user_id_pair(
+            [host_id], system_user_id,
+        ):
+            raise AutonomyPermissionError(
+                'asset and credential authorization failed'
+            )
         host = self._get_host_row(host_id)
         try:
             validate_mode_for_environment(mode, host.ai_environment)
@@ -478,6 +618,9 @@ class AutonomyRepository:
             system_user_id=system_user_id,
             system_user_alias=str(credential.get('alias') or ''),
             mode=mode,
+            trigger_type=trigger_type,
+            trigger_ref=trigger_ref,
+            trigger_summary=trigger_summary,
             custom_profile_json=(
                 json.dumps(custom_profile, sort_keys=True)
                 if custom_profile else None
@@ -503,11 +646,18 @@ class AutonomyRepository:
                 raise AutonomyConflict(
                     'an active autonomous run already exists for this host'
                 ) from None
+            if _is_trigger_unique_violation(exc):
+                raise AutonomyConflict(
+                    'an autonomous run already exists for this trigger'
+                ) from None
             raise
         self.append_event(run, 'run_created', {
             'mode': mode, 'host_id': host_id,
             'system_user_id': system_user_id,
             'custom_profile': custom_profile,
+            'trigger_type': trigger_type,
+            'trigger_ref': trigger_ref,
+            'trigger_summary': trigger_summary,
         })
         self._commit()
         return self._run_to_dict(run)
@@ -545,8 +695,8 @@ class AutonomyRepository:
             t_ai_autonomous_run, t_ai_autonomous_step,
         )
 
-        if role != 'admin':
-            raise AutonomyPermissionError('admin role required')
+        if str(role or '') not in AUTONOMY_ROLES:
+            raise AutonomyPermissionError('unsupported autonomy role')
         run = self.session.query(t_ai_autonomous_run).filter_by(
             id=run_id, owner=owner,
         ).with_for_update().first()
@@ -559,6 +709,7 @@ class AutonomyRepository:
             RunStatus.DRAFT.value,
             RunStatus.QUEUED.value,
             RunStatus.WAITING_APPROVAL.value,
+            RunStatus.NEEDS_ATTENTION.value,
         }
         # 租约已过期 = Worker 已死/失联，取消可直接落终态，不再等确认。
         lease_expired = (
@@ -620,18 +771,104 @@ class AutonomyRepository:
         self._commit()
         return self._run_to_dict(run)
 
+    def find_run_by_trigger(
+        self, owner: str, trigger_type: str, trigger_ref: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Find an idempotent external trigger without exposing other owners."""
+        from app.core.db.database import t_ai_autonomous_run
+
+        row = self.session.query(t_ai_autonomous_run).filter_by(
+            owner=owner,
+            trigger_type=str(trigger_type),
+            trigger_ref=str(trigger_ref),
+        ).first()
+        return self._run_to_dict(row) if row is not None else None
+
     def get_run(self, owner: str, run_id: str) -> Dict[str, Any]:
         return self._run_to_dict(self._get_run_row(owner, run_id))
 
     def list_runs(self, owner: str, limit: int = 50) -> List[Dict[str, Any]]:
-        from app.core.db.database import t_ai_autonomous_run
+        from app.core.db.database import (
+            t_ai_autonomous_event, t_ai_autonomous_run,
+        )
 
+        active_values = [status.value for status in ACTIVE_RUN_STATUSES]
         rows = self.session.query(t_ai_autonomous_run).filter_by(
             owner=owner,
-        ).order_by(t_ai_autonomous_run.created_at.desc()).limit(
+        ).order_by(
+            case(
+                (t_ai_autonomous_run.status.in_(active_values), 0),
+                else_=1,
+            ).asc(),
+            t_ai_autonomous_run.created_at.desc(),
+            t_ai_autonomous_run.id.desc(),
+        ).limit(
             max(1, min(int(limit), 200))
         ).all()
-        return [self._run_to_dict(row) for row in rows]
+        runs = [self._run_to_dict(row) for row in rows]
+        alert_ids = [
+            row.id for row in rows if row.trigger_type == 'alertmanager'
+        ]
+        if not alert_ids:
+            return runs
+
+        latest_sequence = self.session.query(
+            t_ai_autonomous_event.run_id.label('run_id'),
+            func.max(t_ai_autonomous_event.sequence).label('sequence'),
+        ).filter(
+            t_ai_autonomous_event.run_id.in_(alert_ids),
+            t_ai_autonomous_event.event_type.in_([
+                'alert_firing', 'alert_resolved',
+            ]),
+        ).group_by(t_ai_autonomous_event.run_id).subquery()
+        events = self.session.query(t_ai_autonomous_event).join(
+            latest_sequence,
+            (t_ai_autonomous_event.run_id == latest_sequence.c.run_id)
+            & (t_ai_autonomous_event.sequence == latest_sequence.c.sequence),
+        ).all()
+        latest = {event.run_id: event for event in events}
+        for run in runs:
+            if run['trigger_type'] != 'alertmanager':
+                continue
+            event = latest.get(run['id'])
+            run['alert_state'] = (
+                event.event_type.removeprefix('alert_') if event else None
+            )
+            run['alert_updated_at'] = event.created_at if event else None
+        return runs
+
+    def ops_summary(self, owner: str, limit: int = 8) -> Dict[str, Any]:
+        """Bounded data for the AIOps landing page; Run stays authoritative."""
+        from app.core.db.database import t_ai_autonomous_run
+
+        limit = max(1, min(int(limit), 20))
+        active_values = [status.value for status in ACTIVE_RUN_STATUSES]
+        active_query = self.session.query(t_ai_autonomous_run).filter(
+            t_ai_autonomous_run.owner == owner,
+            t_ai_autonomous_run.status.in_(active_values),
+        )
+        queued = active_query.filter(
+            t_ai_autonomous_run.status == RunStatus.QUEUED.value,
+        ).count()
+        running = active_query.order_by(
+            t_ai_autonomous_run.updated_at.desc(),
+        ).limit(limit).all()
+        alerts = active_query.filter(
+            t_ai_autonomous_run.trigger_type == 'alertmanager',
+        ).order_by(t_ai_autonomous_run.updated_at.desc()).limit(limit).all()
+        conclusions = self.session.query(t_ai_autonomous_run).filter(
+            t_ai_autonomous_run.owner == owner,
+            t_ai_autonomous_run.outcome.isnot(None),
+        ).order_by(t_ai_autonomous_run.completed_at.desc()).limit(limit).all()
+        return {
+            'active_runs': active_query.count(),
+            'queued_runs': int(queued),
+            'pending_alerts': [self._run_to_dict(row) for row in alerts],
+            'running_runs': [self._run_to_dict(row) for row in running],
+            'recent_conclusions': [
+                self._run_to_dict(row) for row in conclusions
+            ],
+        }
 
     def list_steps(self, owner: str, run_id: str) -> List[Dict[str, Any]]:
         from app.core.db.database import t_ai_autonomous_step
@@ -667,6 +904,24 @@ class AutonomyRepository:
         run = self.get_run(owner, run_id)
         run['steps'] = self.list_steps(owner, run_id)
         run['allowed_operations'] = self.allowed_operations(owner, run_id)
+        if (
+            run['status'] == RunStatus.FAILED.value
+            and not any(step['status'] in {
+                StepStatus.FAILED.value, StepStatus.OUTCOME_UNKNOWN.value,
+            } for step in run['steps'])
+        ):
+            from app.core.db.database import t_ai_autonomous_event
+
+            event = self.session.query(t_ai_autonomous_event).filter(
+                t_ai_autonomous_event.run_id == run_id,
+                t_ai_autonomous_event.event_type.in_(RUN_FAILURE_EVENT_TYPES),
+            ).order_by(t_ai_autonomous_event.sequence.desc()).first()
+            if event is not None:
+                note = sanitize_evidence(
+                    self._event_to_dict(event)['payload'].get('note') or ''
+                ).strip()
+                if note:
+                    run['failure_reason'] = note[:128]
         return run
 
     # ------------------------------------------------------------------
@@ -1422,6 +1677,7 @@ class AutonomyRepository:
         summary: str,
         step_id: Optional[str] = None,
         artifact_ids: Optional[List[str]] = None,
+        event_type: Optional[str] = None,
         commit: bool = True,
     ) -> Dict[str, Any]:
         """把一次执行观察归一化成有界脱敏的 Evidence 引用。
@@ -1433,7 +1689,7 @@ class AutonomyRepository:
             t_ai_autonomous_artifact, t_ai_autonomous_evidence,
         )
 
-        self._get_run_row(owner, run_id)
+        run = self._get_run_row(owner, run_id)
         if str(kind) not in EVIDENCE_KINDS:
             raise AutonomyValidationError('unknown evidence kind: %r' % (kind,))
         text = sanitize_text(summary or '')[:EVIDENCE_SUMMARY_CHARS]
@@ -1461,6 +1717,12 @@ class AutonomyRepository:
             trusted=False,
         )
         self.session.add(evidence)
+        if event_type:
+            self.append_event(run, str(event_type), {
+                'evidence_id': evidence.id,
+                'kind': evidence.kind,
+                'summary': evidence.summary,
+            })
         if commit:
             self._commit()
         return self._evidence_to_dict(evidence)
@@ -1481,6 +1743,7 @@ class AutonomyRepository:
         run_id: str,
         outcome: str,
         evidence_ids: List[str],
+        details: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """落库唯一终局 Outcome：必须引用同一 Run 的 Evidence。
 
@@ -1524,6 +1787,9 @@ class AutonomyRepository:
             raise AutonomyValidationError(
                 'conclusion may only cite same-run evidence'
             )
+        normalized_details = normalize_conclusion_details(
+            details or fallback_conclusion_details(),
+        )
 
         requested = str(outcome)
         forced = ''
@@ -1542,6 +1808,11 @@ class AutonomyRepository:
             forced = 'verification_missing'
 
         run.outcome = outcome
+        run.conclusion_json = json.dumps({
+            **normalized_details,
+            'final_status': outcome,
+            'evidence_ids': ids,
+        }, ensure_ascii=False, separators=(',', ':'))
         self._bump(run)
         self.append_event(run, 'run_concluded', {
             'outcome': outcome,

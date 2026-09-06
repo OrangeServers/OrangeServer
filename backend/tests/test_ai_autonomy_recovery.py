@@ -35,6 +35,7 @@ from app.core.db.database import (
     t_ai_autonomous_evidence,
     t_ai_autonomous_run,
     t_ai_autonomous_step,
+    t_acc_user,
     t_group,
     t_host,
 )
@@ -48,6 +49,9 @@ class FakePlatform:
         pass
 
     def validate_asset_ids(self, asset_ids):
+        return True
+
+    def validate_asset_sys_user_id_pair(self, asset_ids, sys_user_id):
         return True
 
     def resolve_system_user(self, sys_user_id):
@@ -92,12 +96,18 @@ def env(monkeypatch, tmp_path):
     db.metadata.create_all(
         engine,
         tables=[t_group.__table__, t_host.__table__,
+                t_acc_user.__table__,
                 t_ai_autonomous_run.__table__,
                 t_ai_autonomous_step.__table__,
                 t_ai_autonomous_event.__table__,
                 t_ai_autonomous_artifact.__table__,
                 t_ai_autonomous_evidence.__table__],
     )
+    session.add(t_acc_user(
+        alias="Administrator", name="admin", password="fake-hash",
+        usrole="admin", mail="admin@example.com", group="admins",
+    ))
+    session.commit()
 
     repo = AutonomyRepository(
         session, SECRET_KEY,
@@ -475,6 +485,41 @@ def test_checkpoint_loss_resumes_durable_proposal_at_policy(env):
     assert planner_calls == []
     assert len(env["runner"].calls) == 1
     assert _step_row(env, step["id"]).status == "succeeded"
+    assert "recovery_boundary_rebuild" in _event_types(env, run["id"])
+
+
+def test_checkpoint_loss_resumes_after_terminal_investigation_probes(env):
+    run = env["create_queued_run"]()
+    step_ids = [
+        env["repo"].propose_probe(
+            "admin", "admin", run["id"], probe_id,
+        )["id"]
+        for probe_id in ("system.load", "system.memory", "system.disk_usage")
+    ]
+    for index, step_id in enumerate(step_ids):
+        _step_row(env, step_id).status = (
+            "succeeded" if index == 0 else "failed"
+        )
+    env["session"].commit()
+    env["simulate_kill"](run["id"])
+    planner_contexts = []
+
+    def finish_planning(context):
+        planner_contexts.append(context)
+        return []
+
+    result = env["make_driver"](
+        saver=MemorySaver(), planner=finish_planning,
+    ).drive(run["id"], env["claim"](run["id"]))
+
+    assert result == drive_mod.RESULT_COMPLETED
+    assert len(planner_contexts) == 1
+    assert planner_contexts[0]["loops"] == 3
+    assert len(planner_contexts[0]["evidence"]) == 3
+    assert env["runner"].calls == []
+    assert [_step_row(env, step_id).status for step_id in step_ids] == [
+        "succeeded", "failed", "failed",
+    ]
     assert "recovery_boundary_rebuild" in _event_types(env, run["id"])
 
 

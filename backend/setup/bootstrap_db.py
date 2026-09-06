@@ -72,7 +72,8 @@ def main() -> int:
             t_acc_user,
             t_settings,
         )
-        from app.tools.basesec import hash_pwd
+        from app.tools.auto_update import sync_user_permissions
+        from app.tools.basesec import UNUSABLE_PASSWORD_HASH, hash_pwd
         from app.mail.config import save_configuration
         step('import', True, '业务模块加载成功')
     except Exception as exc:
@@ -100,7 +101,8 @@ def main() -> int:
             if not t_acc_user.query.filter_by(name='system').first():
                 db.session.add(t_acc_user(
                     id=99, alias='system', name='system',
-                    password=hash_pwd('!disabled-system-account!'),
+                    password=UNUSABLE_PASSWORD_HASH,
+                    password_version=2,
                     usrole='member', mail='system@orange.local',
                     group='admin', remarks='内置系统账号, 不可删除',
                 ))
@@ -111,15 +113,25 @@ def main() -> int:
                 hashed = hash_pwd(password)
                 existing = t_acc_user.query.filter_by(name=username).first()
                 legacy = t_acc_user.query.filter_by(name='admin').first()
+                previous_username = None
                 if existing is not None:
+                    if legacy is not None and legacy.id != existing.id:
+                        previous_username = legacy.name
+                        legacy.usrole = 'user'
+                        legacy.is_deleted = True
+                        legacy.password = UNUSABLE_PASSWORD_HASH
+                        legacy.password_version = 2
                     existing.password = hashed
                     existing.usrole = 'admin'
+                    existing.group = 'admin'
+                    existing.is_deleted = False
                     existing.password_version = 2
                     if email:
                         existing.mail = email
                     step('admin', True, '已更新既有账号 %s 为管理员' % username)
                 elif legacy is not None and username != 'admin':
                     # 覆盖种子 admin/admin 弱口令行：改名为向导管理员
+                    previous_username = legacy.name
                     legacy.alias = username
                     legacy.name = username
                     legacy.password = hashed
@@ -135,7 +147,15 @@ def main() -> int:
                         group='admin', remarks='首次部署向导创建',
                     ))
                     step('admin', True, '管理员 %s 已创建' % username)
+                sync_user_permissions(
+                    previous_username,
+                    username,
+                    True,
+                    True,
+                    commit=False,
+                )
                 db.session.commit()
+                step('admin_auth', True, '管理员已绑定所有权限')
             else:
                 step('admin', False, '缺少管理员用户名或密码')
                 raise ValueError('admin required')
@@ -153,6 +173,7 @@ def main() -> int:
                 db.session.commit()
             step('smtp', True, 'SMTP 设置已加密写入' if mail else '已跳过 SMTP 设置')
     except Exception as exc:
+        db.session.rollback()
         step('apply_db', False, '%s: %s' % (type(exc).__name__, exc))
         print(json.dumps({'ok': False, 'steps': steps}, ensure_ascii=False))
         return 4

@@ -58,9 +58,13 @@ SECRET_KEY = "unit-test-secret-key-for-autonomy-executor"
 class FakePlatform:
     def __init__(self, owner, role, state):
         self.state = state
+        self.state.setdefault("roles", []).append((owner, role))
 
     def validate_asset_ids(self, asset_ids):
         return self.state["asset_ok"]
+
+    def validate_asset_sys_user_id_pair(self, asset_ids, sys_user_id):
+        return self.state["asset_ok"] and self.state["credential_ok"]
 
     def resolve_system_user(self, sys_user_id):
         if not self.state["credential_ok"]:
@@ -116,7 +120,9 @@ def env():
         agreement="ssh",
     ))
     session.commit()
-    platform_state = {"asset_ok": True, "credential_ok": True}
+    platform_state = {
+        "asset_ok": True, "credential_ok": True, "roles": [],
+    }
     repo = AutonomyRepository(
         session, SECRET_KEY,
         platform_factory=lambda owner, role: FakePlatform(
@@ -559,6 +565,21 @@ def test_runtime_probe_observes_cancel_and_permission_revocation(env):
     user.usrole = "user"
     env["session"].commit()
     assert permission_probe() == TERMINATION_AUTHORIZATION_REVOKED
+
+
+def test_executor_ignores_stale_admin_role_and_uses_current_user_role(env):
+    run = env["create_queued_run"]()
+    step_id = env["approve_probe_step"](run["id"])
+    user = env["session"].query(t_acc_user).filter_by(name="admin").one()
+    user.usrole = "user"
+    env["session"].commit()
+    env["platform_state"]["roles"].clear()
+
+    env["executor"].execute_step(
+        "admin", "admin", run["id"], step_id,
+    )
+
+    assert env["platform_state"]["roles"][-1] == ("admin", "user")
 
 
 def test_runtime_probe_observes_lease_loss_and_action_tamper(env):

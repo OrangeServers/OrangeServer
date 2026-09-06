@@ -117,7 +117,7 @@ export async function postAiStream(
 export async function aiJsonRequest<T>(
   url: string,
   options: {
-    method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
+    method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
     body?: Record<string, unknown>
     signal?: AbortSignal
   } = {},
@@ -129,12 +129,27 @@ export async function aiJsonRequest<T>(
     headers: {
       Accept: 'application/json',
       ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(method === 'POST' || method === 'PUT' || method === 'DELETE' ? csrfHeaders() : {}),
+      ...(method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE' ? csrfHeaders() : {}),
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
     signal: options.signal,
   })
 
+  if (response.status === 401) {
+    window.location.href = '/login'
+    throw new Error(t('common.http.sessionExpired'))
+  }
+  if (!response.ok) throw await responseError(response)
+  return await response.json() as T
+}
+
+export async function aiFormRequest<T>(url: string, body: FormData): Promise<T> {
+  const response = await fetch(url, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { Accept: 'application/json', ...csrfHeaders() },
+    body,
+  })
   if (response.status === 401) {
     window.location.href = '/login'
     throw new Error(t('common.http.sessionExpired'))
