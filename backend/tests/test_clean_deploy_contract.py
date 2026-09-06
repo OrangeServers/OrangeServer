@@ -99,6 +99,7 @@ def test_compose_bootstrap_is_a_versioned_checksumming_thin_wrapper():
     assert 'set_key .env COMPOSE_PROJECT_NAME "$PROJECT_NAME"' in bootstrap
     assert "releases/download/${VERSION}" in bootstrap
     assert "sha256sum -c" in bootstrap
+    assert "chmod 0644 backend/mysqldir/*.sql" in bootstrap
     assert "bash ops/preflight-compose.sh bundled" in bootstrap
     assert "make docker-up-image" in bootstrap
     assert "openssl rand -hex" in bootstrap
@@ -203,10 +204,11 @@ def test_release_bundle_builder_stages_every_runtime_input(tmp_path):
     result = subprocess.run(
         [
             "bash",
+            "-c",
+            # bootstrap-compose-cn.sh builds the bundle under umask 077.
+            'umask 077; exec bash "$1" --version v1.2.3 --output-dir "$2"',
+            "build-deploy-bundle.sh",
             _shell_path(OPS / "build-deploy-bundle.sh"),
-            "--version",
-            "v1.2.3",
-            "--output-dir",
             _shell_path(output_dir),
         ],
         cwd=str(REPO_ROOT),
@@ -249,6 +251,23 @@ def test_release_bundle_builder_stages_every_runtime_input(tmp_path):
     # image, so neither may creep back into the bundle.
     assert not any(entry.startswith("orangeserver/deploy/nginx/") for entry in entries)
     assert not any(entry.startswith("orangeserver/frontend/") for entry in entries)
+
+    modes = subprocess.run(
+        ["bash", "-c", 'tar -tvzf "$1"', "tar", _shell_path(archive)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert modes.returncode == 0, modes.stderr
+    schema_entries = [
+        line for line in modes.stdout.splitlines()
+        if "/backend/mysqldir/" in line and not line.endswith("/")
+    ]
+    assert schema_entries, "release bundle carries no schema payload"
+    for line in schema_entries:
+        # The MySQL container runs its initdb script as uid 999; a schema that is
+        # not world-readable is skipped and the orange database stays empty.
+        assert line.startswith("-rw-r--r--"), line
 
     digest = output_dir / "orangeserver-deploy-v1.2.3.tar.gz.sha256"
     assert digest.is_file()
