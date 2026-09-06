@@ -101,6 +101,10 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `docker compose up --wait` could not succeed. The probe now applies the same
   three-state setup judgement as the worker entrypoint, and still gates on real
   checkpoint and worker readiness once the deployment is configured.
+- Read-only monitoring tools now surface their actionable failure reason (for
+  example the Prometheus sample-budget limit) as a validation error instead of
+  one opaque generic message, so the Agent can shorten the time window or widen
+  the step and retry.
 
 ## [1.1.1] - 2026-08-19
 
