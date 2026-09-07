@@ -5,8 +5,15 @@ Docker Compose 是推荐部署路径，已在真实的全新安装环境中完�
 
 ## Docker Compose（推荐）
 
-一条命令启动六个容器（前端、后端、自治 Worker、自治 Redis、MySQL、Redis），即
-[快速开始](/zh/guide/getting-started)描述的路径。
+bundled 发布路径一条命令启动四个产品容器：
+
+- `app`：Flask/Gunicorn、WebSocket、API 和内置 Vue SPA；
+- `worker`：负责可恢复自治 Run 的 Celery prefork Worker；
+- `redis`：Redis 8，DB0 保存检查点/向量，DB1 作为 Broker，DB2 保存会话/缓存；
+- `mysql`：业务、审计、Run 和知识元数据的持久化数据库。
+
+即[快速开始](/zh/guide/getting-started)描述的路径。开发自治覆盖层为了隔离可以额外
+启动专用 Redis，但它不属于四容器发布拓扑。
 
 全新安装可直接运行稳定 GitHub Release 中固定版本的薄引导器：
 

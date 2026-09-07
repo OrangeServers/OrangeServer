@@ -32,7 +32,7 @@ export default {
     cardLabel: '{signal} for {service}, {n} similar occurrences, linked Run status {status}',
   },
   create: 'New task draft',
-  featureDisabled: 'Autonomous runs are unavailable. The standard install enables them; confirm dedicated Redis and the Worker are running.',
+  featureDisabled: 'Autonomous runs are unavailable. The standard install enables them; confirm the Redis service and Worker are running.',
   notReady: 'Infrastructure not ready ({reason}); started runs will not execute. Drafts can still be created.',
   reason: {
     ready: 'ready',

@@ -26,7 +26,7 @@
 <table>
   <tr>
     <td align="center"><img src="docs/images/dashboard.png" alt="仪表盘"><br><sub>仪表盘 · 实时概览与 AI 执行统计</sub></td>
-    <td align="center"><img src="docs/images/ai-agent.png" alt="AI 运维"><br><sub>AI 运维 · 人工审批式批量操作</sub></td>
+    <td align="center"><img src="docs/images/ai-agent.png" alt="AI 运维工作台"><br><sub>AI 运维 · 引导式调查与受控自治任务</sub></td>
   </tr>
   <tr>
     <td align="center"><img src="docs/images/batch-ops.png" alt="批量命令"><br><sub>批量命令 · 逐资产结果与审计</sub></td>
@@ -54,7 +54,7 @@ OrangeServer 把日常 Linux 运维工作集中在同一个权限边界内：
 | 定时任务 | 使用 cron 表达式管理周期任务及最近执行结果 |
 | 权限管理 | 将平台用户/用户组关联到资产/资产组和系统用户 |
 | 日志审计 | 查询登录、命令和平台操作记录 |
-| AI 运维 | 查询已授权平台数据，运行固定只读诊断，生成需人工确认的批量操作 |
+| AI 运维 | 查询已授权平台数据，动态分析已配置监控来源，运行固定只读诊断并准备受控操作 |
 | M1 受控自治 | 按计划调查、执行、验证并产出可引用结论 |
 | M2 告警与知识闭环 | 告警触发调查，受控关联指标，并检索审核 Runbook 与已验证任务 |
 | 双语界面 | 全站中英双语，设置 → 外观与语言即时切换，持久化到服务端 |
@@ -87,13 +87,12 @@ flowchart LR
 Run 的证据 ID。需要改变主机状态的修复仍必须生成独立审批动作。详见
 [受控只读诊断](docs/ai/DIAGNOSTICS.md)。
 
-M1/S3 还提供独立的自治任务工作台（`/ai-runs`）：管理员可以把调查、受控变更、
-服务操作、独立验证和结论组织成一个可恢复 Run。它不是把 Shell 交给模型：目标资产、
-系统用户、权限模式、预算和动作白名单由服务端固定，写动作仍按 `ask`/Guardian/人工
-审批处理，`auto` 仅允许管理员标记为 `lab` 的资产。标准 bundled 安装会启动统一
-Redis 8 与 Worker，默认可用。M2 还提供 Alertmanager 告警入口、运维态势首页和
-管理员审核的向量知识库；知识引用只辅助调查，不能授权动作或替代独立验证。详见
-  [AI 运维使用指南](docs/ai/USER_GUIDE.md)。
+`/ai-ops` 工作台统一了对话、自治任务、告警和独立验证。管理员与普通用户都可以在
+自己拥有且被授权的资产/系统凭据范围内管理 Run；每次副作用前，服务端都会重新校验
+所有者和权限。M2 增加了 Prometheus、Grafana、Loki、Zabbix 的受控只读动态分析、
+Alertmanager 入口，以及独立一级入口 `/ai-knowledge` 的管理员审核知识库。知识引用
+只辅助调查，不能授权动作或替代独立验证。旧 `/ai-agent` 与 `/ai-runs*` 地址会重定向
+到工作台。详见[AI 运维使用指南](docs/ai/USER_GUIDE.md)。
 
 ## 快速开始
 
@@ -149,14 +148,21 @@ flowchart LR
     Nginx --> Frontend["Vue 3 静态资源"]
     Nginx --> API["Flask API / WebSocket"]
     API --> MySQL[("MySQL")]
-    API --> Redis[("Redis")]
+    API --> Redis[("Redis 8\nDB0 检查点/向量\nDB1 Broker\nDB2 会话/缓存")]
+    API --> Worker["Celery prefork Worker"]
+    Worker --> Redis
     API --> SSH["SSH / SFTP 目标资产"]
     API --> LLM["OpenAI-compatible Provider"]
+    API --> Sources["Prometheus / Grafana / Loki / Zabbix"]
+    Alertmanager["Alertmanager Webhook"] --> API
 ```
 
 - 后端：Python 3.12、Flask、Gunicorn、gevent、SQLAlchemy、Paramiko。
 - 前端：Vue 3、TypeScript、Vite、Element Plus、ECharts、xterm.js。
-- 数据：MySQL 保存业务与审计数据；Redis 保存会话、缓存、AI 对话、结果集和动作。
+- 数据：MySQL 保存业务、审计、Run 和知识元数据；统一 Redis 8 使用 DB0 保存检查点和
+  可重建向量，DB1 作为 Celery Broker，DB2 保存会话和带 TTL 的缓存。
+- 监控：服务端适配器只读取已配置的 Prometheus、Grafana、Loki 和 Zabbix；Alertmanager
+  可以进入同一条自治任务流程。
 - 部署：Docker Compose 为推荐路径，也提供 systemd、Supervisor 和 Kubernetes 示例。
 
 ## 文档入口
@@ -179,10 +185,9 @@ flowchart LR
 ## 项目状态
 
 OrangeServer 处于活跃开发中。当前 AI 能力覆盖权限过滤的平台查询、证据可溯的
-Linux/Docker 只读诊断、人工审批式批量命令，以及标准 bundled 安装默认启用的 M1
-受控自治。
-外部诊断适配器为后续规划；已发布能力与未发布能力的边界见
-[变更日志](CHANGELOG.md)和[AI 运维路线图](docs/ai/ROADMAP.md)。
+Linux/Docker 只读诊断、受控批量命令、可恢复自治 Run、动态监控分析、Alertmanager
+入口和审核知识检索。固定 SSH 诊断适配器与监控适配器是两条独立链路；已发布能力与
+未发布能力的边界见[变更日志](CHANGELOG.md)和[AI 运维路线图](docs/ai/ROADMAP.md)。
 
 ## 开发与贡献
 

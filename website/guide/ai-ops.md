@@ -1,42 +1,66 @@
 # AI operations
 
-OrangeServer's AI assistant works inside the same permission boundary as every
-human user — it queries authorized platform data, runs fixed read-only
-diagnostics, and prepares batch actions that always require human approval.
+OrangeServer's AI operations workbench keeps conversations, monitoring
+investigations, alerts, and controlled Autonomy Runs inside the same permission
+boundary as every human user. Chat is the read-only analysis entry point;
+remote writes continue through the existing approval-gated Run workflow.
 
 ![AI operations](/screens/ai-agent.png)
+![AI operations on a narrow screen](/screens/ai-agent-narrow.png)
 
-## What it can do
+## Start at the workbench
 
-- **Query platform data** through permission-filtered structured tools: assets,
-  groups, execution logs, audit records. Results come back as server-side
-  result sets with authoritative IDs.
-- **Run read-only diagnostics** on managed hosts using fixed server-owned
-  Linux/Docker profiles. Evidence is sanitized, size-capped, encrypted at
-  rest, and every finding must cite evidence from the current run.
-- **Prepare batch commands** across authorized assets. The plan is shown as an
-  approval card; nothing executes until a human approves it.
-- **Answer in your language** — replies follow the interface language setting.
+The primary routes are:
 
-## M1 controlled autonomy
+- `/ai-ops` — one workbench for the current conversation and recent task rail;
+- `/ai-ops/tasks` — tasks grouped by attention, running, and completed state;
+- `/ai-ops/alerts` — Runs entered through Alertmanager;
+- `/ai-knowledge` — reviewed Runbooks and verified-run retrieval.
 
-M1 adds an administrator-only workbench at `/ai-runs` for a single-host,
-recoverable Run: investigate, perform bounded changes, restart a service when
-approved, verify independently, and produce a cited conclusion. The server
-fixes the target, system account, permission profile, budget, and action
-allowlist; the model never receives an unrestricted shell. `auto` is restricted
-to assets explicitly marked `lab`.
+The four starter cards in an empty conversation fill a real prompt but do not
+send it automatically. Add the asset, service, or symptom, then choose the
+Autonomy profile before sending.
 
-The standard bundled install starts dedicated Redis and a Worker; autonomous
-runs are available by default. See the
-[repository AI guide](https://github.com/OrangeServers/OrangeServer/blob/main/docs/ai/USER_GUIDE.md).
+## Monitoring analysis
+
+An administrator configures read-only Prometheus, Grafana, Loki, and Zabbix
+sources under the monitoring-source settings and confirms their asset mappings.
+The Agent discovers the available metrics, log streams, panels, and monitoring
+items, then chooses bounded queries from the user's prompt. It can compare time
+windows and sources; it is not limited to a fixed CPU or availability check.
+
+The server controls destinations, credentials, labels, query shape, time range,
+sample and response limits. Monitoring analysis in chat is read-only. When a
+change, restart, or continued investigation is needed, the user explicitly
+creates an Autonomy Run.
+
+## Controlled Autonomy Runs
+
+Administrators and ordinary users can create and manage their own single-host
+Runs when the asset and system-account combination is authorized. A Run records
+the plan, approvals, actions, evidence, independent verification, and final
+conclusion. The server fixes the target, account, profile, budget, and action
+allowlist; the model never receives an unrestricted shell.
+
+The four-container bundled install uses one Redis 8 service split into DB0
+checkpoint/vector data, DB1 Celery broker, and DB2 sessions/cache, plus a
+prefork Worker. `ask`, `ai_review`, and `custom` remain bounded by server-side
+approval rules; `auto` is restricted to `lab` assets.
+
+## Knowledge
+
+`/ai-knowledge` is a first-level entry. Users can search authorized global and
+host-scoped metadata and citations; only administrators can add or change
+Runbooks, approve sources, configure embeddings, or rebuild the index. The
+index accepts reviewed Markdown Runbooks and verified resolved Runs, not chat,
+credentials, raw SSH output, or unsanitized logs.
 
 ## What it cannot do
 
 - It cannot run SQL or open an unrestricted shell.
-- Chat diagnostics and batch commands never execute until a human approves
-  them. M1 server-owned `allow` probes may continue without a per-step prompt;
-  `auto` is limited to assets marked `lab` and still cannot elevate a `deny`.
+- Chat monitoring analysis is read-only. Run writes are governed by the selected
+  profile and server-side approval policy; `auto` is limited to assets marked
+  `lab` and still cannot elevate a `deny`.
 - It cannot invent asset IDs, database fields, or execution results — tool
   results are the only source of truth.
 - Tool output, history summaries, and diagnostic evidence are treated as
@@ -45,9 +69,9 @@ runs are available by default. See the
 
 ## Evidence and audit
 
-Every tool call, approval, and execution is recorded. Diagnostic findings are
-deterministic and citable — each one references evidence IDs from the current
-diagnostic run, so conclusions can always be traced back to raw data.
+Every tool call, approval, monitoring observation, and execution is recorded.
+Diagnostic findings and monitoring observations are citable; Run conclusions
+reference Evidence from the current investigation and independent verification.
 
 ## Learn more
 

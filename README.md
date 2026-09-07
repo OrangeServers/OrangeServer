@@ -26,7 +26,7 @@
 <table>
   <tr>
     <td align="center"><img src="docs/images/dashboard.png" alt="Dashboard"><br><sub>Dashboard · live overview and AI execution stats</sub></td>
-    <td align="center"><img src="docs/images/ai-agent.png" alt="AI operations agent"><br><sub>AI operations · approval-gated batch actions</sub></td>
+    <td align="center"><img src="docs/images/ai-agent.png" alt="AI operations workbench"><br><sub>AI operations · guided investigations and controlled runs</sub></td>
   </tr>
   <tr>
     <td align="center"><img src="docs/images/batch-ops.png" alt="Batch command canvas"><br><sub>Batch commands · per-asset results and audit</sub></td>
@@ -54,7 +54,7 @@ OrangeServer keeps day-to-day Linux operations inside one permission boundary:
 | Scheduled jobs | Manage cron-style jobs and inspect recent results |
 | Authorization | Map platform users/groups to assets/groups and system accounts |
 | Audit | Query login, command, and platform operation trails |
-| AI operations | Query authorized data, run fixed read-only diagnostics, and prepare batch actions that require human approval |
+| AI operations | Query authorized data, dynamically analyze configured monitoring sources, run fixed read-only diagnostics, and prepare controlled actions |
 | M1 controlled autonomy | Investigate, execute bounded changes, verify independently, and produce cited conclusions |
 | M2 alert and knowledge loop | Trigger investigation from alerts, attach bounded metrics, and retrieve reviewed runbooks and verified runs |
 | Bilingual UI | Full Chinese/English interface; switch instantly under Settings → Appearance & Language, persisted server-side |
@@ -89,18 +89,16 @@ rule findings must cite evidence IDs from the current run. Any fix that changes
 host state still requires a separate approval-gated action. See
 [controlled read-only diagnostics](docs/ai/DIAGNOSTICS.md).
 
-M1/S3 also provides an administrator-only autonomy workbench (`/ai-runs`) for a
-single-host, recoverable Run: investigation, bounded changes, service operations,
-independent verification, and a cited conclusion. This is not a model-owned
-shell. The server fixes the target asset, system account, permission profile,
-budget, and action allowlist; write actions still follow `ask`/Guardian/human
-approval rules, and `auto` is restricted to assets marked `lab`. The standard
-bundled install starts one Redis 8 service and a Worker; autonomous runs are
-available by default. M2 also adds an Alertmanager entry point, an operations
-posture page, and administrator-reviewed vector knowledge. Knowledge citations
-inform investigation but never grant permissions or replace independent
-verification. See the
-  [AI operations guide](docs/ai/USER_GUIDE.md).
+The `/ai-ops` workbench brings together conversations, task runs, alerts, and
+independent verification. Administrators and ordinary users can manage their
+own Runs within their authorized asset and system-account scope; the server
+rechecks ownership and permissions before every side effect. M2 adds bounded
+read-only analysis for configured Prometheus, Grafana, Loki, and Zabbix sources,
+an Alertmanager entry point, and administrator-reviewed vector knowledge at
+`/ai-knowledge`. Knowledge citations inform investigation but never grant
+permissions or replace independent verification. Legacy `/ai-agent` and
+`/ai-runs*` URLs redirect to the workbench. See the
+[AI operations guide](docs/ai/USER_GUIDE.md).
 
 ## Quick start
 
@@ -160,15 +158,22 @@ flowchart LR
     Nginx --> Frontend["Vue 3 static app"]
     Nginx --> API["Flask API and WebSocket"]
     API --> MySQL[("MySQL")]
-    API --> Redis[("Redis")]
+    API --> Redis[("Redis 8\nDB0 checkpoint/vector\nDB1 broker\nDB2 session/cache")]
+    API --> Worker["Celery prefork Worker"]
+    Worker --> Redis
     API --> Targets["SSH / SFTP targets"]
     API --> Provider["OpenAI-compatible provider"]
+    API --> Sources["Prometheus / Grafana / Loki / Zabbix"]
+    Alertmanager["Alertmanager webhook"] --> API
 ```
 
 - Backend: Python 3.12, Flask, Gunicorn, gevent, SQLAlchemy, Paramiko.
 - Frontend: Vue 3, TypeScript, Vite, Element Plus, ECharts, xterm.js.
-- Data: MySQL for durable business and audit data; Redis for sessions, caches,
-  AI conversations, result sets, and pending actions.
+- Data: MySQL for durable business, audit, Run, and knowledge metadata; unified
+  Redis 8 uses DB0 for checkpoints and rebuildable vectors, DB1 for the Celery
+  broker, and DB2 for sessions and TTL-bound caches.
+- Monitoring: server-owned adapters read configured Prometheus, Grafana, Loki,
+  and Zabbix sources; Alertmanager can enter the same Run workflow.
 - Deployment: Docker Compose is the recommended path; systemd, Supervisor, and
   Kubernetes examples are provided.
 
@@ -191,11 +196,11 @@ flowchart LR
 
 OrangeServer is under active development. The current AI capability covers
 permission-filtered platform queries, evidence-backed read-only Linux/Docker
-diagnostics, approval-gated batch commands, and M1 controlled autonomy
-(enabled by default in the standard bundled install). External diagnostic
-adapters remain
-future work; see the [changelog](CHANGELOG.md) and [AI roadmap](docs/ai/ROADMAP.md)
-for the released/unreleased boundary.
+diagnostics, controlled batch commands, recoverable Autonomy Runs, dynamic
+monitoring analysis, Alertmanager intake, and reviewed knowledge retrieval.
+The fixed SSH diagnostic adapter remains separate from the monitoring adapters;
+see the [changelog](CHANGELOG.md) and [AI roadmap](docs/ai/ROADMAP.md) for the
+released/unreleased boundary.
 
 ## Security and support
 

@@ -22,7 +22,8 @@ OrangeServer（橘子平台）是一款面向运维场景的资产 / 命令 / �
 | 批量脚本 | ✅ | Shell 脚本拖拽上传 + 批量执行 |
 | 定时任务 | ✅ | APScheduler 内存调度 + Redis 缓存最新结果 |
 | 日志审计 | ✅ | 登录日志 / 命令日志 / 操作日志（统一 `CzToolsLog` 审计基类） |
-| AI 运维 | ✅ | OpenAI-compatible 模型接入、平台工具调用与批量命令审批 |
+| AI 运维 | ✅ | OpenAI-compatible 模型接入、平台工具调用、监控分析与批量命令审批 |
+| 自治任务与知识库 | ✅ | 可恢复 Run、独立验证、审核 Runbook、向量检索与引用 |
 | 系统设置 | ✅ | 安全策略 / 终端 / 审计 / 文件传输 / 通知 / 界面语言 |
 | 统计图表 | ✅ | 登录/用户/错误趋势 |
 | 验证码 | ✅ | PIL 图形验证码 + IP 限流（30 次/分钟） |
@@ -37,7 +38,7 @@ OrangeServer（橘子平台）是一款面向运维场景的资产 / 命令 / �
 | 调度器 | APScheduler（内存模式） |
 | ORM | SQLAlchemy 2.0 + Flask-SQLAlchemy |
 | 数据库 | MySQL 8.0（utf8mb4） |
-| 缓存 | Redis 7（默认 DB 0，业务库隔离走 key prefix） |
+| 缓存 | Redis 8（DB0 检查点/向量、DB1 Celery Broker、DB2 会话/缓存） |
 | SSH | paramiko 3.x |
 | WebSocket | gevent-websocket |
 | 密码哈希 | bcrypt |
@@ -61,7 +62,7 @@ backend/
 │   ├── core/                  # 基础设施
 │   │   ├── config.py          # 配置加载（OGS_* 环境变量）
 │   │   └── db/
-│   │       ├── database.py    # 23 张表 ORM 模型
+│   │       ├── database.py    # 业务 ORM 模型
 │   │       └── settings.py    # SQLAlchemy 实例 + session
 │   ├── audit/                 # 审计日志
 │   │   └── loginlogs.py       # 登录日志查询
@@ -161,8 +162,8 @@ python init.py
 
 ## 数据库结构
 
-共 **23 张表**（`orange.sql` 导入 + `db.create_all()` 自动补建；数量随迁移演进，
-以 `orange.sql` 的 `CREATE TABLE` 为准）。
+表结构由 `orange.sql` 与 `backend/migrations/` 共同演进；迁移和发布升级流程是结构的
+权威来源，不在这里维护易过期的表数量。
 
 ### 核心业务表
 

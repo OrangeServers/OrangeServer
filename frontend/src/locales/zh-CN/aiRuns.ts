@@ -30,7 +30,7 @@ export default {
     cardLabel: '{signal}，服务 {service}，同类触发 {n} 次，关联 Run 状态 {status}',
   },
   create: '新建任务草稿',
-  featureDisabled: '自治任务当前不可用。标准安装默认启用；请确认专用 Redis 与 Worker 已启动。',
+  featureDisabled: '自治任务当前不可用。标准安装默认启用；请确认 Redis 服务与 Worker 已启动。',
   notReady: '基础设施未就绪（{reason}），任务启动后不会被执行；草稿仍可创建。',
   reason: {
     ready: '就绪',

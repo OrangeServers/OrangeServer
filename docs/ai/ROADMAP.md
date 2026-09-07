@@ -1,7 +1,7 @@
 # AI 运维路线图
 
-> 本文同时记录已实现的 M1 受控自治和正在推进的 M2。标准 bundled 栈包含统一
-> Redis 与 Worker，默认可用。当前可用行为以
+> 本文记录已发布的 M1 受控自治和 M2 实现，以及仍需单独补齐的验收证据。标准 bundled
+> 栈包含统一 Redis 8 与 Worker，默认可用。当前可用行为以
 > [AI 运维使用指南](USER_GUIDE.md)、[受控只读诊断](DIAGNOSTICS.md) 和
 > [AI REST/SSE 契约](API.md) 为准。
 
@@ -31,7 +31,9 @@ M0 是已经发布的能力：
 - 256K 标准上下文与 Provider 声明支持时可选的 1M 深度诊断档。
 
 当前诊断不能提交自由 Shell，修复也不会由诊断流程直接执行。M1/S3 提供独立自治
-任务工作台；标准发布栈默认启动统一 Redis 8 与 Worker，管理员仍可关闭自治入口。
+任务工作台；标准发布栈默认启动统一 Redis 8 与 Worker，管理员仍可关闭自治入口。M2
+已随 v1.2.0 发布：告警触发、动态监控分析、统一 AI 运维工作台和审核知识检索均已
+进入当前产品基线。
 
 ## 长期里程碑
 
@@ -39,7 +41,7 @@ M0 是已经发布的能力：
 |---|---|---|
 | M0 当前基线 | AI 对话、固定只读诊断、批量命令审批、审计和上下文档位 | 已发布；后续不得破坏兼容性 |
 | M1 Linux 自治 | 单机调查、安装、配置修改、服务操作、验证、审批暂停和重启恢复 | 强杀恢复、安全测试和完整纵向闭环通过 |
-| M2 监控与事故工作台 | Prometheus、Loki、Alertmanager 受控查询；异常时间线、最近变更关联和告警触发调查 | 查询范围、租户、超时、脱敏和 Evidence 契约稳定 |
+| M2 监控与事故工作台（v1.2.0） | Prometheus、Grafana、Loki、Zabbix、Alertmanager 受控接入；任务工作台、知识检索和告警触发调查 | 已发布实现；查询范围、租户、超时、脱敏和 Evidence 契约持续验收 |
 | M3 Docker | 容器、Compose、事件和日志诊断；受控重启、重建、旧 digest 回退及验证 | 不暴露宿主 Docker socket；结构化执行和回退证据稳定 |
 | M4 Kubernetes | 先做只读 Analyzer，再做 restart、scale、rollback 等修复 | 最小 RBAC、Secret 排除、dry-run、diff、审批和复核通过 |
 | M5 运维知识闭环 | 已验证处置转 Runbook、相似事故、健康节点对比、服务拓扑、影响范围和复盘草稿 | 积累足够经人工审核的真实成功案例 |
@@ -56,13 +58,14 @@ Alertmanager → Prometheus/SSH → Autonomy Run 闭环；S2 增加只索引审�
 已验证 Run 的可重建向量知识库。M2 不迁移 ASGI/asyncio，不替换 Celery prefork，
 也不新增默认监控或向量数据库容器。
 
-当前 Unreleased 已完成 S0、S1 和 S2 实现：单条 Alertmanager 告警入口、固定
-Prometheus 可用性观察、Run 触发契约、运维状态聚合，以及只索引审核 Runbook 与
-独立验证 Run 的本地/远程 embedding 知识库。AI 运维入口已统一为 Agent 工作台、
+v1.2.0 已发布 S0、S1 和 S2 实现：单条 Alertmanager 告警入口、固定 Prometheus
+可用性观察、Run 触发契约、运维状态聚合，以及只索引审核 Runbook 与独立验证 Run 的
+本地/远程 embedding 知识库。AI 运维入口已统一为 Agent 工作台、
 分组任务和告警视图，知识库保持独立一级入口。当前聊天可发现已确认资产映射的
 Prometheus、Grafana、Loki 与 Zabbix 能力，并动态查询指标、日志、Panel 与监控项历史；
-没有引入 HolmesGPT 运行时、第二套 Agent 或额外容器。测试机真实告警、并行 Run、知识复用与
-从零四容器纵向验收仍由 Issue #25 跟踪，未完成前不视为 M2 发布门通过。
+没有引入 HolmesGPT 运行时、第二套 Agent 或额外容器。Issue #25 中的测试机真实告警、
+并行 Run、知识复用与从零四容器纵向验收属于发布后的验收证据轨道；它们的完成状态必须
+以实际记录为准，不能再用“Unreleased”描述已经发布的实现。
 
 - Prometheus 和 Loki 请求必须经过服务端查询代理；模型不能提供任意 URL、Header、tenant
   或跳出已确认资产标签。PromQL 由指标、函数和聚合参数生成，LogQL 只开放映射流内过滤。
@@ -242,16 +245,17 @@ M1 不承诺通用自动回滚。结构化文件补丁必须有备份并可恢�
 
 ### 已实现接口
 
-以下接口已实现，但只有管理员且在 `OGS_AI_AUTONOMY_ENABLED` 显式打开时才允许创建、
-启动或推进 Run。`GET /ai/autonomy/status` 始终可用于区分 feature flag、Redis
-checkpoint 和 Worker 是否就绪；接口字段以 [AI REST/SSE 契约](API.md) 为准。
+以下接口已实现。管理员和普通用户都可以在 `OGS_AI_AUTONOMY_ENABLED` 打开且资产、
+系统凭据组合已授权时创建、查看、启动、决定和取消自己拥有的 Run；跨 owner 访问仍按
+不存在处理。`GET /ai/autonomy/status` 始终可用于区分 feature flag、Redis checkpoint
+和 Worker 是否就绪；接口字段以 [AI REST/SSE 契约](API.md) 为准。
 
 | 方法 | 路径 | 行为 |
 |---|---|---|
 | GET | `/ai/autonomy/status` | feature、Worker 和 checkpoint 就绪状态 |
 | POST | `/ai/autonomous-runs` | 创建并预检 draft |
 | POST | `/ai/autonomous-runs/{run_id}/start` | 锁定范围并异步启动 |
-| GET | `/ai/autonomous-runs` | 当前管理员的分页列表 |
+| GET | `/ai/autonomous-runs` | 当前用户拥有且有权访问的分页列表 |
 | GET | `/ai/autonomous-runs/{run_id}` | 权威快照、Step、结果和 `allowed_operations` |
 | GET | `/ai/autonomous-runs/{run_id}/stream?after_seq=` | 从指定 Event 序号续传 SSE |
 | POST | `/ai/autonomous-runs/{run_id}/steps/{step_id}/decision` | 对当前允许操作作出决定 |
