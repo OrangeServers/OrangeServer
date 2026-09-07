@@ -17,6 +17,8 @@ flowchart LR
     API --> Worker["自治 Worker"]
     Worker --> Cache
     Worker -->|"解密后仅在内存使用"| SSH
+    API --> Sources["Prometheus / Grafana / Loki / Zabbix\n只读监控适配器"]
+    Alertmanager["Alertmanager Webhook"] --> API
 ```
 
 | 边界 | 可信输入 | 必须视为不可信 |
@@ -92,6 +94,18 @@ sequenceDiagram
   TTL 的会话和缓存；它不是业务事实源。
 - 远端输出按不可信 Evidence 处理：清理、脱敏、限长后加密保存。
 
+## M2 监控与知识边界
+
+- Alertmanager 只能引用服务端已经确认的资产和凭据映射；`firing` 进入 `ask` Run，
+  `resolved` 只是观察证据，不能替代独立验证。
+- Prometheus、Grafana、Loki 和 Zabbix 通过服务端拥有的适配器只读访问。模型可以根据
+  用户问题选择已发现的指标、日志流、Panel 或监控项，但不能提交任意 URL、Header、
+  tenant、PromQL、LogQL 或 Zabbix method。
+- 监控响应在边界内完整提供给 Agent 和检查器，只脱敏秘密并执行时间、样本、日志和
+  响应大小上限；监控观察不能授权动作或替代 Run Evidence。
+- 知识库只接受管理员审核的 Runbook 和已独立验证的已解决 Run。Redis 中的向量和
+  chunk 是可重建派生数据，引用只辅助调查，不扩大资产权限。
+
 启用命令和关闭条件见 [AI 运维使用指南](../ai/USER_GUIDE.md) 与
 [部署手册](../../DEPLOY.md)。
 
@@ -114,12 +128,12 @@ sequenceDiagram
 | 资产、授权、系统用户、审计 | MySQL | 按业务表和管理员策略 |
 | Web 会话、缓存 | Redis | 由各功能 TTL 控制 |
 | AI 会话、结果集 | Redis | 7 天 |
-| AI 待审批动作 | Redis 7 | 10 分钟；执行状态会适当延长 |
+| AI 待审批动作 | 统一 Redis 8（DB2） | 10 分钟；执行状态会适当延长 |
 | AI 工具展示事件 | AI 会话 | 每个会话最多保留最近 200 条 |
 | 诊断 Run、事件、加密证据、报告 | MySQL | 证据默认 7 天；报告、Run 与事件默认 90 天后级联删除，可配置 |
 | 自治 Run、Step、Event | MySQL | 默认 90 天 |
 | 自治 Artifact / Evidence | MySQL | Artifact 默认 7 天；Evidence 引用随 Run 保留 |
-| 自治 checkpoint / Celery broker | Redis 8 | 仅隔离栈；不保存最终业务结果 |
+| 自治 checkpoint / Celery broker | 统一 Redis 8（DB0/DB1） | 不保存最终业务结果 |
 
 Redis 中的 AI 对话不是永久事件存储。若组织需要长期留存，应以审计日志和外部
 合规系统为准。

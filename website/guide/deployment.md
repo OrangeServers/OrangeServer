@@ -6,9 +6,17 @@ service-manager paths are advanced references for operators who need them.
 
 ## Docker Compose (recommended)
 
-Six containers (frontend, backend, autonomy worker, autonomy Redis, MySQL, and
-Redis) start with one command.
-This is the path described in [Getting started](/guide/getting-started).
+The bundled release starts four product containers with one command:
+
+- `app` — Flask/Gunicorn, WebSocket, API, and the built-in Vue SPA;
+- `worker` — Celery prefork worker for recoverable Autonomy Runs;
+- `redis` — Redis 8, split into DB0 checkpoint/vector, DB1 broker, and DB2
+  session/cache data;
+- `mysql` — durable business, audit, Run, and knowledge metadata.
+
+This is the path described in [Getting started](/guide/getting-started). The
+development autonomy overlay may add a separate Redis for isolation; it is not
+part of the four-container release topology.
 
 For a new installation, run the version-pinned launcher from the stable
 GitHub Release:

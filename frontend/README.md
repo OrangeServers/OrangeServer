@@ -224,7 +224,13 @@ location /local/websocket {
 | `/log-login` | AuditUserLog | ✅ | 登录日志 |
 | `/log-exec` | AuditComLog | ✅ | 执行日志 |
 | `/log-op` | AuditCzLog | ✅ | 操作日志 |
-| `/ai-agent` | AIAgent | ✅ | AI 运维 Agent |
+| `/ai-ops` | AiOpsShell / AIAgent | ✅ user/admin | AI 运维工作台与当前对话 |
+| `/ai-ops/tasks` | AiRuns | ✅ user/admin | 按状态分组的自治任务 |
+| `/ai-ops/tasks/:runId` | AiRunDetail | ✅ user/admin | Run 的审批、证据、验证和结论 |
+| `/ai-ops/alerts` | AiRuns | ✅ user/admin | Alertmanager 触发的 Run |
+| `/ai-ops/sources` | Settings | ✅ admin | 监控数据源与资产映射 |
+| `/ai-knowledge` | AiKnowledge | ✅ user/admin | 知识源、索引状态和检索测试 |
+| `/ai-agent`, `/ai-runs*` | Redirect | ✅ user/admin | 兼容旧书签，重定向到新工作台 |
 
 ---
 

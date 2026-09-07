@@ -121,7 +121,8 @@ Runbook。Runbook 是调查和处置步骤建议，不是已执行记录。涉�
 
 ## 当前范围与后续适配器
 
-当前只实现现有 SSH 执行链上的 Linux/Docker `SSHProbeAdapter`。内部接口为
-`DiagnosticSourceAdapter`，后续可以接入 Fleet/osquery、Prometheus/Loki 或
-HolmesGPT，但当前没有公开第三方插件 ABI，也没有引入常驻 Agent、Ansible Runner
-或 HolmesGPT sidecar。
+当前固定主机诊断只实现现有 SSH 执行链上的 Linux/Docker `SSHProbeAdapter`。内部接口为
+`DiagnosticSourceAdapter`；M2 的 Prometheus、Grafana、Loki 和 Zabbix 监控分析属于独立
+的 `MonitoringAdapter` 只读链路，不是把监控数据伪装成 SSH 诊断。后续如需把 Fleet/osquery
+等来源加入固定诊断流程，再单独评估；当前没有公开第三方插件 ABI，也没有引入常驻 Agent、
+Ansible Runner 或 HolmesGPT sidecar。
