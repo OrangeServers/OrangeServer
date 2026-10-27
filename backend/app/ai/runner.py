@@ -86,14 +86,14 @@ class AgentRunner:
         context_manager: Optional[ContextManager] = None,
         diagnostic_service_factory: Optional[Any] = None,
         worker_context_factory: Optional[Any] = None,
-        max_steps: int = 5,
+        max_steps: int = 15,
     ):
         self.store = store
         self.providers = provider_service or ProviderConfigService()
         self.context = context_manager
         self.diagnostic_service_factory = diagnostic_service_factory
         self.worker_context_factory = worker_context_factory
-        self.max_steps = max(1, min(8, int(max_steps)))
+        self.max_steps = max(1, min(20, int(max_steps)))
 
     def _diagnostic_service(self):
         if self.diagnostic_service_factory is not None:
@@ -522,11 +522,42 @@ class AgentRunner:
 
             registry.monitoring_executor = execute_monitoring
 
-            for _step in range(self.max_steps):
+            def finish_partial(content, reason="rounds"):
+                if _configured_language() == "en-US":
+                    text = ("Investigation incomplete: the context budget was reached."
+                            if reason == "context" else
+                            "Investigation incomplete: the tool-call round limit was reached.")
+                    fallback = "Review the completed tool results and evidence above, then continue the investigation."
+                else:
+                    text = ("调查未完成：已达到上下文预算上限。" if reason == "context"
+                            else "调查未完成：已达到工具调用轮数上限。")
+                    fallback = "请查看上方已完成的工具结果和证据，并继续调查。"
+                text += "\n\n" + (content or fallback)
+                self.store.append_message(owner, conversation_id, {
+                    "id": uuid.uuid4().hex,
+                    "role": "assistant",
+                    "content": text,
+                    "created_at": time.time(),
+                })
+                yield sse_event("assistant.delta", run_id=run_id, content=text)
+                yield sse_event(
+                    "run.completed", run_id=run_id,
+                    conversation_id=conversation_id,
+                    waiting_for_approval=False, partial=True,
+                )
+
+            for _step in range(self.max_steps + 1):
+                finalizing = _step == self.max_steps
+                partial_reason = "rounds"
                 renew_lock()
+                final_instruction = (
+                    "\n\n调查已达到工具调用轮数上限，不得继续调用工具。"
+                    "请仅依据已有工具结果总结已确认事实及其引用、"
+                    "未完成事项和未知项，明确说明调查未完成。"
+                ) if finalizing else ""
                 context_manager.set_runtime_reservations(
-                    system_prompt=build_system_prompt(),
-                    tools=registry.definitions(),
+                    system_prompt=build_system_prompt() + final_instruction,
+                    tools=None if finalizing else registry.definitions(),
                     state=conversation.get("state") or {},
                 )
                 conversation = self._compress(
@@ -546,6 +577,8 @@ class AgentRunner:
                     conversation,
                     extra_context=diagnostic_context,
                 )
+                if finalizing:
+                    provider_messages[0]["content"] += final_instruction
                 estimated_input_tokens = context_manager.estimate_tokens(
                     conversation.get("messages") or [],
                     (
@@ -561,15 +594,51 @@ class AgentRunner:
                     metrics["context_budget"] = budget
                     metrics["truncation_reason"] = "input_budget_exceeded"
                     self.store.save_conversation(owner, conversation)
-                    yield sse_event(
-                        "run.failed",
-                        run_id=run_id,
-                        message=(
-                            "会话上下文超过当前模型的安全输入预算；"
-                            "压缩未能释放足够空间，请新建会话或改用更大上下文模型"
-                        ),
+                    current = conversation.get("messages") or []
+                    last_user = next((i for i in range(len(current) - 1, -1, -1)
+                                      if current[i].get("role") == "user"), -1)
+                    tool_messages = [m for m in current[last_user + 1:] if m.get("role") == "tool"]
+                    historical = not tool_messages
+                    if historical:
+                        tool_messages = [m for m in current[:last_user] if m.get("role") == "tool"]
+                    if not tool_messages:
+                        yield sse_event(
+                            "run.failed", run_id=run_id,
+                            message=("会话上下文超过当前模型的安全输入预算；"
+                                     "压缩未能释放足够空间，请新建会话或改用更大上下文模型"),
+                        )
+                        return
+                    partial_reason = "context"
+                    finalizing = True
+                    final_instruction = (
+                        "\n\n调查因上下文预算中断，不得调用工具。以下证据可能被截断或省略；"
+                        "历史证据不代表当前状态；只依据所给证据总结已确认事实、引用、未知项和未完成事项。"
                     )
-                    return
+                    tool_names = {call.get("id"): (call.get("function") or {}).get("name")
+                                  for message in current
+                                  for call in message.get("tool_calls") or []}
+                    evidence = [{"tool_call_id": m.get("tool_call_id"),
+                                 "tool": tool_names.get(m.get("tool_call_id")),
+                                 "excerpt": str(m.get("content") or "")[:256]}
+                                for m in tool_messages[-32:]]
+                    payload = json.dumps({
+                        "type": "untrusted_partial_evidence", "truncated": True,
+                        "historical_evidence": historical,
+                        "omitted_results": max(0, len(tool_messages) - len(evidence)),
+                        "goal": str(current[last_user].get("content") or "")[:1500],
+                        "evidence": evidence,
+                    }, ensure_ascii=False, separators=(",", ":"))
+                    provider_messages = [
+                        {"role": "system", "content": build_system_prompt() + final_instruction},
+                        {"role": "user", "content": payload},
+                    ]
+                    context_manager.set_runtime_reservations(
+                        system_prompt=provider_messages[0]["content"], tools=None, state={},
+                    )
+                    estimated_input_tokens = context_manager.estimate_tokens([provider_messages[1]])
+                    if estimated_input_tokens > context_manager.effective_input_tokens:
+                        yield from finish_partial("", partial_reason)
+                        return
 
                 def provider_worker(
                     messages=provider_messages,
@@ -578,9 +647,9 @@ class AgentRunner:
                     try:
                         response = adapter.complete(
                             messages=messages,
-                            tools=registry.definitions(),
-                            tool_choice="auto",
-                            on_delta=lambda delta: result_queue.put(
+                            tools=None if finalizing else registry.definitions(),
+                            tool_choice=None if finalizing else "auto",
+                            on_delta=None if finalizing else lambda delta: result_queue.put(
                                 ("delta", delta)
                             ),
                         )
@@ -602,7 +671,23 @@ class AgentRunner:
                     elif item_type == "result":
                         result = item
                     else:
+                        if finalizing:
+                            logger.warning("AI partial summary failed: run_id=%s", run_id)
+                            break
                         raise item
+                if finalizing:
+                    partial = ""
+                    if result is not None:
+                        conversation = self._record_provider_observability(
+                            owner, conversation, result, context_manager,
+                            estimated_input_tokens,
+                        )
+                    if (result is not None and not result.tool_calls
+                            and not result.truncated and result.finish_reason != "length"
+                            and result.content.strip()):
+                        partial = result.content.strip()
+                    yield from finish_partial(partial, partial_reason)
+                    return
                 conversation = self._record_provider_observability(
                     owner,
                     conversation,

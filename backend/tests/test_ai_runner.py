@@ -39,6 +39,81 @@ class TextAdapter:
         )
 
 
+@pytest.mark.parametrize("summary_result", ["ok", "error", "truncated", "tool_call"])
+@pytest.mark.parametrize("language", ["zh-CN", "en-US"])
+def test_tool_budget_finishes_with_partial_result(monkeypatch, summary_result, language):
+    from app.ai.context import ContextManager
+    from app.ai.provider import ChatResult, ProviderToolCall
+    from app.ai.runner import AgentRunner
+    from app.ai.storage import AgentStore
+    from app.ai.tools import ToolRegistry
+
+    monkeypatch.setattr("app.ai.runner._configured_language", lambda: language)
+    executed = []
+    reservations = []
+    original_reservations = ContextManager.set_runtime_reservations
+
+    def record_reservations(manager, **kwargs):
+        reservations.append(kwargs)
+        return original_reservations(manager, **kwargs)
+
+    monkeypatch.setattr(ContextManager, "set_runtime_reservations", record_reservations)
+
+    def execute(_registry, name, arguments):
+        executed.append((name, arguments))
+        return {"result_set_id": "evidence-1", "summary": {"total": 1}}
+
+    monkeypatch.setattr(ToolRegistry, "execute", execute)
+
+    class Adapter:
+        def __init__(self):
+            self.rounds = 0
+
+        def complete(self, *, messages, tools=None, tool_choice=None, **_kwargs):
+            if tools is None:
+                assert tool_choice is None
+                assert "调查未完成" in messages[0]["content"]
+                assert any(m.get("role") == "tool" for m in messages)
+                if summary_result == "error":
+                    raise RuntimeError("provider failed")
+                if summary_result == "truncated":
+                    return ChatResult(content="截断", tool_calls=(), used_stream=False, truncated=True)
+                if summary_result == "tool_call":
+                    return ChatResult(content="", used_stream=False, tool_calls=(
+                        ProviderToolCall(id="unexpected", name="list_assets", arguments={}),
+                    ))
+                return ChatResult(content="已查询证据 evidence-1；仍需分析。", tool_calls=(),
+                                  used_stream=False, usage={"total_tokens": 42})
+            self.rounds += 1
+            return ChatResult(
+                content="", used_stream=False,
+                tool_calls=tuple(ProviderToolCall(
+                    id=f"{self.rounds}-{i}", name="list_assets", arguments={}
+                ) for i in range(2)),
+            )
+
+    redis = FakeRedis()
+    store = AgentStore(redis)
+    conversation = store.create_conversation("alice", "minimax", "demo")
+    adapter = Adapter()
+    runner = AgentRunner(store=store, provider_service=FakeProviderService(adapter), max_steps=2)
+    output = "".join(runner.run(owner="alice", role="user", conversation_id=conversation["id"], message="分析监控"))
+
+    assert adapter.rounds == 2
+    assert len(executed) == 4
+    assert reservations[-1]["tools"] is None
+    assert "调查未完成" in reservations[-1]["system_prompt"]
+    assert '"partial":true' in output
+    assert "event: run.failed" not in output
+    saved = store.get_conversation("alice", conversation["id"])
+    expected = "调查未完成" if language == "zh-CN" else "Investigation incomplete"
+    assert saved["messages"][-1]["content"].startswith(expected)
+    assert ("evidence-1" in saved["messages"][-1]["content"]) == (summary_result == "ok")
+    if summary_result == "ok":
+        assert saved["state"]["provider_observability"]["usage"]["total_tokens"] == 42
+    assert not redis.get(store._run_lock_key("alice", conversation["id"]))
+
+
 def test_provider_wire_messages_strip_internal_metadata_and_keep_tool_pairs():
     from app.ai.runner import AgentRunner
 
@@ -303,6 +378,92 @@ def test_runner_uses_the_conversation_context_mode_for_compression():
             assert saved["summary"] == "较早对话已经压缩"
         else:
             assert saved["summary"] == ""
+
+
+@pytest.mark.parametrize("summary_result", ["ok", "error", "tool_call"])
+def test_context_exhaustion_after_tool_results_returns_partial_answer(monkeypatch, summary_result):
+    from app.ai.provider import ChatResult, ProviderToolCall
+    from app.ai.runner import AgentRunner
+    from app.ai.storage import AgentStore
+    from app.ai.tools import ToolRegistry
+
+    monkeypatch.setattr(ToolRegistry, "execute", lambda *_args: {
+        "result_set_id": "evidence-1", "preview": "x" * 80000,
+    })
+
+    class Adapter:
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, *, messages, tools=None, **_kwargs):
+            self.calls.append((messages, tools))
+            if tools is not None:
+                return ChatResult(content="", used_stream=False, tool_calls=(
+                    ProviderToolCall(id="call-1", name="search_assets", arguments={}),
+                ))
+            assert "evidence-1" in str(messages)
+            assert '"truncated":true' in messages[1]["content"]
+            if summary_result == "error":
+                raise RuntimeError("provider failed")
+            if summary_result == "tool_call":
+                return ChatResult(content="", used_stream=False, tool_calls=(
+                    ProviderToolCall(id="unexpected", name="search_assets", arguments={}),
+                ))
+            return ChatResult(content="已有证据 evidence-1；其他项未知。",
+                              used_stream=False, tool_calls=())
+
+    store = AgentStore(FakeRedis())
+    conversation = store.create_conversation("alice", "demo", "model")
+    adapter = Adapter()
+    provider = FakeProviderService(adapter)
+    provider.runtime = lambda *_args, **_kwargs: SimpleNamespace(
+        adapter=adapter, context_window_tokens=32768,
+    )
+    output = "".join(AgentRunner(
+        store=store, provider_service=provider,
+    ).run(owner="alice", role="user", conversation_id=conversation["id"],
+          message="分析监控"))
+
+    assert '"partial":true' in output
+    assert "event: run.failed" not in output
+    assert len(adapter.calls) == 2
+    assert adapter.calls[-1][1] is None
+    saved = store.get_conversation("alice", conversation["id"])
+    assert saved["messages"][-1]["content"].startswith("调查未完成：已达到上下文预算上限")
+    assert ("evidence-1" in saved["messages"][-1]["content"]) == (summary_result == "ok")
+    assert "evidence-1" in next(m["content"] for m in saved["messages"] if m["role"] == "tool")
+
+
+def test_context_exhaustion_uses_prior_results_as_historical_evidence():
+    from app.ai.provider import ChatResult
+    from app.ai.runner import AgentRunner
+    from app.ai.storage import AgentStore
+
+    class Adapter:
+        def complete(self, *, messages, tools=None, **_kwargs):
+            assert tools is None
+            assert '"historical_evidence":true' in messages[1]["content"]
+            assert "evidence-1" in messages[1]["content"]
+            return ChatResult(content="历史证据 evidence-1；当前状态未知。",
+                              tool_calls=(), used_stream=False)
+
+    store = AgentStore(FakeRedis())
+    conversation = store.create_conversation("alice", "demo", "model")
+    store.append_message("alice", conversation["id"], {"role": "user", "content": "之前的调查"})
+    store.append_message("alice", conversation["id"], {
+        "role": "tool", "tool_call_id": "old-call",
+        "content": '{"result_set_id":"evidence-1","data":"' + "x" * 80000 + '"}',
+    })
+    adapter = Adapter()
+    provider = FakeProviderService(adapter)
+    provider.runtime = lambda *_args, **_kwargs: SimpleNamespace(
+        adapter=adapter, context_window_tokens=32768,
+    )
+    output = "".join(AgentRunner(store=store, provider_service=provider).run(
+        owner="alice", role="user", conversation_id=conversation["id"], message="现在呢？"))
+    assert '"partial":true' in output
+    assert "event: run.failed" not in output
+    assert "历史证据 evidence-1" in store.get_conversation("alice", conversation["id"])["messages"][-1]["content"]
 
 
 def test_runner_blocks_provider_call_when_context_still_exceeds_budget():
