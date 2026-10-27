@@ -522,12 +522,15 @@ class AgentRunner:
 
             registry.monitoring_executor = execute_monitoring
 
-            def finish_partial(content):
+            def finish_partial(content, reason="rounds"):
                 if _configured_language() == "en-US":
-                    text = "Investigation incomplete: the tool-call round limit was reached."
+                    text = ("Investigation incomplete: the context budget was reached."
+                            if reason == "context" else
+                            "Investigation incomplete: the tool-call round limit was reached.")
                     fallback = "Review the completed tool results and evidence above, then continue the investigation."
                 else:
-                    text = "调查未完成：已达到工具调用轮数上限。"
+                    text = ("调查未完成：已达到上下文预算上限。" if reason == "context"
+                            else "调查未完成：已达到工具调用轮数上限。")
                     fallback = "请查看上方已完成的工具结果和证据，并继续调查。"
                 text += "\n\n" + (content or fallback)
                 self.store.append_message(owner, conversation_id, {
@@ -545,6 +548,7 @@ class AgentRunner:
 
             for _step in range(self.max_steps + 1):
                 finalizing = _step == self.max_steps
+                partial_reason = "rounds"
                 renew_lock()
                 final_instruction = (
                     "\n\n调查已达到工具调用轮数上限，不得继续调用工具。"
@@ -590,18 +594,47 @@ class AgentRunner:
                     metrics["context_budget"] = budget
                     metrics["truncation_reason"] = "input_budget_exceeded"
                     self.store.save_conversation(owner, conversation)
-                    if finalizing:
-                        yield from finish_partial("")
+                    current = conversation.get("messages") or []
+                    last_user = next((i for i in range(len(current) - 1, -1, -1)
+                                      if current[i].get("role") == "user"), -1)
+                    tool_messages = [m for m in current[last_user + 1:] if m.get("role") == "tool"]
+                    if not tool_messages:
+                        yield sse_event(
+                            "run.failed", run_id=run_id,
+                            message=("会话上下文超过当前模型的安全输入预算；"
+                                     "压缩未能释放足够空间，请新建会话或改用更大上下文模型"),
+                        )
                         return
-                    yield sse_event(
-                        "run.failed",
-                        run_id=run_id,
-                        message=(
-                            "会话上下文超过当前模型的安全输入预算；"
-                            "压缩未能释放足够空间，请新建会话或改用更大上下文模型"
-                        ),
+                    partial_reason = "context"
+                    finalizing = True
+                    final_instruction = (
+                        "\n\n调查因上下文预算中断，不得调用工具。以下证据可能被截断或省略；"
+                        "只依据所给证据总结已确认事实、引用、未知项和未完成事项。"
                     )
-                    return
+                    tool_names = {call.get("id"): (call.get("function") or {}).get("name")
+                                  for message in current[last_user + 1:]
+                                  for call in message.get("tool_calls") or []}
+                    evidence = [{"tool_call_id": m.get("tool_call_id"),
+                                 "tool": tool_names.get(m.get("tool_call_id")),
+                                 "excerpt": str(m.get("content") or "")[:256]}
+                                for m in tool_messages[-32:]]
+                    payload = json.dumps({
+                        "type": "untrusted_partial_evidence", "truncated": True,
+                        "omitted_results": max(0, len(tool_messages) - len(evidence)),
+                        "goal": str(current[last_user].get("content") or "")[:1500],
+                        "evidence": evidence,
+                    }, ensure_ascii=False, separators=(",", ":"))
+                    provider_messages = [
+                        {"role": "system", "content": build_system_prompt() + final_instruction},
+                        {"role": "user", "content": payload},
+                    ]
+                    context_manager.set_runtime_reservations(
+                        system_prompt=provider_messages[0]["content"], tools=None, state={},
+                    )
+                    estimated_input_tokens = context_manager.estimate_tokens([provider_messages[1]])
+                    if estimated_input_tokens > context_manager.effective_input_tokens:
+                        yield from finish_partial("", partial_reason)
+                        return
 
                 def provider_worker(
                     messages=provider_messages,
@@ -649,7 +682,7 @@ class AgentRunner:
                             and not result.truncated and result.finish_reason != "length"
                             and result.content.strip()):
                         partial = result.content.strip()
-                    yield from finish_partial(partial)
+                    yield from finish_partial(partial, partial_reason)
                     return
                 conversation = self._record_provider_observability(
                     owner,

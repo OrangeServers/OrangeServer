@@ -8,8 +8,8 @@ principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - AI chat now provides a clearly marked partial investigation when it reaches
-  its tool-call round limit, preserving completed evidence instead of failing
-  without a conclusion.
+  its tool-call round or context budget limit, preserving completed evidence
+  instead of failing without a conclusion.
 
 ## [1.2.0] - 2026-09-06
 

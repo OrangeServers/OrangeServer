@@ -380,6 +380,60 @@ def test_runner_uses_the_conversation_context_mode_for_compression():
             assert saved["summary"] == ""
 
 
+@pytest.mark.parametrize("summary_result", ["ok", "error", "tool_call"])
+def test_context_exhaustion_after_tool_results_returns_partial_answer(monkeypatch, summary_result):
+    from app.ai.provider import ChatResult, ProviderToolCall
+    from app.ai.runner import AgentRunner
+    from app.ai.storage import AgentStore
+    from app.ai.tools import ToolRegistry
+
+    monkeypatch.setattr(ToolRegistry, "execute", lambda *_args: {
+        "result_set_id": "evidence-1", "preview": "x" * 80000,
+    })
+
+    class Adapter:
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, *, messages, tools=None, **_kwargs):
+            self.calls.append((messages, tools))
+            if tools is not None:
+                return ChatResult(content="", used_stream=False, tool_calls=(
+                    ProviderToolCall(id="call-1", name="search_assets", arguments={}),
+                ))
+            assert "evidence-1" in str(messages)
+            assert '"truncated":true' in messages[1]["content"]
+            if summary_result == "error":
+                raise RuntimeError("provider failed")
+            if summary_result == "tool_call":
+                return ChatResult(content="", used_stream=False, tool_calls=(
+                    ProviderToolCall(id="unexpected", name="search_assets", arguments={}),
+                ))
+            return ChatResult(content="已有证据 evidence-1；其他项未知。",
+                              used_stream=False, tool_calls=())
+
+    store = AgentStore(FakeRedis())
+    conversation = store.create_conversation("alice", "demo", "model")
+    adapter = Adapter()
+    provider = FakeProviderService(adapter)
+    provider.runtime = lambda *_args, **_kwargs: SimpleNamespace(
+        adapter=adapter, context_window_tokens=32768,
+    )
+    output = "".join(AgentRunner(
+        store=store, provider_service=provider,
+    ).run(owner="alice", role="user", conversation_id=conversation["id"],
+          message="分析监控"))
+
+    assert '"partial":true' in output
+    assert "event: run.failed" not in output
+    assert len(adapter.calls) == 2
+    assert adapter.calls[-1][1] is None
+    saved = store.get_conversation("alice", conversation["id"])
+    assert saved["messages"][-1]["content"].startswith("调查未完成：已达到上下文预算上限")
+    assert ("evidence-1" in saved["messages"][-1]["content"]) == (summary_result == "ok")
+    assert "evidence-1" in next(m["content"] for m in saved["messages"] if m["role"] == "tool")
+
+
 def test_runner_blocks_provider_call_when_context_still_exceeds_budget():
     from app.ai.provider import ChatResult
     from app.ai.runner import AgentRunner
