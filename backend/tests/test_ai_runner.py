@@ -40,13 +40,15 @@ class TextAdapter:
 
 
 @pytest.mark.parametrize("summary_result", ["ok", "error", "truncated", "tool_call"])
-def test_tool_budget_finishes_with_partial_result(monkeypatch, summary_result):
+@pytest.mark.parametrize("language", ["zh-CN", "en-US"])
+def test_tool_budget_finishes_with_partial_result(monkeypatch, summary_result, language):
     from app.ai.context import ContextManager
     from app.ai.provider import ChatResult, ProviderToolCall
     from app.ai.runner import AgentRunner
     from app.ai.storage import AgentStore
     from app.ai.tools import ToolRegistry
 
+    monkeypatch.setattr("app.ai.runner._configured_language", lambda: language)
     executed = []
     reservations = []
     original_reservations = ContextManager.set_runtime_reservations
@@ -104,7 +106,8 @@ def test_tool_budget_finishes_with_partial_result(monkeypatch, summary_result):
     assert '"partial":true' in output
     assert "event: run.failed" not in output
     saved = store.get_conversation("alice", conversation["id"])
-    assert saved["messages"][-1]["content"].startswith("调查未完成")
+    expected = "调查未完成" if language == "zh-CN" else "Investigation incomplete"
+    assert saved["messages"][-1]["content"].startswith(expected)
     assert ("evidence-1" in saved["messages"][-1]["content"]) == (summary_result == "ok")
     if summary_result == "ok":
         assert saved["state"]["provider_observability"]["usage"]["total_tokens"] == 42

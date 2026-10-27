@@ -523,8 +523,13 @@ class AgentRunner:
             registry.monitoring_executor = execute_monitoring
 
             def finish_partial(content):
-                text = "调查未完成：已达到工具调用轮数上限。"
-                text += "\n\n" + (content or "请查看上方已完成的工具结果和证据，并继续调查。")
+                if _configured_language() == "en-US":
+                    text = "Investigation incomplete: the tool-call round limit was reached."
+                    fallback = "Review the completed tool results and evidence above, then continue the investigation."
+                else:
+                    text = "调查未完成：已达到工具调用轮数上限。"
+                    fallback = "请查看上方已完成的工具结果和证据，并继续调查。"
+                text += "\n\n" + (content or fallback)
                 self.store.append_message(owner, conversation_id, {
                     "id": uuid.uuid4().hex,
                     "role": "assistant",
