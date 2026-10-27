@@ -385,7 +385,7 @@ data: {"type":"assistant.delta","run_id":"...","content":"..."}
 | `diagnostic_completed` | `event_seq`, `run_id`, `report` | 完成或部分完成 |
 | `diagnostic_failed` | `event_seq`, `run_id`, `message` | 失败或取消 |
 | `autonomy.draft_created` | `run_id`, `goal`, `status`, `mode`, `action_categories?` | 已创建自治任务草稿；`custom` 额外返回动作类别 |
-| `run.completed` | `conversation_id` | 本轮正常结束 |
+| `run.completed` | `conversation_id`, `partial?` | 本轮结束；`partial: true` 表示达到调查轮数上限，结论不完整 |
 | `run.failed` | `message` | 本轮失败 |
 
 `tool.started` 和对应的 `tool.completed` 使用相同 `id`。客户端应更新同一条时间线

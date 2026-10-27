@@ -86,14 +86,14 @@ class AgentRunner:
         context_manager: Optional[ContextManager] = None,
         diagnostic_service_factory: Optional[Any] = None,
         worker_context_factory: Optional[Any] = None,
-        max_steps: int = 5,
+        max_steps: int = 15,
     ):
         self.store = store
         self.providers = provider_service or ProviderConfigService()
         self.context = context_manager
         self.diagnostic_service_factory = diagnostic_service_factory
         self.worker_context_factory = worker_context_factory
-        self.max_steps = max(1, min(8, int(max_steps)))
+        self.max_steps = max(1, min(20, int(max_steps)))
 
     def _diagnostic_service(self):
         if self.diagnostic_service_factory is not None:
@@ -522,7 +522,24 @@ class AgentRunner:
 
             registry.monitoring_executor = execute_monitoring
 
-            for _step in range(self.max_steps):
+            def finish_partial(content):
+                text = "调查未完成：已达到工具调用轮数上限。"
+                text += "\n\n" + (content or "请查看上方已完成的工具结果和证据，并继续调查。")
+                self.store.append_message(owner, conversation_id, {
+                    "id": uuid.uuid4().hex,
+                    "role": "assistant",
+                    "content": text,
+                    "created_at": time.time(),
+                })
+                yield sse_event("assistant.delta", run_id=run_id, content=text)
+                yield sse_event(
+                    "run.completed", run_id=run_id,
+                    conversation_id=conversation_id,
+                    waiting_for_approval=False, partial=True,
+                )
+
+            for _step in range(self.max_steps + 1):
+                finalizing = _step == self.max_steps
                 renew_lock()
                 context_manager.set_runtime_reservations(
                     system_prompt=build_system_prompt(),
@@ -546,6 +563,12 @@ class AgentRunner:
                     conversation,
                     extra_context=diagnostic_context,
                 )
+                if finalizing:
+                    provider_messages[0]["content"] += (
+                        "\n\n调查已达到工具调用轮数上限，不得继续调用工具。"
+                        "请仅依据已有工具结果总结已确认事实及其引用、"
+                        "未完成事项和未知项，明确说明调查未完成。"
+                    )
                 estimated_input_tokens = context_manager.estimate_tokens(
                     conversation.get("messages") or [],
                     (
@@ -561,6 +584,9 @@ class AgentRunner:
                     metrics["context_budget"] = budget
                     metrics["truncation_reason"] = "input_budget_exceeded"
                     self.store.save_conversation(owner, conversation)
+                    if finalizing:
+                        yield from finish_partial("")
+                        return
                     yield sse_event(
                         "run.failed",
                         run_id=run_id,
@@ -578,9 +604,9 @@ class AgentRunner:
                     try:
                         response = adapter.complete(
                             messages=messages,
-                            tools=registry.definitions(),
-                            tool_choice="auto",
-                            on_delta=lambda delta: result_queue.put(
+                            tools=None if finalizing else registry.definitions(),
+                            tool_choice=None if finalizing else "auto",
+                            on_delta=None if finalizing else lambda delta: result_queue.put(
                                 ("delta", delta)
                             ),
                         )
@@ -602,7 +628,18 @@ class AgentRunner:
                     elif item_type == "result":
                         result = item
                     else:
+                        if finalizing:
+                            logger.warning("AI partial summary failed: run_id=%s", run_id)
+                            break
                         raise item
+                if finalizing:
+                    partial = ""
+                    if (result is not None and not result.tool_calls
+                            and not result.truncated and result.finish_reason != "length"
+                            and result.content.strip()):
+                        partial = result.content.strip()
+                    yield from finish_partial(partial)
+                    return
                 conversation = self._record_provider_observability(
                     owner,
                     conversation,
