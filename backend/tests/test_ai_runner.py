@@ -434,6 +434,38 @@ def test_context_exhaustion_after_tool_results_returns_partial_answer(monkeypatc
     assert "evidence-1" in next(m["content"] for m in saved["messages"] if m["role"] == "tool")
 
 
+def test_context_exhaustion_uses_prior_results_as_historical_evidence():
+    from app.ai.provider import ChatResult
+    from app.ai.runner import AgentRunner
+    from app.ai.storage import AgentStore
+
+    class Adapter:
+        def complete(self, *, messages, tools=None, **_kwargs):
+            assert tools is None
+            assert '"historical_evidence":true' in messages[1]["content"]
+            assert "evidence-1" in messages[1]["content"]
+            return ChatResult(content="历史证据 evidence-1；当前状态未知。",
+                              tool_calls=(), used_stream=False)
+
+    store = AgentStore(FakeRedis())
+    conversation = store.create_conversation("alice", "demo", "model")
+    store.append_message("alice", conversation["id"], {"role": "user", "content": "之前的调查"})
+    store.append_message("alice", conversation["id"], {
+        "role": "tool", "tool_call_id": "old-call",
+        "content": '{"result_set_id":"evidence-1","data":"' + "x" * 80000 + '"}',
+    })
+    adapter = Adapter()
+    provider = FakeProviderService(adapter)
+    provider.runtime = lambda *_args, **_kwargs: SimpleNamespace(
+        adapter=adapter, context_window_tokens=32768,
+    )
+    output = "".join(AgentRunner(store=store, provider_service=provider).run(
+        owner="alice", role="user", conversation_id=conversation["id"], message="现在呢？"))
+    assert '"partial":true' in output
+    assert "event: run.failed" not in output
+    assert "历史证据 evidence-1" in store.get_conversation("alice", conversation["id"])["messages"][-1]["content"]
+
+
 def test_runner_blocks_provider_call_when_context_still_exceeds_budget():
     from app.ai.provider import ChatResult
     from app.ai.runner import AgentRunner

@@ -598,6 +598,9 @@ class AgentRunner:
                     last_user = next((i for i in range(len(current) - 1, -1, -1)
                                       if current[i].get("role") == "user"), -1)
                     tool_messages = [m for m in current[last_user + 1:] if m.get("role") == "tool"]
+                    historical = not tool_messages
+                    if historical:
+                        tool_messages = [m for m in current[:last_user] if m.get("role") == "tool"]
                     if not tool_messages:
                         yield sse_event(
                             "run.failed", run_id=run_id,
@@ -609,10 +612,10 @@ class AgentRunner:
                     finalizing = True
                     final_instruction = (
                         "\n\n调查因上下文预算中断，不得调用工具。以下证据可能被截断或省略；"
-                        "只依据所给证据总结已确认事实、引用、未知项和未完成事项。"
+                        "历史证据不代表当前状态；只依据所给证据总结已确认事实、引用、未知项和未完成事项。"
                     )
                     tool_names = {call.get("id"): (call.get("function") or {}).get("name")
-                                  for message in current[last_user + 1:]
+                                  for message in current
                                   for call in message.get("tool_calls") or []}
                     evidence = [{"tool_call_id": m.get("tool_call_id"),
                                  "tool": tool_names.get(m.get("tool_call_id")),
@@ -620,6 +623,7 @@ class AgentRunner:
                                 for m in tool_messages[-32:]]
                     payload = json.dumps({
                         "type": "untrusted_partial_evidence", "truncated": True,
+                        "historical_evidence": historical,
                         "omitted_results": max(0, len(tool_messages) - len(evidence)),
                         "goal": str(current[last_user].get("content") or "")[:1500],
                         "evidence": evidence,
