@@ -541,9 +541,14 @@ class AgentRunner:
             for _step in range(self.max_steps + 1):
                 finalizing = _step == self.max_steps
                 renew_lock()
+                final_instruction = (
+                    "\n\n调查已达到工具调用轮数上限，不得继续调用工具。"
+                    "请仅依据已有工具结果总结已确认事实及其引用、"
+                    "未完成事项和未知项，明确说明调查未完成。"
+                ) if finalizing else ""
                 context_manager.set_runtime_reservations(
-                    system_prompt=build_system_prompt(),
-                    tools=registry.definitions(),
+                    system_prompt=build_system_prompt() + final_instruction,
+                    tools=None if finalizing else registry.definitions(),
                     state=conversation.get("state") or {},
                 )
                 conversation = self._compress(
@@ -564,11 +569,7 @@ class AgentRunner:
                     extra_context=diagnostic_context,
                 )
                 if finalizing:
-                    provider_messages[0]["content"] += (
-                        "\n\n调查已达到工具调用轮数上限，不得继续调用工具。"
-                        "请仅依据已有工具结果总结已确认事实及其引用、"
-                        "未完成事项和未知项，明确说明调查未完成。"
-                    )
+                    provider_messages[0]["content"] += final_instruction
                 estimated_input_tokens = context_manager.estimate_tokens(
                     conversation.get("messages") or [],
                     (
@@ -634,6 +635,11 @@ class AgentRunner:
                         raise item
                 if finalizing:
                     partial = ""
+                    if result is not None:
+                        conversation = self._record_provider_observability(
+                            owner, conversation, result, context_manager,
+                            estimated_input_tokens,
+                        )
                     if (result is not None and not result.tool_calls
                             and not result.truncated and result.finish_reason != "length"
                             and result.content.strip()):

@@ -41,12 +41,21 @@ class TextAdapter:
 
 @pytest.mark.parametrize("summary_result", ["ok", "error", "truncated", "tool_call"])
 def test_tool_budget_finishes_with_partial_result(monkeypatch, summary_result):
+    from app.ai.context import ContextManager
     from app.ai.provider import ChatResult, ProviderToolCall
     from app.ai.runner import AgentRunner
     from app.ai.storage import AgentStore
     from app.ai.tools import ToolRegistry
 
     executed = []
+    reservations = []
+    original_reservations = ContextManager.set_runtime_reservations
+
+    def record_reservations(manager, **kwargs):
+        reservations.append(kwargs)
+        return original_reservations(manager, **kwargs)
+
+    monkeypatch.setattr(ContextManager, "set_runtime_reservations", record_reservations)
 
     def execute(_registry, name, arguments):
         executed.append((name, arguments))
@@ -71,7 +80,8 @@ def test_tool_budget_finishes_with_partial_result(monkeypatch, summary_result):
                     return ChatResult(content="", used_stream=False, tool_calls=(
                         ProviderToolCall(id="unexpected", name="list_assets", arguments={}),
                     ))
-                return ChatResult(content="已查询证据 evidence-1；仍需分析。", tool_calls=(), used_stream=False)
+                return ChatResult(content="已查询证据 evidence-1；仍需分析。", tool_calls=(),
+                                  used_stream=False, usage={"total_tokens": 42})
             self.rounds += 1
             return ChatResult(
                 content="", used_stream=False,
@@ -89,11 +99,15 @@ def test_tool_budget_finishes_with_partial_result(monkeypatch, summary_result):
 
     assert adapter.rounds == 2
     assert len(executed) == 4
+    assert reservations[-1]["tools"] is None
+    assert "调查未完成" in reservations[-1]["system_prompt"]
     assert '"partial":true' in output
     assert "event: run.failed" not in output
     saved = store.get_conversation("alice", conversation["id"])
     assert saved["messages"][-1]["content"].startswith("调查未完成")
     assert ("evidence-1" in saved["messages"][-1]["content"]) == (summary_result == "ok")
+    if summary_result == "ok":
+        assert saved["state"]["provider_observability"]["usage"]["total_tokens"] == 42
     assert not redis.get(store._run_lock_key("alice", conversation["id"]))
 
 
