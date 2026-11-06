@@ -1,15 +1,23 @@
 """Role-aware deterministic tools exposed to the LLM."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
-from app.ai.monitoring import MonitoringError, MonitoringValidationError
-from app.ai.storage import AgentStore
+from app.ai.diagnostic_adapters import sanitize_evidence
+from app.ai.monitoring import (
+    MonitoringAnalysisService,
+    MonitoringError,
+    MonitoringValidationError,
+    _safe_labels,
+)
+from app.ai.storage import AgentStore, AgentStoreNotFound
 
 
 MAX_QUERY_ROWS = 200
 MAX_PREVIEW_ROWS = 10
+MAX_MONITORING_EVIDENCE_PAGE = 100
 
 
 def _monitoring_model_preview(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -41,6 +49,87 @@ class ToolValidationError(ToolError):
     pass
 
 
+def _validate_monitoring_result_access(
+    result: Dict[str, Any],
+    platform: Any,
+    *,
+    allowed_source_types: Set[str],
+) -> None:
+    resource_ids = result.get("resource_ids")
+    rows = result.get("rows")
+    filters = result.get("filters")
+    if (
+        result.get("kind") != "monitoring_observation"
+        or not isinstance(resource_ids, list)
+        or len(resource_ids) != 1
+        or type(resource_ids[0]) is not int
+        or resource_ids[0] <= 0
+        or not isinstance(rows, list)
+        or len(rows) != 1
+        or not isinstance(rows[0], dict)
+        or not isinstance(filters, dict)
+    ):
+        raise MonitoringValidationError("monitoring result scope is invalid")
+
+    host_id = resource_ids[0]
+    row = rows[0]
+    source_id = row.get("source_id")
+    if (
+        type(source_id) is not int
+        or source_id <= 0
+        or type(filters.get("host_id")) is not int
+        or filters["host_id"] != host_id
+        or type(filters.get("source_id")) is not int
+        or filters["source_id"] != source_id
+    ):
+        raise MonitoringValidationError("monitoring result identity is invalid")
+
+    session = getattr(platform, "session", None)
+    if session is None:
+        from app.core.db.database import db
+
+        session = db.session
+    mapped = MonitoringAnalysisService(session, platform)._mapped_sources(
+        host_id, source_id=source_id,
+    )
+    if len(mapped) != 1:
+        raise MonitoringValidationError("monitoring source mapping is ambiguous")
+    source_type = getattr(mapped[0][0], "source_type", None)
+    if (
+        not isinstance(source_type, str)
+        or source_type not in allowed_source_types
+        or row.get("source_type") != source_type
+    ):
+        raise MonitoringValidationError("monitoring source is no longer authorized")
+
+
+def _monitoring_series_page(
+    observation: Dict[str, Any],
+    series_index: int,
+    offset: int,
+    limit: int,
+) -> tuple[Dict[str, Any], List[Any], int]:
+    series = observation.get("series")
+    if not isinstance(series, list) or series_index >= len(series):
+        raise ToolValidationError("series_index is outside the observation")
+    selected = series[series_index]
+    if not isinstance(selected, dict):
+        raise ToolNotAllowed("Prometheus evidence has an invalid series")
+    samples = selected.get("samples")
+    if not isinstance(samples, list):
+        raise ToolNotAllowed("Prometheus evidence has an invalid sample list")
+    page = samples[offset:offset + limit]
+    if any(not isinstance(sample, (list, tuple)) or len(sample) != 2
+           or any(type(value) not in (int, float) or not math.isfinite(value) for value in sample)
+           for sample in page):
+        raise ToolNotAllowed("Prometheus evidence contains an invalid sample")
+    return (
+        {"labels": _safe_labels(selected.get("labels"))},
+        page,
+        len(samples),
+    )
+
+
 @dataclass
 class ToolData:
     kind: str
@@ -48,6 +137,7 @@ class ToolData:
     resource_ids: List[Any]
     summary: Dict[str, Any]
     filters: Optional[Dict[str, Any]] = None
+    authorization_scope: Optional[Dict[str, Any]] = None
 
 
 def _tool(name: str, description: str, properties: Dict[str, Any], required=None):
@@ -264,6 +354,55 @@ TOOL_DEFINITIONS = {
         },
         required=["host_id", "source_id", "item_ids"],
     ),
+    "read_monitoring_evidence": _tool(
+        "read_monitoring_evidence",
+        "分页读取当前会话中仍有权访问的 Prometheus 监控观测；必须使用查询工具返回的 "
+        "result_set_id，并按 observation_index、series_index 与 offset/limit 读取样本。",
+        {
+            "result_set_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "observation_index": {"type": "integer", "minimum": 0, "maximum": 99},
+            "series_index": {"type": "integer", "minimum": 0, "maximum": 99},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 1000},
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_MONITORING_EVIDENCE_PAGE,
+            },
+        },
+        required=[
+            "result_set_id", "observation_index", "series_index", "offset", "limit",
+        ],
+    ),
+    "verify_monitoring_citations": _tool(
+        "verify_monitoring_citations",
+        "批量复核 Prometheus 样本引用的结果集、序列、下标、时间戳和数值；"
+        "对有效引用返回基于完整已存序列计算的统计。",
+        {
+            "citations": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 100,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "result_set_id": {"type": "string"},
+                        "observation_index": {"type": "integer"},
+                        "series_index": {"type": "integer"},
+                        "sample_index": {"type": "integer"},
+                        "timestamp": {"type": "number"},
+                        "value": {"type": "number"},
+                        "metric": {"type": "string"},
+                    },
+                    "required": [
+                        "result_set_id", "observation_index", "series_index",
+                        "sample_index", "timestamp", "value", "metric",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        required=["citations"],
+    ),
 }
 
 MONITORING_TOOLS = frozenset({
@@ -347,6 +486,26 @@ class ToolRegistry:
             raise ToolNotAllowed(f"unknown tool: {name}")
         if name in ADMIN_ONLY_TOOLS and self.role != "admin":
             raise ToolNotAllowed(f"tool requires admin role: {name}")
+        if name == "read_monitoring_evidence":
+            result, record = self._read_monitoring_evidence(
+                arguments, _return_record=True,
+            )
+            try:
+                result["series_statistics"] = self._summarize_monitoring_series(
+                    arguments["result_set_id"], arguments["observation_index"],
+                    arguments["series_index"], _snapshot=(result, record),
+                )
+            except ToolNotAllowed:
+                raise
+            except ToolError:
+                result["statistics_unavailable"] = True
+            leading = (
+                "result_set_id", "observation_index", "series_index", "page",
+                "series_statistics", "statistics_unavailable",
+            )
+            return {**{key: result[key] for key in leading if key in result}, **result}
+        if name == "verify_monitoring_citations":
+            return self._verify_monitoring_citations(arguments)
         if name == "run_diagnostic":
             return self._run_diagnostic(arguments)
         if name == "create_autonomy_draft":
@@ -371,6 +530,7 @@ class ToolRegistry:
             resource_ids=data.resource_ids,
             filters=data.filters or arguments,
             summary=data.summary,
+            authorization_scope=data.authorization_scope,
         )
         conversation = self.store.get_conversation(self.owner, self.conversation_id)
         conversation.setdefault("state", {})["last_result_set_id"] = result_set["id"]
@@ -451,6 +611,304 @@ class ToolRegistry:
             summary=summary,
             filters=normalized,
         )
+
+    def _read_monitoring_evidence(
+        self, arguments: Dict[str, Any], *, _return_record: bool = False,
+    ):
+        source_types = self.monitoring_source_types
+        if source_types is not None and "prometheus" not in source_types:
+            raise ToolNotAllowed("Prometheus evidence is disabled for this request")
+        expected = {
+            "result_set_id", "observation_index", "series_index", "offset", "limit",
+        }
+        if set(arguments) != expected:
+            raise ToolValidationError("read_monitoring_evidence arguments are invalid")
+        result_set_id = arguments.get("result_set_id")
+        if (
+            not isinstance(result_set_id, str)
+            or not result_set_id
+            or result_set_id != result_set_id.strip()
+            or len(result_set_id) > 128
+        ):
+            raise ToolValidationError("result_set_id is invalid")
+        indexes = {}
+        for name, maximum in (
+            ("observation_index", 99), ("series_index", 99),
+            ("offset", 1000), ("limit", MAX_MONITORING_EVIDENCE_PAGE),
+        ):
+            value = arguments.get(name)
+            minimum = 1 if name == "limit" else 0
+            if type(value) is not int or value < minimum or value > maximum:
+                raise ToolValidationError(f"{name} is invalid")
+            indexes[name] = value
+
+        try:
+            conversation = self.store.get_conversation(
+                self.owner, self.conversation_id,
+            )
+            result = self.store.get_result_set(self.owner, result_set_id)
+        except AgentStoreNotFound:
+            raise ToolNotAllowed("monitoring result is no longer available") from None
+        except Exception as exc:
+            raise ToolError("monitoring evidence is unavailable") from exc
+
+        if (
+            not isinstance(conversation, dict)
+            or conversation.get("owner") != self.owner
+            or conversation.get("id") != self.conversation_id
+            or not isinstance(result, dict)
+            or result.get("owner") != self.owner
+            or result.get("id") != result_set_id
+            or result.get("conversation_id") != self.conversation_id
+            or result.get("kind") != "monitoring_observation"
+        ):
+            raise ToolNotAllowed("monitoring result is not available in this conversation")
+
+        try:
+            _validate_monitoring_result_access(
+                result, self.platform, allowed_source_types={"prometheus"},
+            )
+        except Exception as exc:
+            raise ToolNotAllowed("monitoring result is no longer accessible") from exc
+
+        row = result["rows"][0]
+        observations = row.get("observations")
+        observation_index = indexes["observation_index"]
+        if (
+            not isinstance(observations, list)
+            or observation_index >= len(observations)
+            or not isinstance(observations[observation_index], dict)
+        ):
+            raise ToolValidationError("observation_index is outside the result")
+        observation = observations[observation_index]
+        filters = result["filters"]
+        query_parameters = {
+            key: filters[key]
+            for key in (
+                "metric", "calculation", "range_minutes", "aggregation",
+                "group_by", "lookback_minutes", "step_seconds",
+            )
+            if key in filters
+        }
+        raw_query = observation.get("query")
+        query = sanitize_evidence(raw_query) if isinstance(raw_query, str) else query_parameters
+        metadata, samples, total = _monitoring_series_page(
+            observation,
+            indexes["series_index"],
+            indexes["offset"],
+            indexes["limit"],
+        )
+        observation_metadata = {
+            key: sanitize_evidence(observation[key])
+            if isinstance(observation.get(key), str) else observation.get(key)
+            for key in ("template", "query", "step_seconds", "sample_count")
+            if key in observation
+        }
+        payload = {
+            "result_set_id": result_set_id,
+            "kind": "monitoring_observation",
+            "source": {
+                "id": row["source_id"],
+                "name": sanitize_evidence(row.get("source_name"))[:64],
+                "type": row.get("source_type"),
+            },
+            "observation_index": observation_index,
+            "observation": observation_metadata,
+            "query": query,
+            "query_parameters": query_parameters,
+            "series_index": indexes["series_index"],
+            "series": metadata,
+            "samples": samples,
+            "page": {
+                "offset": indexes["offset"],
+                "limit": indexes["limit"],
+                "total": total,
+            },
+        }
+        return (payload, result) if _return_record else payload
+
+    def _verify_monitoring_citations(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        citations = arguments.get("citations")
+        if (
+            set(arguments) != {"citations"}
+            or not isinstance(citations, list)
+            or not 1 <= len(citations) <= 100
+        ):
+            raise ToolValidationError("citations must contain 1 to 100 entries")
+
+        results = []
+        series_keys = []
+        snapshots = {}
+        records = {}
+        required = {
+            "result_set_id", "observation_index", "series_index", "sample_index",
+            "timestamp", "value", "metric",
+        }
+        for position, claim in enumerate(citations):
+            valid = False
+            try:
+                if not isinstance(claim, dict) or set(claim) != required:
+                    raise ValueError("invalid claim")
+                if (
+                    type(claim["timestamp"]) not in (int, float)
+                    or type(claim["value"]) not in (int, float)
+                    or not math.isfinite(claim["timestamp"])
+                    or not math.isfinite(claim["value"])
+                ):
+                    raise ValueError("invalid numeric value")
+                page, record = self._read_monitoring_evidence({
+                    "result_set_id": claim["result_set_id"],
+                    "observation_index": claim["observation_index"],
+                    "series_index": claim["series_index"],
+                    "offset": claim["sample_index"],
+                    "limit": 1,
+                }, _return_record=True)
+                result_set_id = claim["result_set_id"]
+                if (
+                    result_set_id in records
+                    and record != records[result_set_id]
+                ):
+                    raise ToolError("monitoring result changed during verification")
+                metric = (page.get("query_parameters") or {}).get("metric")
+                samples = page.get("samples") or []
+                valid = (
+                    isinstance(claim["metric"], str)
+                    and claim["metric"] == metric
+                    and len(samples) == 1
+                    and len(samples[0]) == 2
+                    and claim["timestamp"] == samples[0][0]
+                    and claim["value"] == samples[0][1]
+                )
+            except (ToolError, ValueError, TypeError, KeyError, IndexError, OverflowError):
+                valid = False
+
+            results.append({"index": position, "verified": valid})
+            if valid:
+                key = (
+                    claim["result_set_id"], claim["observation_index"],
+                    claim["series_index"],
+                )
+                records[result_set_id] = record
+                snapshots[key] = (page, record)
+                if key not in series_keys:
+                    series_keys.append(key)
+
+        statistics = [
+            self._summarize_monitoring_series(
+                *key, _snapshot=snapshots[key],
+            )
+            for key in series_keys
+        ]
+        return {
+            "kind": "monitoring_citation_verification",
+            "results": results,
+            "verified_count": sum(item["verified"] for item in results),
+            "total": len(results),
+            "statistics": statistics,
+        }
+
+    def _summarize_monitoring_series(
+        self,
+        result_set_id: str,
+        observation_index: int,
+        series_index: int,
+        *,
+        _snapshot=None,
+    ) -> Dict[str, Any]:
+        if _snapshot is None:
+            first_page, record = self._read_monitoring_evidence({
+                "result_set_id": result_set_id,
+                "observation_index": observation_index,
+                "series_index": series_index,
+                "offset": 0,
+                "limit": MAX_MONITORING_EVIDENCE_PAGE,
+            }, _return_record=True)
+        else:
+            first_page, record = _snapshot
+
+        try:
+            if (
+                record.get("id") != result_set_id
+                or record.get("owner") != self.owner
+                or record.get("conversation_id") != self.conversation_id
+                or record.get("kind") != "monitoring_observation"
+            ):
+                raise ToolNotAllowed(
+                    "monitoring result is not available in this conversation"
+                )
+            _validate_monitoring_result_access(
+                record, self.platform, allowed_source_types={"prometheus"},
+            )
+            observations = record["rows"][0]["observations"]
+            samples = observations[observation_index]["series"][series_index]["samples"]
+            page = first_page.get("page") or {}
+            offset, limit = page.get("offset"), page.get("limit")
+            if (
+                not isinstance(samples, list)
+                or not 1 <= len(samples) <= 1000
+                or type(offset) is not int
+                or type(limit) is not int
+                or page.get("total") != len(samples)
+                or first_page.get("samples") != samples[offset:offset + limit]
+            ):
+                raise ToolError("monitoring series is inconsistent")
+        except ToolError:
+            raise
+        except Exception as exc:
+            raise ToolNotAllowed("monitoring result is no longer accessible") from exc
+
+        timestamps, values = [], []
+        for sample in samples:
+            try:
+                valid = (
+                    isinstance(sample, list)
+                    and len(sample) == 2
+                    and all(type(value) in (int, float) and math.isfinite(value)
+                            for value in sample)
+                )
+            except (TypeError, OverflowError):
+                valid = False
+            if not valid:
+                raise ToolError("monitoring series contains invalid samples")
+            timestamp, value = sample
+            if timestamps and timestamp <= timestamps[-1]:
+                raise ToolError("monitoring timestamps are not increasing")
+            timestamps.append(timestamp)
+            values.append(value)
+
+        observation = record["rows"][0]["observations"][observation_index]
+        step = observation.get("step_seconds")
+        gaps = None
+        try:
+            valid_step = type(step) in (int, float) and math.isfinite(step) and step > 0
+        except (TypeError, OverflowError):
+            valid_step = False
+        if valid_step:
+            gaps = sum(
+                1 for start, end in zip(timestamps, timestamps[1:])
+                if end - start > step + 0.001
+            )
+        try:
+            mean = math.fsum(values) / len(values)
+        except (OverflowError, ValueError):
+            raise ToolError("monitoring statistics cannot be represented") from None
+        if not math.isfinite(mean):
+            raise ToolError("monitoring statistics cannot be represented")
+        return {
+            "result_set_id": result_set_id,
+            "observation_index": observation_index,
+            "series_index": series_index,
+            "metric": (first_page.get("query_parameters") or {}).get("metric"),
+            "series": first_page.get("series"),
+            "count": len(values),
+            "min": min(values),
+            "max": max(values),
+            "mean": mean,
+            "first_timestamp": timestamps[0],
+            "last_timestamp": timestamps[-1],
+            "step_seconds": step,
+            "gap_count": gaps,
+        }
 
     def _search_knowledge(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         from app.ai.knowledge import KnowledgeError, KnowledgeService
@@ -822,7 +1280,8 @@ class PlatformQueryService:
         cron_query = t_cron.query.filter_by(is_deleted=False)
         if self.role != "admin":
             cron_query = cron_query.filter_by(job_owner=self.owner)
-        cron_count = cron_query.count()
+        cron_rows = cron_query.with_entities(t_cron.id).all()
+        cron_count = len(cron_rows)
         online_statuses = get_hosts_online_status([host.id for host in hosts])
         online_count = sum(
             bool(online_statuses.get(host.id, False))
@@ -835,7 +1294,9 @@ class PlatformQueryService:
             "group_count": len(allowed_groups),
             "cron_count": cron_count,
         }
-        return ToolData("overview", [summary], [], summary)
+        return ToolData("overview", [summary], [], summary,
+                        authorization_scope={"groups": sorted(allowed_groups),
+                                             "cron_ids": sorted(row.id for row in cron_rows)})
 
     def search_assets(self, arguments: Dict[str, Any]) -> ToolData:
         from app.assets.ServerManagement import (
@@ -953,6 +1414,17 @@ class PlatformQueryService:
             },
             arguments,
         )
+
+    def validate_cron_ids(self, cron_ids: Sequence[int]) -> bool:
+        from app.core.db.database import t_cron
+
+        ids = set(cron_ids)
+        if not ids:
+            return True
+        query = t_cron.query.filter(t_cron.id.in_(ids), t_cron.is_deleted.is_(False))
+        if self.role != "admin":
+            query = query.filter_by(job_owner=self.owner)
+        return {row.id for row in query.all()} == ids
 
     def list_authorized_system_users(self, _arguments=None) -> ToolData:
         from app.core.db.database import t_sys_user

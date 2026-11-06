@@ -28,7 +28,7 @@
 # =============================================================================
 
 # ---------- Stage 1: base ----------
-FROM python:3.12-slim AS base
+FROM python:3.12-slim-bookworm AS base
 
 # REV49: 国内镜像加速 (apt 阿里云 + pip 清华源)
 #   海外构建可注释掉以下两行，回退到默认源
@@ -54,6 +54,13 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
+
+# ---------- Stage 2.5: Pi runtime dependencies ----------
+FROM node:22.22.1-bookworm-slim AS pi-deps
+
+WORKDIR /app
+COPY backend/package.json backend/package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
 
 
 # ---------- Stage 3: Python builder ----------
@@ -104,6 +111,7 @@ FROM base AS runtime
 #   - zlib1g1 -> zlib1g (bookworm 去掉末尾 1; bullseye 才叫 zlib1g1)
 #   - libffi8 保留 (bookworm 和 bullseye 都是 libffi8)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        libatomic1 \
         libffi8 \
         libssl3 \
         libgomp1 \
@@ -124,6 +132,8 @@ RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels,ro \
 
 # 复制业务代码（配合 .dockerignore 排除 _archive / data / verify 脚本）
 COPY --chown=ogs:ogs backend/ /app/
+COPY --from=pi-deps /usr/local/bin/node /usr/local/bin/node
+COPY --from=pi-deps /app/node_modules/ /app/node_modules/
 COPY --from=frontend-builder --chown=ogs:ogs /frontend/dist/ /app/app/static/
 COPY --from=builder --chown=ogs:ogs /models/fast-bge-small-zh-v1.5/ /opt/orangeserver/models/fast-bge-small-zh-v1.5/
 

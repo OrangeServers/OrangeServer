@@ -75,7 +75,8 @@ For AI and remote-execution work, preserve these boundaries:
 - the server, never the model, authorizes actions;
 - permissions and ownership are revalidated before side effects;
 - credentials are passed by reference and never enter prompts or events;
-- remote and model output is untrusted, sanitized, redacted, and bounded;
+- remote evidence is untrusted, sanitized, redacted, and bounded before use;
+- model output is untrusted and handled safely at its destination;
 - an uncertain write result is not automatically replayed or reported as
   success.
 

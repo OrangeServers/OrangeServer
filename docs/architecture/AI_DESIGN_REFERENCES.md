@@ -80,7 +80,7 @@ Observation 与隔离执行环境分开。OrangeServer 只借鉴动作提案、�
 - 不用危险命令黑名单替代参数白名单和服务端固定探针。
 - 不因引入 AI 绕过 OrangeServer 现有的资产权限、凭据授权、审批和审计。
 - 不把 1M 上下文当作日志仓库；长证据仍使用持久化、检索和分层摘要。
-- 不因引入 LangGraph 就迁移当前聊天循环，也不整包引入 LangChain。
+- 自治流程继续使用 LangGraph；聊天会话使用 Pi，不为统一框架重写自治流程或整包引入 LangChain。
 - 不在只有一个实现时预先建设公开 Adapter、MCP 或插件系统。
 
 具体安全边界见[架构与信任边界](TRUST_BOUNDARIES.md)，诊断状态和证据契约见

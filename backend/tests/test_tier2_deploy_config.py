@@ -62,9 +62,12 @@ class TestDockerfile:
             match = pat.search(dockerfile)
             assert not match, f"Dockerfile 仍用普通 gevent worker: {match.group(0)!r}"
 
-    def test_04_dockerfile_has_three_stages(self, dockerfile):
-        """Dockerfile 必须 3 阶段 (base / builder / runtime)"""
-        assert "FROM python:3.12-slim AS base" in dockerfile
+    def test_04_dockerfile_has_separate_build_and_runtime_stages(self, dockerfile):
+        """Python 和 Pi 构建阶段与运行镜像分离，并使用兼容的系统库。"""
+        assert "FROM python:3.12-slim-bookworm AS base" in dockerfile
+        assert "FROM node:22.22.1-bookworm-slim AS pi-deps" in dockerfile
+        assert "COPY --from=pi-deps /usr/local/bin/node /usr/local/bin/node" in dockerfile
+        assert "COPY --from=pi-deps /app/node_modules/ /app/node_modules/" in dockerfile
         assert "FROM base AS builder" in dockerfile
         assert "FROM base AS runtime" in dockerfile
 

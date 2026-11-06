@@ -469,6 +469,9 @@ def test_platform_overview_reads_online_status_in_one_batch(monkeypatch):
         def count(self):
             return len(self.rows)
 
+        def with_entities(self, *_args):
+            return self
+
     hosts = [SimpleNamespace(id=11), SimpleNamespace(id=12)]
     monkeypatch.setattr(
         database,
@@ -482,7 +485,7 @@ def test_platform_overview_reads_online_status_in_one_batch(monkeypatch):
     monkeypatch.setattr(
         database,
         "t_cron",
-        SimpleNamespace(query=FakeQuery([object()])),
+        SimpleNamespace(query=FakeQuery([SimpleNamespace(id=1)]), id=FakeColumn()),
     )
     monkeypatch.setattr(database, "t_group", SimpleNamespace())
 
@@ -509,3 +512,4 @@ def test_platform_overview_reads_online_status_in_one_batch(monkeypatch):
     assert requested == [[11, 12]]
     assert result.summary["online_count"] == 1
     assert result.summary["offline_count"] == 1
+    assert result.authorization_scope == {"groups": ["web"], "cron_ids": [1]}

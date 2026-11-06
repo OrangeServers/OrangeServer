@@ -273,38 +273,14 @@ def test_create_autonomy_draft_permission_error_becomes_validation_error(
 # =============================================================================
 
 
-def test_runner_emits_and_persists_autonomy_draft_reference_card(
+def test_pi_runner_emits_and_persists_autonomy_draft_reference_card(
     monkeypatch, autonomy_env
 ):
     import json
 
-    from app.ai import runner as runner_module
-    from app.ai.provider import ChatResult, ProviderToolCall
     from app.ai.storage import AgentStore
-
-    class DraftAdapter:
-        def __init__(self):
-            self.rounds = 0
-
-        def complete(self, **_kwargs):
-            self.rounds += 1
-            if self.rounds == 1:
-                return ChatResult(
-                    content="",
-                    tool_calls=(ProviderToolCall(
-                        id="call-draft",
-                        name="create_autonomy_draft",
-                        arguments={
-                            "goal": "清理磁盘",
-                            "host_id": 1,
-                            "system_user_id": 2,
-                        },
-                    ),),
-                    used_stream=False,
-                )
-            return ChatResult(
-                content="已创建自治任务草稿", tool_calls=(), used_stream=False,
-            )
+    from app.ai.tools import ToolRegistry
+    from test_ai_runner import _run_pi_bridge
 
     class EmptyPlatform:
         pass
@@ -317,49 +293,34 @@ def test_runner_emits_and_persists_autonomy_draft_reference_card(
         autonomy_mode="custom",
         autonomy_profile={"action_categories": ["systemd"]},
     )
-    monkeypatch.setattr(
-        runner_module,
-        "PlatformQueryService",
-        lambda _owner, _role: EmptyPlatform(),
-    )
-
-    adapter = DraftAdapter()
-
-    class SharedProviderService:
-        def adapter(self, _code):
-            return adapter
-
-        def runtime(self, _code, *, context_mode):
-            from app.ai.context import (
-                STANDARD_CONTEXT_TOKENS,
-                normalize_context_mode,
-            )
-
-            return SimpleNamespace(
-                adapter=adapter,
-                context_mode=normalize_context_mode(context_mode),
-                context_window_tokens=STANDARD_CONTEXT_TOKENS,
-            )
-
-    runner = runner_module.AgentRunner(
-        store=store,
-        provider_service=SharedProviderService(),
-    )
-
-    output = "".join(runner.run(
-        owner="alice",
+    frames = [
+        {"type": "authorize.request", "id": "auth-1"},
+        {"type": "tool.request", "name": "create_autonomy_draft", "id": "call-draft",
+         "arguments": {
+             "goal": "清理磁盘",
+             "host_id": 1,
+             "system_user_id": 2,
+         }},
+        {"type": "checkpoint", "checkpoint": {"entries": [{"type": "session"}]}},
+        {"type": "authorize.request", "id": "auth-2"},
+        {"type": "final", "text": "已创建自治任务草稿", "checkpoint": {"entries": [{"type": "session"}]}},
+    ]
+    output, _child, _commits, _registries = _run_pi_bridge(
+        monkeypatch,
+        store,
+        conversation,
+        frames,
+        registry_factory=ToolRegistry,
+        platform=EmptyPlatform(),
         role="admin",
-        conversation_id=conversation["id"],
-        message="帮我建一个清理磁盘的自治任务",
-    ))
+    )
     events = [
         json.loads(line[6:])
-        for line in output.splitlines()
+        for item in output
+        for line in item.splitlines()
         if line.startswith("data: ")
     ]
-    draft_events = [
-        event for event in events if event["type"] == "autonomy.draft_created"
-    ]
+    draft_events = [event for event in events if event["type"] == "autonomy.draft_created"]
 
     assert len(draft_events) == 1
     card = draft_events[0]
@@ -369,7 +330,6 @@ def test_runner_emits_and_persists_autonomy_draft_reference_card(
     assert card["mode"] == "custom"
     assert card["action_categories"] == ["systemd"]
 
-    # 持久化：刷新页面后仍能恢复引用卡
     saved = store.get_conversation("alice", conversation["id"])
     persisted = [
         event for event in saved["events"]
@@ -378,7 +338,6 @@ def test_runner_emits_and_persists_autonomy_draft_reference_card(
     assert len(persisted) == 1
     assert persisted[0]["run_id"] == "run-draft-1"
 
-    # 边界：聊天侧只调用过 create_run，没有任何 Run 生命周期操作
     (repo,) = autonomy_env
     assert len(repo.create_run_calls) == 1
     assert repo.create_run_calls[0][2]["mode"] == "custom"
