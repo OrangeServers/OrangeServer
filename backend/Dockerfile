@@ -94,12 +94,22 @@ RUN pip install --upgrade pip \
 # app and worker share this one image layer and never download it at runtime.
 ARG OGS_LOCAL_EMBEDDING_MODEL_URL=https://storage.googleapis.com/qdrant-fastembed/fast-bge-small-zh-v1.5.tar.gz
 ARG OGS_LOCAL_EMBEDDING_MODEL_SHA256=bf023219b6029148fddf764d248808816c0ca1f107f058231bb1ae0fa526f83f
+COPY backend/embedding-model.sha256 /build/embedding-model.sha256
 RUN mkdir -p /models \
-    && curl -fsSL "$OGS_LOCAL_EMBEDDING_MODEL_URL" -o /tmp/embedding-model.tar.gz \
-    && echo "$OGS_LOCAL_EMBEDDING_MODEL_SHA256  /tmp/embedding-model.tar.gz" | sha256sum -c - \
-    && tar -xzf /tmp/embedding-model.tar.gz -C /models \
+    && if curl -fsSL "$OGS_LOCAL_EMBEDDING_MODEL_URL" -o /tmp/embedding-model.tar.gz; then \
+        echo "$OGS_LOCAL_EMBEDDING_MODEL_SHA256  /tmp/embedding-model.tar.gz" | sha256sum -c - \
+        && tar -xzf /tmp/embedding-model.tar.gz -C /models; \
+    elif [ "$OGS_LOCAL_EMBEDDING_MODEL_URL" = "https://storage.googleapis.com/qdrant-fastembed/fast-bge-small-zh-v1.5.tar.gz" ] \
+        && [ "$OGS_LOCAL_EMBEDDING_MODEL_SHA256" = "bf023219b6029148fddf764d248808816c0ca1f107f058231bb1ae0fa526f83f" ]; then \
+        mkdir -p /models/fast-bge-small-zh-v1.5 \
+        && while read -r checksum filename; do \
+            curl -fsSL "https://modelscope.cn/api/v1/models/Qdrant/bge-small-zh-v1.5/repo?Revision=master&FilePath=$filename" \
+                -o "/models/fast-bge-small-zh-v1.5/$filename" || exit 1; \
+        done < /build/embedding-model.sha256 \
+        && (cd /models/fast-bge-small-zh-v1.5 && sha256sum -c /build/embedding-model.sha256); \
+    else exit 1; fi \
     && test -f /models/fast-bge-small-zh-v1.5/model_optimized.onnx \
-    && rm /tmp/embedding-model.tar.gz
+    && rm -f /tmp/embedding-model.tar.gz
 
 
 # ---------- Stage 4: runtime ----------

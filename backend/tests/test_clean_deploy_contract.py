@@ -761,6 +761,10 @@ def test_dockerfile_pins_and_verifies_local_embedding_model():
     assert "fast-bge-small-zh-v1.5.tar.gz" in dockerfile
     assert "bf023219b6029148fddf764d248808816c0ca1f107f058231bb1ae0fa526f83f" in dockerfile
     assert "sha256sum -c -" in dockerfile
+    assert "sha256sum -c /build/embedding-model.sha256" in dockerfile
+    manifest = (REPO_ROOT / "backend" / "embedding-model.sha256").read_text(encoding="utf-8")
+    assert len(manifest.strip().splitlines()) == 7
+    assert "1294ea4b6331115a353d81f96b85e8c8d7fdcc284453d5b2fab5b016230aad38  model_optimized.onnx" in manifest
     assert "libgomp1" in dockerfile
     assert "OGS_AI_EMBEDDING_MODEL_PATH=/opt/orangeserver/models/fast-bge-small-zh-v1.5" in dockerfile
     assert "PIP_EXTRA_INDEX_URL" not in dockerfile

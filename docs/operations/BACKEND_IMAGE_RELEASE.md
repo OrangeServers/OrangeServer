@@ -111,6 +111,8 @@ wsl -d <wsl-发行版> -u root -e bash -c '
 
 - 用 `wsl -u root`（root 有 docker socket 和 TCR 登录；普通用户可能在 docker 组之外）。
 - 源码先 `cp` 进 Linux 文件系统再 build（`/mnt/...` 9p 挂载读得慢）。
+- 默认 embedding 模型归档不可下载时，构建会从 Qdrant 的 ModelScope 镜像下载同一模型，
+  并以仓库中的逐文件 SHA-256 校验；自定义模型归档下载或校验失败时不会回退。
 - 两个 registry 是独立构建环境，digest 会不同，**这是预期，不是错误**。
 
 ### 3.3 发布后验证
