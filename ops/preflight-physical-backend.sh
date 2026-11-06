@@ -135,6 +135,18 @@ for cmd in rsync ssh curl ss systemctl; do
     fi
 done
 
+if command -v node >/dev/null 2>&1 && (
+    cd "${BACKEND}" && node --input-type=module -e '
+        const [major, minor] = process.versions.node.split(".").map(Number);
+        if (major < 22 || (major === 22 && minor < 19)) process.exit(1);
+        await import("@earendil-works/pi-coding-agent");
+    ' >/dev/null 2>&1
+); then
+    ok "Node.js 和 Pi 聊天依赖可用"
+else
+    fail "需要 Node.js 22.19.0+ 和 backend npm 依赖，请按物理机部署说明安装"
+fi
+
 # =============================================================================
 echo ">>> 7/12 数据目录检查"
 # =============================================================================

@@ -880,7 +880,7 @@ function ContextView(): ReturnType<typeof h> {
     ]),
   ]
 
-  if (budget) {
+  if (budget && Number(budget.effective_input_tokens) > 0 && budget.estimated_input_tokens != null) {
     sections.push(h('section', { class: 'context-section' }, [
       h('span', { class: 'context-label' }, t('ai.context.budget')),
       h('div', { class: 'context-budget' }, [

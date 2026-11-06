@@ -3,6 +3,19 @@
 Notable user-visible changes are recorded here. This project follows the
 principles of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- AI chat uses Pi sessions for tool orchestration and context compaction,
+  while retaining server-side authorization, existing tools, and evidence.
+
+### Fixed
+
+- Long investigations no longer stop at the former fixed chat tool-round limit.
+- Image builds can recover from an unavailable default embedding archive using
+  individually checksum-verified copies of the same model files.
+
 ## [1.2.0] - 2026-09-06
 
 ### Added

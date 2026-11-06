@@ -273,6 +273,7 @@ class AgentStore:
         resource_ids: Iterable[Any],
         filters: Optional[Dict[str, Any]] = None,
         summary: Optional[Dict[str, Any]] = None,
+        authorization_scope: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         self.get_conversation(owner, conversation_id)
         result_id = uuid.uuid4().hex
@@ -287,6 +288,8 @@ class AgentStore:
             "summary": copy.deepcopy(summary or {}),
             "created_at": self.now(),
         }
+        if authorization_scope is not None:
+            result["authorization_scope"] = copy.deepcopy(authorization_scope)
         key = self._result_key(owner, result_id)
         self.redis.set(key, self._json(result), ex=self.conversation_ttl)
         index = self._conversation_results(owner, conversation_id)

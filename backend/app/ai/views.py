@@ -10,7 +10,8 @@ from flask import Response, current_app, request, stream_with_context
 from sqlalchemy import func
 
 from app.ai.provider_config import ProviderConfigError, ProviderConfigService
-from app.ai.runner import AgentRunner, sse_event
+from app.ai.runner import sse_event
+from app.ai.pi_runner import PiAgentRunner as AgentRunner
 from app.ai.storage import (
     AgentStore,
     AgentStoreConflict,

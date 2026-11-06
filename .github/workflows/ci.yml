@@ -57,6 +57,20 @@ jobs:
           cache: "pip"
           cache-dependency-path: backend/requirements.txt
 
+      - name: Set up Node.js for Pi
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.1"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Test Pi runtime bridge
+        working-directory: backend
+        run: |
+          npm ci --omit=dev --no-audit --no-fund
+          node tests/pi/legacy-history.test.mjs
+          node tests/pi/web-child.test.mjs
+
       - name: Install runtime + dev dependencies
         working-directory: backend
         run: |

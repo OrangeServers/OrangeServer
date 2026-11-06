@@ -55,6 +55,9 @@ Docker Compose 源码部署需要构建目标镜像：
 make build-backend
 ```
 
+物理机部署升级到使用 Pi 聊天的版本时，先按 [物理机部署](../../DEPLOY.md#物理机部署高级)
+准备 Node.js 和后端 npm 依赖，再重启服务；回滚到旧版本时保留原有代码及 Python 环境。
+
 ### Release bundle 安装
 
 下载目标版本的 bundle 和校验文件，解压到与当前安装目录同一文件系统的暂存目录。

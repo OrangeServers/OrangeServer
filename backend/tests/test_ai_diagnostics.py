@@ -601,89 +601,31 @@ def test_diagnostic_revalidates_permissions_before_each_probe():
 
 
 def test_chat_sse_projects_diagnostic_events_and_followup_context(monkeypatch):
+    import json
     from contextlib import contextmanager
     from types import SimpleNamespace
 
-    from app.ai import runner as runner_module
-    from app.ai.provider import ChatResult, ProviderToolCall
-    from app.ai.context import ContextManager
-    from app.ai.runner import AgentRunner
     from app.ai.storage import AgentStore
     from test_ai_agent_state import FakeRedis
+    from test_ai_runner import _run_pi_bridge
 
-    class Adapter:
-        def __init__(self):
-            self.calls = 0
-            self.last_messages = []
-
-        def complete(self, *, messages, **_kwargs):
-            self.calls += 1
-            self.last_messages = messages
-            if self.calls == 1:
-                return ChatResult(
-                    content="",
-                    tool_calls=(ProviderToolCall(
-                        id="diag-call",
-                        name="run_diagnostic",
-                        arguments={
-                            "profile_id": "disk_usage",
-                            "result_set_id": "assets-1",
-                            "system_user_id": 21,
-                            "parameters": {},
-                        },
-                    ),),
-                    used_stream=False,
-                )
-            return ChatResult(
-                content="磁盘诊断完成",
-                tool_calls=(),
-                used_stream=False,
-            )
-
-    class Providers:
-        def __init__(self, adapter):
-            self.adapter = adapter
-
-        def runtime(self, _code, *, context_mode):
-            return SimpleNamespace(
-                adapter=self.adapter,
-                context_window_tokens=262144,
-            )
+    worker_context = {"active": False}
 
     class DiagnosticService:
         def start(self, *, owner, role, payload, on_event):
             assert worker_context["active"] is True
             assert payload["conversation_id"]
             for event in (
-                {
-                    "type": "diagnostic_started",
-                    "event_seq": 1,
-                    "run_id": "diag-1",
-                    "status": "running",
-                },
-                {
-                    "type": "diagnostic_progress",
-                    "event_seq": 2,
-                    "run_id": "diag-1",
-                    "status": "running",
-                    "asset": {"alias": "edge-01", "status": "success"},
-                },
-                {
-                    "type": "diagnostic_completed",
-                    "event_seq": 3,
-                    "run_id": "diag-1",
-                    "status": "partial",
-                },
+                {"type": "diagnostic_started", "event_seq": 1, "run_id": "diag-1", "status": "running"},
+                {"type": "diagnostic_progress", "event_seq": 2, "run_id": "diag-1",
+                 "status": "running", "asset": {"alias": "edge-01", "status": "success"}},
+                {"type": "diagnostic_completed", "event_seq": 3, "run_id": "diag-1", "status": "partial"},
             ):
                 on_event(event)
             return {
                 "id": "diag-1",
                 "status": "partial",
-                "summary": {
-                    "severity": "critical",
-                    "finding_count": 1,
-                    "evidence_count": 2,
-                },
+                "summary": {"severity": "critical", "finding_count": 1, "evidence_count": 2},
             }
 
         def report(self, owner, run_id, role=None):
@@ -703,9 +645,7 @@ def test_chat_sse_projects_diagnostic_events_and_followup_context(monkeypatch):
                 }],
             }
 
-        def conversation_runs(
-            self, owner, conversation_id, limit=5, role=None
-        ):
+        def conversation_runs(self, owner, conversation_id, limit=5, role=None):
             return [{
                 "id": "diag-1",
                 "status": "partial",
@@ -715,12 +655,14 @@ def test_chat_sse_projects_diagnostic_events_and_followup_context(monkeypatch):
                 "summary": {"severity": "critical", "finding_count": 1},
             }]
 
-    class Platform:
-        pass
+    @contextmanager
+    def diagnostic_worker_context():
+        worker_context["active"] = True
+        try:
+            yield
+        finally:
+            worker_context["active"] = False
 
-    monkeypatch.setattr(
-        runner_module, "PlatformQueryService", lambda *_args: Platform()
-    )
     store = AgentStore(FakeRedis())
     conversation = store.create_conversation("alice", "openai", "demo")
     result = store.create_result_set(
@@ -730,46 +672,43 @@ def test_chat_sse_projects_diagnostic_events_and_followup_context(monkeypatch):
         rows=[{"id": 1, "alias": "edge-01"}],
         resource_ids=[1],
     )
-    adapter = Adapter()
-    diagnostic_service = DiagnosticService()
-    worker_context = {"active": False}
-
-    @contextmanager
-    def diagnostic_worker_context():
-        worker_context["active"] = True
-        try:
-            yield
-        finally:
-            worker_context["active"] = False
-
-    context_manager = ContextManager(context_window=262144)
-    reservation_calls = []
-    original_reserve = context_manager.set_runtime_reservations
-
-    def record_reservations(**kwargs):
-        reservation_calls.append(kwargs)
-        return original_reserve(**kwargs)
-
-    context_manager.set_runtime_reservations = record_reservations
-    output = "".join(AgentRunner(
-        store=store,
-        provider_service=Providers(adapter),
-        diagnostic_service_factory=lambda: diagnostic_service,
+    service = DiagnosticService()
+    platform = SimpleNamespace(validate_asset_ids=lambda ids: ids == [1])
+    frames = [
+        {"type": "authorize.request", "id": "auth-1"},
+        {"type": "tool.request", "name": "run_diagnostic", "id": "diag-call", "arguments": {
+            "profile_id": "disk_usage",
+            "result_set_id": result["id"],
+            "system_user_id": 21,
+            "parameters": {},
+        }},
+        {"type": "checkpoint", "checkpoint": {"entries": [{"type": "session"}]}},
+        {"type": "authorize.request", "id": "auth-2"},
+        {"type": "text.delta", "text": "磁盘诊断完成"},
+        {"type": "final", "text": "磁盘诊断完成", "checkpoint": {"entries": [{"type": "session"}]}},
+    ]
+    output, child, _commits, _registries = _run_pi_bridge(
+        monkeypatch,
+        store,
+        conversation,
+        frames,
+        definitions=[{"type": "function", "function": {"name": "run_diagnostic", "parameters": {}}}],
+        execute=lambda registry, _name, arguments: registry.diagnostic_executor(arguments),
+        diagnostic_service_factory=lambda: service,
         worker_context_factory=diagnostic_worker_context,
-        context_manager=context_manager,
-    ).run(
-        owner="alice",
-        role="user",
-        conversation_id=conversation["id"],
-        message="检查磁盘",
-    )).replace("assets-1", result["id"])
+        platform=platform,
+    )
 
-    assert "event: diagnostic_started" in output
-    assert "event: diagnostic_progress" in output
-    assert "event: diagnostic_completed" in output
-    assert "磁盘使用率过高" in str(adapter.last_messages)
-    assert "evidence-1" in str(adapter.last_messages)
-    assert len(reservation_calls) >= 2
+    text = "".join(output)
+    assert "event: diagnostic_started" in text
+    assert "event: diagnostic_progress" in text
+    assert "event: diagnostic_completed" in text
+    assert "event: run.completed" in text
+    child_messages = [json.loads(line) for line in child.stdin.getvalue().splitlines()]
+    tool_result = next(frame for frame in child_messages if frame.get("result", {}).get("report"))
+    assert "磁盘使用率过高" in json.dumps(tool_result, ensure_ascii=False)
+    assert "evidence-1" in json.dumps(tool_result, ensure_ascii=False)
+    assert worker_context["active"] is False
 
 
 def test_conversation_detail_includes_active_and_latest_diagnostic(monkeypatch):
@@ -828,10 +767,9 @@ def test_conversation_detail_includes_active_and_latest_diagnostic(monkeypatch):
     assert "prompt" not in observability
 
 
-def test_provider_observability_and_effective_context_budget_are_bounded():
+def test_provider_adapter_reports_usage_and_length():
     from types import SimpleNamespace
 
-    from app.ai.context import ContextManager
     from app.ai.provider import OpenAICompatibleAdapter
 
     response = SimpleNamespace(
@@ -839,11 +777,7 @@ def test_provider_observability_and_effective_context_budget_are_bounded():
             finish_reason="length",
             message=SimpleNamespace(content="partial", tool_calls=[]),
         )],
-        usage=SimpleNamespace(
-            prompt_tokens=120,
-            completion_tokens=30,
-            total_tokens=150,
-        ),
+        usage=SimpleNamespace(prompt_tokens=120, completion_tokens=30, total_tokens=150),
     )
 
     class Completions:
@@ -852,9 +786,7 @@ def test_provider_observability_and_effective_context_budget_are_bounded():
                 raise RuntimeError("no stream")
             return response
 
-    client = SimpleNamespace(
-        chat=SimpleNamespace(completions=Completions())
-    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
     adapter = OpenAICompatibleAdapter(
         api_key="synthetic-test-key",
         base_url="https://example.test/v1",
@@ -873,72 +805,36 @@ def test_provider_observability_and_effective_context_budget_are_bounded():
     assert result.truncated is True
     assert result.latency_ms >= 0
 
-    manager = ContextManager(context_window=262144)
-    manager.set_runtime_reservations(
-        system_prompt="system policy",
-        tools=[{"type": "function", "function": {"name": "tool"}}],
-        state={"last_result_set_id": "opaque"},
-    )
-    budget = manager.budget_snapshot()
-    assert budget["effective_input_tokens"] < 262144
-    assert budget["effective_input_tokens"] == (
-        262144
-        - budget["output_reserve_tokens"]
-        - budget["safety_reserve_tokens"]
-        - budget["runtime_reserve_tokens"]
-    )
 
-
-def test_runner_persists_provider_usage_without_prompt_or_credentials():
-    from types import SimpleNamespace
-
-    from app.ai.provider import ChatResult
-    from app.ai.runner import AgentRunner
+def test_pi_runner_persists_provider_usage_without_prompt_or_credentials(monkeypatch):
     from app.ai.storage import AgentStore
     from test_ai_agent_state import FakeRedis
-
-    class Adapter:
-        def complete(self, **_kwargs):
-            return ChatResult(
-                content="输出达到上限",
-                tool_calls=(),
-                used_stream=False,
-                usage={
-                    "prompt_tokens": 100,
-                    "completion_tokens": 20,
-                    "total_tokens": 120,
-                },
-                finish_reason="length",
-                latency_ms=321,
-                truncated=True,
-            )
-
-    class Providers:
-        def runtime(self, _code, *, context_mode):
-            return SimpleNamespace(
-                adapter=Adapter(),
-                context_window_tokens=262144,
-            )
+    from test_ai_runner import _run_pi_bridge
 
     store = AgentStore(FakeRedis())
     conversation = store.create_conversation("alice", "openai", "demo")
-    "".join(AgentRunner(
-        store=store, provider_service=Providers()
-    ).run(
-        owner="alice",
-        role="user",
-        conversation_id=conversation["id"],
-        message="检查状态",
-    ))
-    saved = store.get_conversation("alice", conversation["id"])
-    metrics = saved["state"]["provider_observability"]
+    frames = [
+        {"type": "authorize.request", "id": "auth-1"},
+        {"type": "usage", "input": 100, "cacheRead": 10, "cacheWrite": 5,
+         "output": 20, "stopReason": "length", "contextUsage": {"tokens": 1000}},
+        {"type": "compaction_end", "ok": True},
+        {"type": "text.delta", "text": "输出达到上限"},
+        {"type": "final", "text": "输出达到上限", "checkpoint": {"entries": []}},
+    ]
+    output, _child, commits, _registries = _run_pi_bridge(
+        monkeypatch, store, conversation, frames,
+    )
 
-    assert metrics["usage"]["total_tokens"] == 120
-    assert metrics["last_finish_reason"] == "length"
-    assert metrics["last_latency_ms"] == 321
-    assert metrics["truncation_reason"] == "output_limit"
-    assert metrics["context_budget"]["context_window_tokens"] == 262144
-    serialized = str(metrics).lower()
+    assert "event: run.completed" in "".join(output)
+    telemetry = commits[-1]["telemetry"]
+    assert telemetry["prompt_tokens"] == 115
+    assert telemetry["completion_tokens"] == 20
+    assert telemetry["total_tokens"] == 135
+    assert telemetry["finish_reason"] == "length"
+    assert telemetry["compressions"] == 1
+    assert telemetry["context_window"] == 262144
+    assert telemetry["context_tokens"] == 1000
+    serialized = str(telemetry).lower()
     assert "api_key" not in serialized
     assert "messages" not in serialized
 

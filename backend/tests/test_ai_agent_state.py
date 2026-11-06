@@ -1,9 +1,4 @@
-"""AI Agent 会话状态与上下文压缩的行为测试。
-
-测试缝隙：
-1. AgentStore 是 Redis 会话/结果集/Action 的公开存储接口。
-2. ContextManager 是 Runner 调用的上下文压缩接口。
-"""
+"""AI Agent 会话状态与上下文档位策略的行为测试。"""
 from __future__ import annotations
 
 import fnmatch
@@ -233,37 +228,6 @@ def test_conversation_run_lock_refreshes_and_never_deletes_a_successor():
     assert redis.get(key) == "successor-token"
 
 
-def test_context_compression_keeps_last_four_rounds_and_structured_state():
-    from app.ai.context import ContextManager
-
-    messages = []
-    for index in range(7):
-        messages.extend([
-            {"role": "user", "content": f"request-{index}-" + ("x" * 40)},
-            {"role": "assistant", "content": f"answer-{index}-" + ("y" * 40)},
-        ])
-    conversation = {
-        "messages": messages,
-        "summary": "",
-        "state": {"last_result_set_id": "result-123"},
-    }
-    captured = {}
-
-    def summarize(old_messages, previous_summary):
-        captured["old"] = old_messages
-        captured["previous"] = previous_summary
-        return "前面三轮请求已经完成。"
-
-    manager = ContextManager(context_window=80, threshold_ratio=0.5, keep_rounds=4)
-    compressed = manager.compress(conversation, summarize)
-
-    assert compressed["summary"] == "前面三轮请求已经完成。"
-    assert compressed["messages"][0]["content"].startswith("request-3-")
-    assert len(compressed["messages"]) == 8
-    assert compressed["state"] == {"last_result_set_id": "result-123"}
-    assert len(captured["old"]) == 6
-
-
 def test_context_policy_defaults_to_256k_and_only_enables_deep_with_1m_capability():
     from app.ai.context import (
         DEEP_CONTEXT_MODE,
@@ -293,54 +257,3 @@ def test_context_policy_defaults_to_256k_and_only_enables_deep_with_1m_capabilit
             pass
         else:
             raise AssertionError("unsupported context mode/capability must fail closed")
-
-
-def test_context_manager_default_window_is_256k():
-    from app.ai.context import ContextManager, STANDARD_CONTEXT_TOKENS
-
-    assert ContextManager().context_window == STANDARD_CONTEXT_TOKENS
-
-
-def test_context_compression_keeps_history_when_summary_fails():
-    from app.ai.context import ContextManager
-
-    messages = []
-    for index in range(7):
-        messages.extend([
-            {"role": "user", "content": f"request-{index}-" + ("x" * 40)},
-            {"role": "assistant", "content": f"answer-{index}-" + ("y" * 40)},
-        ])
-    conversation = {
-        "messages": messages,
-        "summary": "previous summary",
-        "state": {"last_result_set_id": "result-123"},
-    }
-    manager = ContextManager(context_window=80, threshold_ratio=0.5, keep_rounds=4)
-
-    untouched = manager.compress(
-        conversation,
-        lambda *_: (_ for _ in ()).throw(TimeoutError("provider timeout")),
-    )
-
-    assert untouched == conversation
-
-
-def test_context_compression_keeps_history_when_summary_is_empty():
-    from app.ai.context import ContextManager
-
-    messages = []
-    for index in range(7):
-        messages.extend([
-            {"role": "user", "content": f"request-{index}-" + ("x" * 40)},
-            {"role": "assistant", "content": f"answer-{index}-" + ("y" * 40)},
-        ])
-    conversation = {
-        "messages": messages,
-        "summary": "",
-        "state": {"last_result_set_id": "result-123"},
-    }
-    manager = ContextManager(context_window=80, threshold_ratio=0.5, keep_rounds=4)
-
-    untouched = manager.compress(conversation, lambda *_: "  ")
-
-    assert untouched == conversation

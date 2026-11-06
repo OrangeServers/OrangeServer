@@ -101,8 +101,8 @@ make docker-up
 - 向导要求 gunicorn 形态（三种部署方式均满足）；`python init.py` 裸跑 dev 模式
   不支持，请手工配置 `backend/.env`
 
-> 生产镜像在 Node 构建阶段生成 SPA，再只把 `dist` 复制进 Python 运行镜像；部署机
-> 和运行镜像都不需要 Node。`make build-frontend` 仅用于独立前端验收。
+> 生产镜像在构建阶段生成 SPA，并在运行镜像中包含 Pi 聊天所需的 Node 运行时；
+> Docker 部署机无需单独安装 Node。`make build-frontend` 仅用于独立前端验收。
 
 > Docker Hub 拉取 Redis、MySQL 超时时，可先合并
 > `deploy/daemon.json.example` 到现有 `/etc/docker/daemon.json`，执行
@@ -283,8 +283,8 @@ Redis DB0 用于 checkpoint（以及 M2 可重建向量），DB1 用于 Celery b
 业务会话和缓存；自治任务默认可用，Worker 默认并发 2，可通过
 `OGS_AUTONOMY_WORKER_CONCURRENCY=1` 在受限机器降级。
 同一个 app/Worker 镜像层内置约 90 MB 的中文 BGE ONNX embedding 模型；知识向量仍
-写入统一 Redis DB0，不新增向量数据库或模型服务容器。生产运行镜像不包含 Node 和
-编译工具。
+写入统一 Redis DB0，不新增向量数据库或模型服务容器。生产运行镜像包含 Pi 聊天
+所需的 Node 运行时，不包含编译工具。
 
 开发覆盖层仍可用于源码热重载验收：
 
@@ -328,7 +328,8 @@ make docker-dev-autonomy-down
 > 整理，尚未在全新物理机上完成同等级实机验收，不属于本次公开发布承诺的一键
 > 路径。适用于愿意自行完成发行版适配和回归验证、且不能运行 Docker 的环境。
 > 需要 Python 3.11+（推荐 3.12，与容器一致；预检脚本硬性要求 3.11/3.12）/
-> MySQL 8.0 / Redis 5+ / Nginx 1.16+。
+> Node.js 22.19.0+ 与 npm / MySQL 8.0 / Redis 5+ / Nginx 1.16+。
+> 容器使用 Node.js 22.22.1；物理机应确保 Node 在 systemd 服务的 PATH 中可执行。
 
 ### 文件布局
 
@@ -349,6 +350,9 @@ git clone https://github.com/OrangeServers/OrangeServer.git /opt/orangeserver/ap
 cd /opt/orangeserver/app
 python3.12 -m venv /opt/orangeserver/venv
 /opt/orangeserver/venv/bin/pip install -r /opt/orangeserver/app/backend/requirements.txt
+# 先按发行版或 Node.js 官方说明安装 Node.js 和 npm，再安装锁定的聊天运行依赖。
+node --version
+npm ci --omit=dev --prefix /opt/orangeserver/app/backend
 
 # 1. 数据目录
 install -d -o orange -g orange -m 0700 /data/orangeserver/{avatars,file,key,log,containers/temp}

@@ -13,8 +13,8 @@ OrangeServer 的目标不是用 AI 包装少量 Linux 基础命令，而是复�
 路线图遵守以下原则：
 
 - 聊天只负责查询、解释、诊断和创建自治草稿；远程写操作统一进入 Autonomy Run。
-- LangGraph 继续负责长任务自治工作流，不重写现有 Provider 和 Tool Calling 循环。
-- 文本分片只引入独立的 `langchain-text-splitters`，不引入第二套 Agent 执行循环。
+- LangGraph 继续负责长任务自治工作流；聊天使用 Pi 会话，复用现有 Provider 配置和工具权限。
+- 知识库文本分片使用独立的 `langchain-text-splitters`，不重写自治执行链。
 - MySQL 始终是业务事实源，模型输出、SSE 和 checkpoint 都不能覆盖权威状态。
 - 模型提出动作，服务端决定自动执行、等待审批或拒绝；模型不能自行提高权限。
 - 先做深一个 Linux 单机闭环，再扩展监控、Docker 和 Kubernetes。
